@@ -1,0 +1,10 @@
+.direnv/
+.env
+result
+tmp/
+target/
+
+
+# Added by cargo
+
+/target

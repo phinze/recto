@@ -1,0 +1,10 @@
+[package]
+name = "recto"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+ratatui = "0.30"
+crossterm = "0.29"
+anyhow = "1"
+color-eyre = "0.6"
