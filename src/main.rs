@@ -1,25 +1,51 @@
+mod backend;
+
 use std::io::{self, stdout};
 
-use color_eyre::Result;
+use anyhow::Result;
 use crossterm::{
     event::{self, Event, KeyCode, KeyEventKind},
     execute,
-    terminal::{disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen},
+    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
-    text::Line,
-    widgets::{Block, Borders, Paragraph},
+    text::{Line, Span},
+    widgets::{Block, Borders, List, ListItem, Paragraph},
 };
 
+use crate::backend::{Backend, Base, FileChange, JjBackend};
+
+struct App {
+    base: Base,
+    changes: Vec<FileChange>,
+    diff: String,
+}
+
+impl App {
+    fn load(backend: &dyn Backend) -> Result<Self> {
+        let base = Base::Revision("@-".into());
+        let changes = backend.list_changes(&base)?;
+        let diff = backend.unified_diff(&base)?;
+        Ok(Self {
+            base,
+            changes,
+            diff,
+        })
+    }
+}
+
 fn main() -> Result<()> {
-    color_eyre::install()?;
+    let _ = color_eyre::install();
+
+    let backend = JjBackend::new();
+    let app = App::load(&backend)?;
 
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal);
+    let result = run(&mut terminal, &app);
     restore_terminal()?;
     result
 }
@@ -36,9 +62,9 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> Result<()> {
     loop {
-        terminal.draw(draw)?;
+        terminal.draw(|f| draw(f, app))?;
 
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
@@ -50,7 +76,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> Result<()> {
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame) {
+fn draw(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
 
     let rows = Layout::default()
@@ -62,8 +88,13 @@ fn draw(frame: &mut ratatui::Frame) {
         ])
         .split(area);
 
-    let header = Paragraph::new(Line::from("recto — base: @- (placeholder)"))
-        .style(Style::default().add_modifier(Modifier::BOLD));
+    let header = Paragraph::new(Line::from(format!(
+        "recto — base: {} · {} changed file{}",
+        app.base.display(),
+        app.changes.len(),
+        if app.changes.len() == 1 { "" } else { "s" },
+    )))
+    .style(Style::default().add_modifier(Modifier::BOLD));
     frame.render_widget(header, rows[0]);
 
     let panes = Layout::default()
@@ -71,12 +102,34 @@ fn draw(frame: &mut ratatui::Frame) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(rows[1]);
 
-    let tree = Paragraph::new("(file tree)")
-        .block(Block::default().borders(Borders::ALL).title("Files"));
+    let items: Vec<ListItem> = app
+        .changes
+        .iter()
+        .map(|c| {
+            let style = match c.status {
+                backend::FileStatus::Added => Style::default().fg(Color::Green),
+                backend::FileStatus::Deleted => Style::default().fg(Color::Red),
+                backend::FileStatus::Modified => Style::default().fg(Color::Yellow),
+                backend::FileStatus::Renamed | backend::FileStatus::Copied => {
+                    Style::default().fg(Color::Cyan)
+                }
+            };
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", c.status.glyph()), style),
+                Span::raw(c.path.clone()),
+            ]))
+        })
+        .collect();
+    let tree = List::new(items).block(Block::default().borders(Borders::ALL).title("Files"));
     frame.render_widget(tree, panes[0]);
 
-    let diff = Paragraph::new("(unified diff)")
-        .block(Block::default().borders(Borders::ALL).title("Diff"));
+    let diff_text = if app.diff.is_empty() {
+        "(no changes)".to_string()
+    } else {
+        app.diff.clone()
+    };
+    let diff =
+        Paragraph::new(diff_text).block(Block::default().borders(Borders::ALL).title("Diff"));
     frame.render_widget(diff, panes[1]);
 
     let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
