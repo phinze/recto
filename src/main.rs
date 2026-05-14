@@ -19,10 +19,15 @@ use ratatui::{
 
 use crate::backend::{Backend, Base, FileChange, JjBackend};
 
+const SCROLLOFF: u16 = 3;
+
 struct App {
     base: Base,
     changes: Vec<FileChange>,
     diff: String,
+    diff_lines: u16,
+    scroll: u16,
+    diff_viewport: u16,
 }
 
 impl App {
@@ -30,11 +35,32 @@ impl App {
         let base = Base::Revision("@-".into());
         let changes = backend.list_changes(&base)?;
         let diff = backend.unified_diff(&base)?;
+        let diff_lines = diff.lines().count().min(u16::MAX as usize) as u16;
         Ok(Self {
             base,
             changes,
             diff,
+            diff_lines,
+            scroll: 0,
+            diff_viewport: 0,
         })
+    }
+
+    fn max_scroll(&self) -> u16 {
+        let overflow = self.diff_lines.saturating_sub(self.diff_viewport);
+        if overflow == 0 {
+            0
+        } else {
+            overflow.saturating_add(SCROLLOFF)
+        }
+    }
+
+    fn scroll_down(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_add(n).min(self.max_scroll());
+    }
+
+    fn scroll_up(&mut self, n: u16) {
+        self.scroll = self.scroll.saturating_sub(n);
     }
 }
 
@@ -42,10 +68,10 @@ fn main() -> Result<()> {
     let _ = color_eyre::install();
 
     let backend = JjBackend::new();
-    let app = App::load(&backend)?;
+    let mut app = App::load(&backend)?;
 
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, &app);
+    let result = run(&mut terminal, &mut app);
     restore_terminal()?;
     result
 }
@@ -62,21 +88,26 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &App) -> Result<()> {
+fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     loop {
         terminal.draw(|f| draw(f, app))?;
+        app.scroll = app.scroll.min(app.max_scroll());
 
         if let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
-            && matches!(key.code, KeyCode::Char('q') | KeyCode::Esc)
         {
-            break;
+            match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => break,
+                KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
+                KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
+                _ => {}
+            }
         }
     }
     Ok(())
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &App) {
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
 
     let rows = Layout::default()
@@ -128,8 +159,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     } else {
         app.diff.clone()
     };
-    let diff =
-        Paragraph::new(diff_text).block(Block::default().borders(Borders::ALL).title("Diff"));
+    app.diff_viewport = panes[1].height.saturating_sub(2);
+    let diff = Paragraph::new(diff_text)
+        .scroll((app.scroll.min(app.max_scroll()), 0))
+        .block(Block::default().borders(Borders::ALL).title("Diff"));
     frame.render_widget(diff, panes[1]);
 
     let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
