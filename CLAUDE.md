@@ -111,5 +111,23 @@ cargo clippy -- -D warnings
 - `cargo fmt` before commit. `cargo clippy` clean.
 - Comments only when the *why* is non-obvious. Doc comments on public
   API; inline comments rare.
-- One module per pane / concern as the surface grows; resist premature
-  abstraction in v0.
+- One module per pane / concern as the surface grows.
+
+## Iteration Style
+
+Tiny slices, snapshotted as they land. Each slice is one jj rev:
+
+- Before starting, name two or three candidates and recommend one.
+  Build when Paul gives the green light.
+- Set the rev description before editing (`jj desc -m "..."`) and
+  refine as scope clarifies.
+- Green before snapshot: `cargo fmt` + `cargo clippy -- -D warnings`
+  clean.
+- `jj new` between slices, leave them stacked — Paul squashes to taste,
+  Claude doesn't squash into prior revs.
+- End each slice with a "fire it up" note: what to try, what to watch
+  for.
+
+Resist premature abstraction even more aggressively than the v0 spec
+suggests. Trait methods, helpers, and config knobs get added when a
+caller arrives, not before — `-D warnings` enforces it.
