@@ -14,12 +14,27 @@ use ratatui::{
     layout::{Constraint, Direction, Layout},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
 use crate::backend::{Backend, Base, FileChange, JjBackend};
 
 const SCROLLOFF: u16 = 3;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Focus {
+    Files,
+    Diff,
+}
+
+impl Focus {
+    fn cycle(self) -> Self {
+        match self {
+            Focus::Files => Focus::Diff,
+            Focus::Diff => Focus::Files,
+        }
+    }
+}
 
 struct App {
     base: Base,
@@ -28,6 +43,8 @@ struct App {
     diff_lines: u16,
     scroll: u16,
     diff_viewport: u16,
+    focus: Focus,
+    file_state: ListState,
 }
 
 impl App {
@@ -36,6 +53,10 @@ impl App {
         let changes = backend.list_changes(&base)?;
         let diff = backend.unified_diff(&base)?;
         let diff_lines = diff.lines().count().min(u16::MAX as usize) as u16;
+        let mut file_state = ListState::default();
+        if !changes.is_empty() {
+            file_state.select(Some(0));
+        }
         Ok(Self {
             base,
             changes,
@@ -43,6 +64,8 @@ impl App {
             diff_lines,
             scroll: 0,
             diff_viewport: 0,
+            focus: Focus::Files,
+            file_state,
         })
     }
 
@@ -61,6 +84,26 @@ impl App {
 
     fn scroll_up(&mut self, n: u16) {
         self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    fn select_next(&mut self) {
+        if self.changes.is_empty() {
+            return;
+        }
+        let last = self.changes.len() - 1;
+        let next = self.file_state.selected().map_or(0, |i| (i + 1).min(last));
+        self.file_state.select(Some(next));
+    }
+
+    fn select_prev(&mut self) {
+        if self.changes.is_empty() {
+            return;
+        }
+        let prev = self
+            .file_state
+            .selected()
+            .map_or(0, |i| i.saturating_sub(1));
+        self.file_state.select(Some(prev));
     }
 }
 
@@ -98,8 +141,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         {
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Char('j') | KeyCode::Down => app.scroll_down(1),
-                KeyCode::Char('k') | KeyCode::Up => app.scroll_up(1),
+                KeyCode::Tab => app.focus = app.focus.cycle(),
+                KeyCode::Char('j') | KeyCode::Down => match app.focus {
+                    Focus::Files => app.select_next(),
+                    Focus::Diff => app.scroll_down(1),
+                },
+                KeyCode::Char('k') | KeyCode::Up => match app.focus {
+                    Focus::Files => app.select_prev(),
+                    Focus::Diff => app.scroll_up(1),
+                },
                 _ => {}
             }
         }
@@ -151,8 +201,10 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             ]))
         })
         .collect();
-    let tree = List::new(items).block(Block::default().borders(Borders::ALL).title("Files"));
-    frame.render_widget(tree, panes[0]);
+    let tree = List::new(items)
+        .block(pane_block("Files", app.focus == Focus::Files))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_stateful_widget(tree, panes[0], &mut app.file_state);
 
     let diff_text = if app.diff.is_empty() {
         "(no changes)".to_string()
@@ -162,10 +214,24 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     app.diff_viewport = panes[1].height.saturating_sub(2);
     let diff = Paragraph::new(diff_text)
         .scroll((app.scroll.min(app.max_scroll()), 0))
-        .block(Block::default().borders(Borders::ALL).title("Diff"));
+        .block(pane_block("Diff", app.focus == Focus::Diff));
     frame.render_widget(diff, panes[1]);
 
     let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
         .style(Style::default().fg(Color::DarkGray));
     frame.render_widget(footer, rows[2]);
+}
+
+fn pane_block(title: &str, focused: bool) -> Block<'_> {
+    let style = if focused {
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD)
+    } else {
+        Style::default().fg(Color::DarkGray)
+    };
+    Block::default()
+        .borders(Borders::ALL)
+        .border_style(style)
+        .title(title)
 }
