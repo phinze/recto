@@ -1,5 +1,6 @@
 mod backend;
 
+use std::collections::HashMap;
 use std::io::{self, stdout};
 
 use anyhow::Result;
@@ -41,6 +42,7 @@ struct App {
     changes: Vec<FileChange>,
     diff: String,
     diff_lines: u16,
+    file_offsets: HashMap<String, u16>,
     scroll: u16,
     diff_viewport: u16,
     focus: Focus,
@@ -53,6 +55,7 @@ impl App {
         let changes = backend.list_changes(&base)?;
         let diff = backend.unified_diff(&base)?;
         let diff_lines = diff.lines().count().min(u16::MAX as usize) as u16;
+        let file_offsets = parse_diff_offsets(&diff);
         let mut file_state = ListState::default();
         if !changes.is_empty() {
             file_state.select(Some(0));
@@ -62,6 +65,7 @@ impl App {
             changes,
             diff,
             diff_lines,
+            file_offsets,
             scroll: 0,
             diff_viewport: 0,
             focus: Focus::Files,
@@ -105,6 +109,31 @@ impl App {
             .map_or(0, |i| i.saturating_sub(1));
         self.file_state.select(Some(prev));
     }
+
+    fn jump_to_selected(&mut self) {
+        let Some(i) = self.file_state.selected() else {
+            return;
+        };
+        let Some(change) = self.changes.get(i) else {
+            return;
+        };
+        if let Some(&offset) = self.file_offsets.get(&change.path) {
+            self.scroll = offset.min(self.max_scroll());
+        }
+    }
+}
+
+fn parse_diff_offsets(diff: &str) -> HashMap<String, u16> {
+    let mut offsets = HashMap::new();
+    for (i, line) in diff.lines().enumerate() {
+        if let Some(rest) = line.strip_prefix("diff --git ")
+            && let Some((_a, b)) = rest.split_once(" b/")
+        {
+            let line_no = i.min(u16::MAX as usize) as u16;
+            offsets.entry(b.to_string()).or_insert(line_no);
+        }
+    }
+    offsets
 }
 
 fn main() -> Result<()> {
@@ -142,6 +171,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Tab => app.focus = app.focus.cycle(),
+                KeyCode::Enter => app.jump_to_selected(),
                 KeyCode::Char('j') | KeyCode::Down => match app.focus {
                     Focus::Files => app.select_next(),
                     Focus::Diff => app.scroll_down(1),
