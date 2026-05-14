@@ -12,13 +12,13 @@ use crossterm::{
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout},
+    layout::{Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
-use crate::backend::{Backend, Base, FileChange, JjBackend};
+use crate::backend::{Backend, Base, FileChange, FileStatus, JjBackend};
 
 const SCROLLOFF: u16 = 3;
 
@@ -40,9 +40,8 @@ impl Focus {
 struct App {
     base: Base,
     changes: Vec<FileChange>,
-    diff: String,
-    diff_lines: u16,
-    file_offsets: HashMap<String, u16>,
+    rendered: Vec<Line<'static>>,
+    file_starts: Vec<u16>,
     scroll: u16,
     diff_viewport: u16,
     focus: Focus,
@@ -54,8 +53,7 @@ impl App {
         let base = Base::Revision("@-".into());
         let changes = backend.list_changes(&base)?;
         let diff = backend.unified_diff(&base)?;
-        let diff_lines = diff.lines().count().min(u16::MAX as usize) as u16;
-        let file_offsets = parse_diff_offsets(&diff);
+        let (rendered, file_starts) = render_diff(&diff, &changes);
         let mut file_state = ListState::default();
         if !changes.is_empty() {
             file_state.select(Some(0));
@@ -63,9 +61,8 @@ impl App {
         Ok(Self {
             base,
             changes,
-            diff,
-            diff_lines,
-            file_offsets,
+            rendered,
+            file_starts,
             scroll: 0,
             diff_viewport: 0,
             focus: Focus::Files,
@@ -73,8 +70,12 @@ impl App {
         })
     }
 
+    fn rendered_lines(&self) -> u16 {
+        self.rendered.len().min(u16::MAX as usize) as u16
+    }
+
     fn max_scroll(&self) -> u16 {
-        let overflow = self.diff_lines.saturating_sub(self.diff_viewport);
+        let overflow = self.rendered_lines().saturating_sub(self.diff_viewport);
         if overflow == 0 {
             0
         } else {
@@ -114,26 +115,102 @@ impl App {
         let Some(i) = self.file_state.selected() else {
             return;
         };
-        let Some(change) = self.changes.get(i) else {
-            return;
-        };
-        if let Some(&offset) = self.file_offsets.get(&change.path) {
+        if let Some(&offset) = self.file_starts.get(i) {
             self.scroll = offset.min(self.max_scroll());
         }
     }
+
+    /// Index into `changes` of the file owning the current scroll position.
+    fn current_file(&self) -> Option<usize> {
+        self.file_starts
+            .iter()
+            .enumerate()
+            .rev()
+            .find(|&(_, &start)| start <= self.scroll)
+            .map(|(i, _)| i)
+    }
 }
 
-fn parse_diff_offsets(diff: &str) -> HashMap<String, u16> {
-    let mut offsets = HashMap::new();
-    for (i, line) in diff.lines().enumerate() {
+fn render_diff(diff: &str, changes: &[FileChange]) -> (Vec<Line<'static>>, Vec<u16>) {
+    let path_to_idx: HashMap<&str, usize> = changes
+        .iter()
+        .enumerate()
+        .map(|(i, c)| (c.path.as_str(), i))
+        .collect();
+
+    let mut rendered: Vec<Line<'static>> = Vec::new();
+    let mut file_starts: Vec<u16> = vec![0; changes.len()];
+    let mut in_metadata = false;
+
+    for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ")
-            && let Some((_a, b)) = rest.split_once(" b/")
+            && let Some((_, b)) = rest.split_once(" b/")
         {
-            let line_no = i.min(u16::MAX as usize) as u16;
-            offsets.entry(b.to_string()).or_insert(line_no);
+            let idx = path_to_idx.get(b).copied();
+            let status = idx.map(|i| changes[i].status);
+            let line_no = rendered.len().min(u16::MAX as usize) as u16;
+            if let Some(i) = idx {
+                file_starts[i] = line_no;
+            }
+            rendered.push(file_separator(b, status));
+            in_metadata = true;
+            continue;
         }
+        if in_metadata {
+            if line.starts_with("@@") {
+                in_metadata = false;
+                rendered.push(Line::from(line.to_string()));
+            }
+            continue;
+        }
+        rendered.push(Line::from(line.to_string()));
     }
-    offsets
+
+    (rendered, file_starts)
+}
+
+fn file_separator(path: &str, status: Option<FileStatus>) -> Line<'static> {
+    let glyph = status.map_or(' ', |s| s.glyph());
+    let color = status.map_or(Color::Gray, status_color);
+    Line::from(vec![
+        Span::styled("── ", Style::default().fg(Color::DarkGray)),
+        Span::styled(
+            format!("{glyph} "),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            path.to_string(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            " ──────────────────────────────────────────────",
+            Style::default().fg(Color::DarkGray),
+        ),
+    ])
+}
+
+fn sticky_line(change: &FileChange) -> Line<'static> {
+    let color = status_color(change.status);
+    Line::from(vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} ", change.status.glyph()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            change.path.clone(),
+            Style::default().add_modifier(Modifier::BOLD),
+        ),
+    ])
+}
+
+fn status_color(status: FileStatus) -> Color {
+    match status {
+        FileStatus::Added => Color::Green,
+        FileStatus::Deleted => Color::Red,
+        FileStatus::Modified => Color::Yellow,
+        FileStatus::Renamed | FileStatus::Copied => Color::Cyan,
+    }
 }
 
 fn main() -> Result<()> {
@@ -173,11 +250,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 KeyCode::Tab => app.focus = app.focus.cycle(),
                 KeyCode::Enter => app.jump_to_selected(),
                 KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                    Focus::Files => app.select_next(),
+                    Focus::Files => {
+                        app.select_next();
+                        app.jump_to_selected();
+                    }
                     Focus::Diff => app.scroll_down(1),
                 },
                 KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                    Focus::Files => app.select_prev(),
+                    Focus::Files => {
+                        app.select_prev();
+                        app.jump_to_selected();
+                    }
                     Focus::Diff => app.scroll_up(1),
                 },
                 _ => {}
@@ -213,18 +296,20 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(rows[1]);
 
+    draw_files(frame, panes[0], app);
+    draw_diff(frame, panes[1], app);
+
+    let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
+        .style(Style::default().fg(Color::DarkGray));
+    frame.render_widget(footer, rows[2]);
+}
+
+fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .changes
         .iter()
         .map(|c| {
-            let style = match c.status {
-                backend::FileStatus::Added => Style::default().fg(Color::Green),
-                backend::FileStatus::Deleted => Style::default().fg(Color::Red),
-                backend::FileStatus::Modified => Style::default().fg(Color::Yellow),
-                backend::FileStatus::Renamed | backend::FileStatus::Copied => {
-                    Style::default().fg(Color::Cyan)
-                }
-            };
+            let style = Style::default().fg(status_color(c.status));
             ListItem::new(Line::from(vec![
                 Span::styled(format!("{} ", c.status.glyph()), style),
                 Span::raw(c.path.clone()),
@@ -234,22 +319,47 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let tree = List::new(items)
         .block(pane_block("Files", app.focus == Focus::Files))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
-    frame.render_stateful_widget(tree, panes[0], &mut app.file_state);
+    frame.render_stateful_widget(tree, area, &mut app.file_state);
+}
 
-    let diff_text = if app.diff.is_empty() {
-        "(no changes)".to_string()
-    } else {
-        app.diff.clone()
-    };
-    app.diff_viewport = panes[1].height.saturating_sub(2);
-    let diff = Paragraph::new(diff_text)
-        .scroll((app.scroll.min(app.max_scroll()), 0))
-        .block(pane_block("Diff", app.focus == Focus::Diff));
-    frame.render_widget(diff, panes[1]);
+fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let block = pane_block("Diff", app.focus == Focus::Diff);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
 
-    let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
-        .style(Style::default().fg(Color::DarkGray));
-    frame.render_widget(footer, rows[2]);
+    if app.rendered.is_empty() {
+        let empty = Paragraph::new("(no changes)").style(Style::default().fg(Color::DarkGray));
+        frame.render_widget(empty, inner);
+        app.diff_viewport = inner.height;
+        return;
+    }
+
+    let split = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(1), Constraint::Min(0)])
+        .split(inner);
+    let sticky_area = split[0];
+    let content_area = split[1];
+    app.diff_viewport = content_area.height;
+
+    let current = app.current_file();
+    if app.focus == Focus::Diff
+        && let Some(i) = current
+        && app.file_state.selected() != Some(i)
+    {
+        app.file_state.select(Some(i));
+    }
+
+    let sticky_text = current
+        .map(|i| sticky_line(&app.changes[i]))
+        .unwrap_or_else(|| Line::from(""));
+    let sticky =
+        Paragraph::new(sticky_text).style(Style::default().add_modifier(Modifier::REVERSED));
+    frame.render_widget(sticky, sticky_area);
+
+    let content =
+        Paragraph::new(app.rendered.clone()).scroll((app.scroll.min(app.max_scroll()), 0));
+    frame.render_widget(content, content_area);
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
