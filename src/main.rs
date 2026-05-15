@@ -55,6 +55,7 @@ struct App {
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
     scroll: u16,
+    h_scroll: u16,
     diff_viewport: u16,
     focus: Focus,
     file_state: ListState,
@@ -85,6 +86,7 @@ impl App {
             rendered,
             file_starts,
             scroll: 0,
+            h_scroll: 0,
             diff_viewport: 0,
             focus: Focus::Files,
             file_state,
@@ -107,6 +109,7 @@ impl App {
                     self.rendered = rendered;
                     self.file_starts = file_starts;
                     self.scroll = 0;
+                    self.h_scroll = 0;
                     self.file_state.select(if self.changes.is_empty() {
                         None
                     } else {
@@ -157,6 +160,7 @@ impl App {
         } else {
             self.scroll = 0;
         }
+        self.h_scroll = 0;
         Ok(())
     }
 
@@ -207,7 +211,16 @@ impl App {
         };
         if let Some(&offset) = self.file_starts.get(i) {
             self.scroll = offset.min(self.max_scroll());
+            self.h_scroll = 0;
         }
+    }
+
+    fn scroll_right(&mut self, n: u16) {
+        self.h_scroll = self.h_scroll.saturating_add(n);
+    }
+
+    fn scroll_left(&mut self, n: u16) {
+        self.h_scroll = self.h_scroll.saturating_sub(n);
     }
 
     /// Index into `changes` of the file owning the current scroll position.
@@ -426,6 +439,23 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     }
                     Focus::Diff => app.scroll_up(1),
                 },
+                KeyCode::Char('H') => app.focus = Focus::Files,
+                KeyCode::Char('L') => app.focus = Focus::Diff,
+                KeyCode::Char('J') => {
+                    app.select_next();
+                    app.jump_to_selected();
+                }
+                KeyCode::Char('K') => {
+                    app.select_prev();
+                    app.jump_to_selected();
+                }
+                KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
+                    app.scroll_right(1)
+                }
+                KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => {
+                    app.scroll_left(1)
+                }
+                KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
                 _ => {}
             }
         }
@@ -536,8 +566,8 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Paragraph::new(sticky_text).style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_widget(sticky, sticky_area);
 
-    let content =
-        Paragraph::new(app.rendered.clone()).scroll((app.scroll.min(app.max_scroll()), 0));
+    let content = Paragraph::new(app.rendered.clone())
+        .scroll((app.scroll.min(app.max_scroll()), app.h_scroll));
     frame.render_widget(content, content_area);
 }
 
