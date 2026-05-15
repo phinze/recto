@@ -9,3 +9,4 @@ crossterm = "0.29"
 anyhow = "1"
 color-eyre = "0.6"
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
+notify = "8.2.0"

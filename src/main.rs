@@ -40,7 +40,10 @@ impl Focus {
 }
 
 struct App {
-    base: Base,
+    backend: Box<dyn Backend>,
+    hl: Highlighter,
+    bases: Vec<Base>,
+    base_idx: usize,
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
@@ -51,17 +54,26 @@ struct App {
 }
 
 impl App {
-    fn load(backend: &dyn Backend, hl: &Highlighter) -> Result<Self> {
-        let base = Base::Revision("@-".into());
-        let changes = backend.list_changes(&base)?;
-        let diff = backend.unified_diff(&base)?;
-        let (rendered, file_starts) = render_diff(&diff, &changes, hl);
+    fn load(backend: Box<dyn Backend>, hl: Highlighter) -> Result<Self> {
+        let bases = vec![
+            Base::Revision("@-".into()),
+            Base::Revision("trunk()".into()),
+            Base::Revision("@--".into()),
+            Base::Revision("root()".into()),
+        ];
+        let base_idx = 0;
+        let changes = backend.list_changes(&bases[base_idx])?;
+        let diff = backend.unified_diff(&bases[base_idx])?;
+        let (rendered, file_starts) = render_diff(&diff, &changes, &hl);
         let mut file_state = ListState::default();
         if !changes.is_empty() {
             file_state.select(Some(0));
         }
         Ok(Self {
-            base,
+            backend,
+            hl,
+            bases,
+            base_idx,
             changes,
             rendered,
             file_starts,
@@ -70,6 +82,47 @@ impl App {
             focus: Focus::Files,
             file_state,
         })
+    }
+
+    fn base(&self) -> &Base {
+        &self.bases[self.base_idx]
+    }
+
+    fn cycle_base(&mut self) -> Result<()> {
+        let attempts = self.bases.len();
+        for _ in 0..attempts {
+            let next_idx = (self.base_idx + 1) % self.bases.len();
+            let new_base = self.bases[next_idx].clone();
+            match self.try_load_base(&new_base) {
+                Ok((changes, rendered, file_starts)) => {
+                    self.base_idx = next_idx;
+                    self.changes = changes;
+                    self.rendered = rendered;
+                    self.file_starts = file_starts;
+                    self.scroll = 0;
+                    self.file_state.select(if self.changes.is_empty() {
+                        None
+                    } else {
+                        Some(0)
+                    });
+                    return Ok(());
+                }
+                Err(_) => {
+                    self.base_idx = next_idx;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    fn try_load_base(
+        &self,
+        base: &Base,
+    ) -> Result<(Vec<FileChange>, Vec<Line<'static>>, Vec<u16>)> {
+        let changes = self.backend.list_changes(base)?;
+        let diff = self.backend.unified_diff(base)?;
+        let (rendered, file_starts) = render_diff(&diff, &changes, &self.hl);
+        Ok((changes, rendered, file_starts))
     }
 
     fn rendered_lines(&self) -> u16 {
@@ -266,9 +319,9 @@ fn status_color(status: FileStatus) -> Color {
 fn main() -> Result<()> {
     let _ = color_eyre::install();
 
-    let backend = JjBackend::new();
+    let backend: Box<dyn Backend> = Box::new(JjBackend::new());
     let hl = Highlighter::new();
-    let mut app = App::load(&backend, &hl)?;
+    let mut app = App::load(backend, hl)?;
 
     let mut terminal = init_terminal()?;
     let result = run(&mut terminal, &mut app);
@@ -299,6 +352,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             match key.code {
                 KeyCode::Char('q') | KeyCode::Esc => break,
                 KeyCode::Tab => app.focus = app.focus.cycle(),
+                KeyCode::Char('b') => app.cycle_base()?,
                 KeyCode::Enter => app.jump_to_selected(),
                 KeyCode::Char('j') | KeyCode::Down => match app.focus {
                     Focus::Files => {
@@ -335,7 +389,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     let header = Paragraph::new(Line::from(format!(
         "recto — base: {} · {} changed file{}",
-        app.base.display(),
+        app.base().display(),
         app.changes.len(),
         if app.changes.len() == 1 { "" } else { "s" },
     )))
