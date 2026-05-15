@@ -3,6 +3,9 @@ mod highlight;
 
 use std::collections::HashMap;
 use std::io::{self, stdout};
+use std::path::Path;
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
@@ -19,10 +22,14 @@ use ratatui::{
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
+use notify::{EventKind, RecursiveMode, Watcher};
+
 use crate::backend::{Backend, Base, FileChange, FileStatus, JjBackend};
 use crate::highlight::{Highlighter, ext_for_path};
 
 const SCROLLOFF: u16 = 3;
+const POLL_INTERVAL: Duration = Duration::from_millis(50);
+const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -123,6 +130,34 @@ impl App {
         let diff = self.backend.unified_diff(base)?;
         let (rendered, file_starts) = render_diff(&diff, &changes, &self.hl);
         Ok((changes, rendered, file_starts))
+    }
+
+    /// Re-fetch from the current base, preserving file selection by path.
+    fn reload(&mut self) -> Result<()> {
+        let prev_path = self
+            .file_state
+            .selected()
+            .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
+
+        let base = self.bases[self.base_idx].clone();
+        let (changes, rendered, file_starts) = self.try_load_base(&base)?;
+        self.changes = changes;
+        self.rendered = rendered;
+        self.file_starts = file_starts;
+
+        let new_idx = prev_path
+            .and_then(|p| self.changes.iter().position(|c| c.path == p))
+            .or_else(|| (!self.changes.is_empty()).then_some(0));
+        self.file_state.select(new_idx);
+
+        if let Some(i) = new_idx
+            && let Some(&offset) = self.file_starts.get(i)
+        {
+            self.scroll = offset.min(self.max_scroll());
+        } else {
+            self.scroll = 0;
+        }
+        Ok(())
     }
 
     fn rendered_lines(&self) -> u16 {
@@ -342,11 +377,34 @@ fn restore_terminal() -> Result<()> {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+    let (tx, rx) = mpsc::channel::<()>();
+    let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
+        if let Ok(event) = res
+            && is_interesting_event(&event)
+        {
+            let _ = tx.send(());
+        }
+    })?;
+    watcher.watch(Path::new("."), RecursiveMode::Recursive)?;
+
+    let mut pending_reload: Option<Instant> = None;
+
     loop {
         terminal.draw(|f| draw(f, app))?;
         app.scroll = app.scroll.min(app.max_scroll());
 
-        if let Event::Key(key) = event::read()?
+        while rx.try_recv().is_ok() {
+            pending_reload = Some(Instant::now());
+        }
+        if let Some(t) = pending_reload
+            && t.elapsed() >= RELOAD_DEBOUNCE
+        {
+            let _ = app.reload();
+            pending_reload = None;
+        }
+
+        if event::poll(POLL_INTERVAL)?
+            && let Event::Key(key) = event::read()?
             && key.kind == KeyEventKind::Press
         {
             match key.code {
@@ -373,6 +431,22 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
     }
     Ok(())
+}
+
+fn is_interesting_event(event: &notify::Event) -> bool {
+    if !matches!(
+        event.kind,
+        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
+    ) {
+        return false;
+    }
+    event.paths.iter().any(|p| {
+        let s = p.to_string_lossy();
+        !s.contains("/.jj/")
+            && !s.contains("/.git/")
+            && !s.contains("/target/")
+            && !s.contains("/node_modules/")
+    })
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
