@@ -1,4 +1,5 @@
 mod backend;
+mod highlight;
 
 use std::collections::HashMap;
 use std::io::{self, stdout};
@@ -19,6 +20,7 @@ use ratatui::{
 };
 
 use crate::backend::{Backend, Base, FileChange, FileStatus, JjBackend};
+use crate::highlight::{Highlighter, ext_for_path};
 
 const SCROLLOFF: u16 = 3;
 
@@ -49,11 +51,11 @@ struct App {
 }
 
 impl App {
-    fn load(backend: &dyn Backend) -> Result<Self> {
+    fn load(backend: &dyn Backend, hl: &Highlighter) -> Result<Self> {
         let base = Base::Revision("@-".into());
         let changes = backend.list_changes(&base)?;
         let diff = backend.unified_diff(&base)?;
-        let (rendered, file_starts) = render_diff(&diff, &changes);
+        let (rendered, file_starts) = render_diff(&diff, &changes, hl);
         let mut file_state = ListState::default();
         if !changes.is_empty() {
             file_state.select(Some(0));
@@ -131,7 +133,11 @@ impl App {
     }
 }
 
-fn render_diff(diff: &str, changes: &[FileChange]) -> (Vec<Line<'static>>, Vec<u16>) {
+fn render_diff(
+    diff: &str,
+    changes: &[FileChange],
+    hl: &Highlighter,
+) -> (Vec<Line<'static>>, Vec<u16>) {
     let path_to_idx: HashMap<&str, usize> = changes
         .iter()
         .enumerate()
@@ -141,6 +147,7 @@ fn render_diff(diff: &str, changes: &[FileChange]) -> (Vec<Line<'static>>, Vec<u
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut file_starts: Vec<u16> = vec![0; changes.len()];
     let mut in_metadata = false;
+    let mut current_ext = String::new();
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ")
@@ -154,19 +161,62 @@ fn render_diff(diff: &str, changes: &[FileChange]) -> (Vec<Line<'static>>, Vec<u
             }
             rendered.push(file_separator(b, status));
             in_metadata = true;
+            current_ext = ext_for_path(b).to_string();
             continue;
         }
         if in_metadata {
             if line.starts_with("@@") {
                 in_metadata = false;
-                rendered.push(Line::from(line.to_string()));
+                rendered.push(hunk_header(line));
             }
             continue;
         }
-        rendered.push(Line::from(line.to_string()));
+        rendered.push(diff_body_line(line, &current_ext, hl));
     }
 
     (rendered, file_starts)
+}
+
+fn hunk_header(line: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        line.to_string(),
+        Style::default()
+            .fg(Color::Cyan)
+            .add_modifier(Modifier::BOLD),
+    ))
+}
+
+fn diff_body_line(line: &str, ext: &str, hl: &Highlighter) -> Line<'static> {
+    let (marker_char, body, marker_color, line_bg) = if let Some(rest) = line.strip_prefix('+') {
+        ('+', rest, Color::Green, Some(Color::Rgb(20, 40, 25)))
+    } else if let Some(rest) = line.strip_prefix('-') {
+        ('-', rest, Color::Red, Some(Color::Rgb(50, 20, 25)))
+    } else if let Some(rest) = line.strip_prefix(' ') {
+        (' ', rest, Color::DarkGray, None)
+    } else if line.starts_with('\\') {
+        return Line::from(Span::styled(
+            line.to_string(),
+            Style::default()
+                .fg(Color::DarkGray)
+                .add_modifier(Modifier::ITALIC),
+        ));
+    } else {
+        return Line::from(line.to_string());
+    };
+
+    let mut spans = vec![Span::styled(
+        marker_char.to_string(),
+        Style::default()
+            .fg(marker_color)
+            .add_modifier(Modifier::BOLD),
+    )];
+    spans.extend(hl.line_spans(body, ext));
+
+    let mut result = Line::from(spans);
+    if let Some(bg) = line_bg {
+        result = result.style(Style::default().bg(bg));
+    }
+    result
 }
 
 fn file_separator(path: &str, status: Option<FileStatus>) -> Line<'static> {
@@ -217,7 +267,8 @@ fn main() -> Result<()> {
     let _ = color_eyre::install();
 
     let backend = JjBackend::new();
-    let mut app = App::load(&backend)?;
+    let hl = Highlighter::new();
+    let mut app = App::load(&backend, &hl)?;
 
     let mut terminal = init_terminal()?;
     let result = run(&mut terminal, &mut app);
