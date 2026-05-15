@@ -4,6 +4,7 @@ mod highlight;
 use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::Path;
+use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
@@ -25,6 +26,15 @@ use ratatui::{
 use notify::{EventKind, RecursiveMode, Watcher};
 
 use crate::backend::{Backend, Base, FileChange, FileStatus, JjBackend};
+
+type LineInfo = Option<(usize, u32)>;
+
+struct LoadedDiff {
+    changes: Vec<FileChange>,
+    rendered: Vec<Line<'static>>,
+    file_starts: Vec<u16>,
+    line_info: Vec<LineInfo>,
+}
 use crate::highlight::{Highlighter, ext_for_path};
 
 const SCROLLOFF: u16 = 3;
@@ -54,6 +64,7 @@ struct App {
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
+    line_info: Vec<LineInfo>,
     scroll: u16,
     h_scroll: u16,
     diff_viewport: u16,
@@ -72,7 +83,7 @@ impl App {
         let base_idx = 0;
         let changes = backend.list_changes(&bases[base_idx])?;
         let diff = backend.unified_diff(&bases[base_idx])?;
-        let (rendered, file_starts) = render_diff(&diff, &changes, &hl);
+        let (rendered, file_starts, line_info) = render_diff(&diff, &changes, &hl);
         let mut file_state = ListState::default();
         if !changes.is_empty() {
             file_state.select(Some(0));
@@ -85,6 +96,7 @@ impl App {
             changes,
             rendered,
             file_starts,
+            line_info,
             scroll: 0,
             h_scroll: 0,
             diff_viewport: 0,
@@ -103,11 +115,12 @@ impl App {
             let next_idx = (self.base_idx + 1) % self.bases.len();
             let new_base = self.bases[next_idx].clone();
             match self.try_load_base(&new_base) {
-                Ok((changes, rendered, file_starts)) => {
+                Ok(loaded) => {
                     self.base_idx = next_idx;
-                    self.changes = changes;
-                    self.rendered = rendered;
-                    self.file_starts = file_starts;
+                    self.changes = loaded.changes;
+                    self.rendered = loaded.rendered;
+                    self.file_starts = loaded.file_starts;
+                    self.line_info = loaded.line_info;
                     self.scroll = 0;
                     self.h_scroll = 0;
                     self.file_state.select(if self.changes.is_empty() {
@@ -125,14 +138,16 @@ impl App {
         Ok(())
     }
 
-    fn try_load_base(
-        &self,
-        base: &Base,
-    ) -> Result<(Vec<FileChange>, Vec<Line<'static>>, Vec<u16>)> {
+    fn try_load_base(&self, base: &Base) -> Result<LoadedDiff> {
         let changes = self.backend.list_changes(base)?;
         let diff = self.backend.unified_diff(base)?;
-        let (rendered, file_starts) = render_diff(&diff, &changes, &self.hl);
-        Ok((changes, rendered, file_starts))
+        let (rendered, file_starts, line_info) = render_diff(&diff, &changes, &self.hl);
+        Ok(LoadedDiff {
+            changes,
+            rendered,
+            file_starts,
+            line_info,
+        })
     }
 
     /// Re-fetch from the current base, preserving file selection by path.
@@ -143,10 +158,11 @@ impl App {
             .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
 
         let base = self.bases[self.base_idx].clone();
-        let (changes, rendered, file_starts) = self.try_load_base(&base)?;
-        self.changes = changes;
-        self.rendered = rendered;
-        self.file_starts = file_starts;
+        let loaded = self.try_load_base(&base)?;
+        self.changes = loaded.changes;
+        self.rendered = loaded.rendered;
+        self.file_starts = loaded.file_starts;
+        self.line_info = loaded.line_info;
 
         let new_idx = prev_path
             .and_then(|p| self.changes.iter().position(|c| c.path == p))
@@ -223,6 +239,30 @@ impl App {
         self.h_scroll = self.h_scroll.saturating_sub(n);
     }
 
+    /// Resolve the (path, line) the user wants to edit.
+    /// Files focus: the selected file's first body line. Diff focus: the line
+    /// at the top of the diff viewport. Skips Deleted (the path is gone) and
+    /// Renamed/Copied (the jj summary path is not a clean filename).
+    fn edit_target(&self) -> Option<(String, u32)> {
+        let start = match self.focus {
+            Focus::Files => *self.file_starts.get(self.file_state.selected()?)?,
+            Focus::Diff => self.scroll,
+        };
+        let (fidx, line) = self
+            .line_info
+            .iter()
+            .skip(start as usize)
+            .find_map(|info| info.as_ref().copied())?;
+        let change = self.changes.get(fidx)?;
+        if matches!(
+            change.status,
+            FileStatus::Deleted | FileStatus::Renamed | FileStatus::Copied
+        ) {
+            return None;
+        }
+        Some((change.path.clone(), line.max(1)))
+    }
+
     /// Index into `changes` of the file owning the current scroll position.
     fn current_file(&self) -> Option<usize> {
         self.file_starts
@@ -238,7 +278,7 @@ fn render_diff(
     diff: &str,
     changes: &[FileChange],
     hl: &Highlighter,
-) -> (Vec<Line<'static>>, Vec<u16>) {
+) -> (Vec<Line<'static>>, Vec<u16>, Vec<LineInfo>) {
     let path_to_idx: HashMap<&str, usize> = changes
         .iter()
         .enumerate()
@@ -246,9 +286,12 @@ fn render_diff(
         .collect();
 
     let mut rendered: Vec<Line<'static>> = Vec::new();
+    let mut line_info: Vec<LineInfo> = Vec::new();
     let mut file_starts: Vec<u16> = vec![0; changes.len()];
     let mut in_metadata = false;
     let mut current_ext = String::new();
+    let mut current_file: Option<usize> = None;
+    let mut new_line: u32 = 0;
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ")
@@ -261,21 +304,49 @@ fn render_diff(
                 file_starts[i] = line_no;
             }
             rendered.push(file_separator(b, status));
+            line_info.push(None);
             in_metadata = true;
             current_ext = ext_for_path(b).to_string();
+            current_file = idx;
+            new_line = 0;
             continue;
         }
         if in_metadata {
             if line.starts_with("@@") {
                 in_metadata = false;
+                new_line = parse_hunk_new_start(line).unwrap_or(1);
                 rendered.push(hunk_header(line));
+                line_info.push(None);
             }
             continue;
         }
         rendered.push(diff_body_line(line, &current_ext, hl));
+        let info = match line.chars().next() {
+            Some('+') => {
+                let i = current_file.map(|f| (f, new_line));
+                new_line += 1;
+                i
+            }
+            Some(' ') => {
+                let i = current_file.map(|f| (f, new_line));
+                new_line += 1;
+                i
+            }
+            Some('-') => current_file.map(|f| (f, new_line)),
+            _ => None,
+        };
+        line_info.push(info);
     }
 
-    (rendered, file_starts)
+    (rendered, file_starts, line_info)
+}
+
+fn parse_hunk_new_start(line: &str) -> Option<u32> {
+    let plus = line
+        .split_whitespace()
+        .find(|tok| tok.starts_with('+'))?
+        .trim_start_matches('+');
+    plus.split(',').next()?.parse().ok()
 }
 
 fn hunk_header(line: &str) -> Line<'static> {
@@ -389,6 +460,28 @@ fn restore_terminal() -> Result<()> {
     Ok(())
 }
 
+fn run_editor(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    path: &str,
+    line: u32,
+) -> Result<()> {
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let mut parts = editor.split_whitespace();
+    let prog = parts.next().unwrap_or("vi");
+    let extra_args: Vec<&str> = parts.collect();
+
+    restore_terminal()?;
+    let _ = Command::new(prog)
+        .args(&extra_args)
+        .arg(format!("+{line}"))
+        .arg(path)
+        .status();
+    enable_raw_mode()?;
+    execute!(stdout(), EnterAlternateScreen)?;
+    terminal.clear()?;
+    Ok(())
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -456,6 +549,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     app.scroll_left(1)
                 }
                 KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
+                KeyCode::Char('e') => {
+                    if let Some((path, line)) = app.edit_target() {
+                        let _ = run_editor(terminal, &path, line);
+                    }
+                }
                 _ => {}
             }
         }
