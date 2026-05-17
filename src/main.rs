@@ -29,7 +29,7 @@ use ratatui::{
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
-use crate::backend::{Backend, Base, FileChange, FileStatus, JjBackend};
+use crate::backend::{Backend, Base, FileChange, FileStatus, detect_backend};
 
 type LineInfo = Option<(usize, u32)>;
 
@@ -89,12 +89,7 @@ struct App {
 
 impl App {
     fn load(backend: Box<dyn Backend>, hl: Highlighter, initial: Option<String>) -> Result<Self> {
-        let mut bases = vec![
-            Base::Revision("@-".into()),
-            Base::Revision("trunk()".into()),
-            Base::Revision("@--".into()),
-            Base::Revision("root()".into()),
-        ];
+        let mut bases = backend.default_bases();
         let base_idx = match initial {
             Some(r) => {
                 if let Some(i) = bases.iter().position(|b| b.display() == r) {
@@ -466,7 +461,10 @@ fn main() -> Result<()> {
     let _ = color_eyre::install();
     let cli = Cli::parse();
 
-    let backend: Box<dyn Backend> = Box::new(JjBackend::new());
+    let backend = detect_backend().unwrap_or_else(|e| {
+        eprintln!("recto: {e}");
+        std::process::exit(2);
+    });
     let hl = Highlighter::new();
     let mut app = App::load(backend, hl, cli.base).unwrap_or_else(|e| {
         eprintln!("recto: {e}");
