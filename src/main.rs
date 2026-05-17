@@ -52,6 +52,10 @@ struct Cli {
     /// Initial diff base (jj revset or git ref). Examples: `@-`, `trunk()`, `HEAD`.
     #[arg(long, value_name = "REVSET")]
     base: Option<String>,
+
+    /// Run as if started from this directory. Matches jj's `-R`.
+    #[arg(short = 'R', long, value_name = "PATH")]
+    repository: Option<std::path::PathBuf>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -460,6 +464,13 @@ fn status_color(status: FileStatus) -> Color {
 fn main() -> Result<()> {
     let _ = color_eyre::install();
     let cli = Cli::parse();
+
+    if let Some(path) = &cli.repository {
+        std::env::set_current_dir(path).unwrap_or_else(|e| {
+            eprintln!("recto: -R {}: {e}", path.display());
+            std::process::exit(2);
+        });
+    }
 
     let backend = detect_backend().unwrap_or_else(|e| {
         eprintln!("recto: {e}");
