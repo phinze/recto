@@ -9,6 +9,7 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
+use clap::Parser;
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
@@ -44,6 +45,15 @@ const SCROLLOFF: u16 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 
+/// recto — a jj-first terminal diff viewer.
+#[derive(Parser, Debug)]
+#[command(version, about, long_about = None)]
+struct Cli {
+    /// Initial diff base (jj revset or git ref). Examples: `@-`, `trunk()`, `HEAD`.
+    #[arg(long, value_name = "REVSET")]
+    base: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Files,
@@ -78,14 +88,24 @@ struct App {
 }
 
 impl App {
-    fn load(backend: Box<dyn Backend>, hl: Highlighter) -> Result<Self> {
-        let bases = vec![
+    fn load(backend: Box<dyn Backend>, hl: Highlighter, initial: Option<String>) -> Result<Self> {
+        let mut bases = vec![
             Base::Revision("@-".into()),
             Base::Revision("trunk()".into()),
             Base::Revision("@--".into()),
             Base::Revision("root()".into()),
         ];
-        let base_idx = 0;
+        let base_idx = match initial {
+            Some(r) => {
+                if let Some(i) = bases.iter().position(|b| b.display() == r) {
+                    i
+                } else {
+                    bases.insert(0, Base::Revision(r));
+                    0
+                }
+            }
+            None => 0,
+        };
         let changes = backend.list_changes(&bases[base_idx])?;
         let diff = backend.unified_diff(&bases[base_idx])?;
         let (rendered, file_starts, line_info) = render_diff(&diff, &changes, &hl);
@@ -444,10 +464,11 @@ fn status_color(status: FileStatus) -> Color {
 
 fn main() -> Result<()> {
     let _ = color_eyre::install();
+    let cli = Cli::parse();
 
     let backend: Box<dyn Backend> = Box::new(JjBackend::new());
     let hl = Highlighter::new();
-    let mut app = App::load(backend, hl)?;
+    let mut app = App::load(backend, hl, cli.base)?;
 
     let mut terminal = init_terminal()?;
     let result = run(&mut terminal, &mut app);
