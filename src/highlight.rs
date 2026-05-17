@@ -1,3 +1,4 @@
+use std::io::Cursor;
 use std::path::Path;
 
 use ratatui::{
@@ -10,6 +11,8 @@ use syntect::{
     parsing::SyntaxSet,
 };
 
+const MOCHA_TM_THEME: &str = include_str!("../assets/Catppuccin Mocha.tmTheme");
+
 pub struct Highlighter {
     syntax_set: SyntaxSet,
     theme: Theme,
@@ -18,8 +21,8 @@ pub struct Highlighter {
 impl Highlighter {
     pub fn new() -> Self {
         let syntax_set = SyntaxSet::load_defaults_newlines();
-        let theme_set = ThemeSet::load_defaults();
-        let theme = theme_set.themes["base16-ocean.dark"].clone();
+        let theme = ThemeSet::load_from_reader(&mut Cursor::new(MOCHA_TM_THEME))
+            .expect("bundled Catppuccin Mocha tmTheme is valid");
         Self { syntax_set, theme }
     }
 

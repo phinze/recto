@@ -1,5 +1,6 @@
 mod backend;
 mod highlight;
+mod theme;
 
 use std::collections::HashMap;
 use std::io::{self, stdout};
@@ -379,23 +380,23 @@ fn hunk_header(line: &str) -> Line<'static> {
     Line::from(Span::styled(
         line.to_string(),
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::TEAL)
             .add_modifier(Modifier::BOLD),
     ))
 }
 
 fn diff_body_line(line: &str, ext: &str, hl: &Highlighter) -> Line<'static> {
     let (marker_char, body, marker_color, line_bg) = if let Some(rest) = line.strip_prefix('+') {
-        ('+', rest, Color::Green, Some(Color::Rgb(20, 40, 25)))
+        ('+', rest, theme::GREEN, Some(theme::ADDED_BG))
     } else if let Some(rest) = line.strip_prefix('-') {
-        ('-', rest, Color::Red, Some(Color::Rgb(50, 20, 25)))
+        ('-', rest, theme::RED, Some(theme::REMOVED_BG))
     } else if let Some(rest) = line.strip_prefix(' ') {
-        (' ', rest, Color::DarkGray, None)
+        (' ', rest, theme::OVERLAY0, None)
     } else if line.starts_with('\\') {
         return Line::from(Span::styled(
             line.to_string(),
             Style::default()
-                .fg(Color::DarkGray)
+                .fg(theme::OVERLAY0)
                 .add_modifier(Modifier::ITALIC),
         ));
     } else {
@@ -419,20 +420,22 @@ fn diff_body_line(line: &str, ext: &str, hl: &Highlighter) -> Line<'static> {
 
 fn file_separator(path: &str, status: Option<FileStatus>) -> Line<'static> {
     let glyph = status.map_or(' ', |s| s.glyph());
-    let color = status.map_or(Color::Gray, status_color);
+    let color = status.map_or(theme::SUBTEXT0, status_color);
     Line::from(vec![
-        Span::styled("── ", Style::default().fg(Color::DarkGray)),
+        Span::styled("── ", Style::default().fg(theme::SURFACE1)),
         Span::styled(
             format!("{glyph} "),
             Style::default().fg(color).add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             path.to_string(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
         ),
         Span::styled(
             " ──────────────────────────────────────────────",
-            Style::default().fg(Color::DarkGray),
+            Style::default().fg(theme::SURFACE1),
         ),
     ])
 }
@@ -447,17 +450,20 @@ fn sticky_line(change: &FileChange) -> Line<'static> {
         ),
         Span::styled(
             change.path.clone(),
-            Style::default().add_modifier(Modifier::BOLD),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
         ),
     ])
+    .style(Style::default().bg(theme::SURFACE0))
 }
 
 fn status_color(status: FileStatus) -> Color {
     match status {
-        FileStatus::Added => Color::Green,
-        FileStatus::Deleted => Color::Red,
-        FileStatus::Modified => Color::Yellow,
-        FileStatus::Renamed | FileStatus::Copied => Color::Cyan,
+        FileStatus::Added => theme::GREEN,
+        FileStatus::Deleted => theme::RED,
+        FileStatus::Modified => theme::YELLOW,
+        FileStatus::Renamed | FileStatus::Copied => theme::TEAL,
     }
 }
 
@@ -683,7 +689,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         app.changes.len(),
         if app.changes.len() == 1 { "" } else { "s" },
     )))
-    .style(Style::default().add_modifier(Modifier::BOLD));
+    .style(
+        Style::default()
+            .fg(theme::MAUVE)
+            .add_modifier(Modifier::BOLD),
+    );
     frame.render_widget(header, rows[0]);
 
     let panes = Layout::default()
@@ -695,7 +705,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     draw_diff(frame, panes[1], app);
 
     let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
-        .style(Style::default().fg(Color::DarkGray));
+        .style(Style::default().fg(theme::OVERLAY0));
     frame.render_widget(footer, rows[2]);
 }
 
@@ -724,7 +734,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     frame.render_widget(block, area);
 
     if app.rendered.is_empty() {
-        let empty = Paragraph::new("(no changes)").style(Style::default().fg(Color::DarkGray));
+        let empty = Paragraph::new("(no changes)").style(Style::default().fg(theme::OVERLAY0));
         frame.render_widget(empty, inner);
         app.diff_viewport = inner.height;
         app.diff_content_area = inner;
@@ -751,8 +761,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let sticky_text = current
         .map(|i| sticky_line(&app.changes[i]))
         .unwrap_or_else(|| Line::from(""));
-    let sticky =
-        Paragraph::new(sticky_text).style(Style::default().add_modifier(Modifier::REVERSED));
+    let sticky = Paragraph::new(sticky_text).style(Style::default().bg(theme::SURFACE0));
     frame.render_widget(sticky, sticky_area);
 
     let content = Paragraph::new(app.rendered.clone())
@@ -763,10 +772,10 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
     let style = if focused {
         Style::default()
-            .fg(Color::Cyan)
+            .fg(theme::MAUVE)
             .add_modifier(Modifier::BOLD)
     } else {
-        Style::default().fg(Color::DarkGray)
+        Style::default().fg(theme::SURFACE1)
     };
     Block::default()
         .borders(Borders::ALL)
