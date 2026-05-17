@@ -10,14 +10,17 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::{
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{
+        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
+        MouseEventKind,
+    },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
 };
 use ratatui::{
     Terminal,
     backend::CrosstermBackend,
-    layout::{Constraint, Direction, Layout, Rect},
+    layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
     widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
@@ -70,6 +73,8 @@ struct App {
     diff_viewport: u16,
     focus: Focus,
     file_state: ListState,
+    files_area: Rect,
+    diff_content_area: Rect,
 }
 
 impl App {
@@ -102,6 +107,8 @@ impl App {
             diff_viewport: 0,
             focus: Focus::Files,
             file_state,
+            files_area: Rect::default(),
+            diff_content_area: Rect::default(),
         })
     }
 
@@ -450,13 +457,13 @@ fn main() -> Result<()> {
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     Ok(Terminal::new(CrosstermBackend::new(stdout()))?)
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(stdout(), LeaveAlternateScreen)?;
+    execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
     Ok(())
 }
 
@@ -477,7 +484,7 @@ fn run_editor(
         .arg(path)
         .status();
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen)?;
+    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
     Ok(())
 }
@@ -509,56 +516,104 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             pending_reload = None;
         }
 
-        if event::poll(POLL_INTERVAL)?
-            && let Event::Key(key) = event::read()?
-            && key.kind == KeyEventKind::Press
-        {
-            match key.code {
-                KeyCode::Char('q') | KeyCode::Esc => break,
-                KeyCode::Tab => app.focus = app.focus.cycle(),
-                KeyCode::Char('b') => app.cycle_base()?,
-                KeyCode::Enter => app.jump_to_selected(),
-                KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                    Focus::Files => {
+        if event::poll(POLL_INTERVAL)? {
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                    KeyCode::Char('q') | KeyCode::Esc => break,
+                    KeyCode::Tab => app.focus = app.focus.cycle(),
+                    KeyCode::Char('b') => app.cycle_base()?,
+                    KeyCode::Enter => app.jump_to_selected(),
+                    KeyCode::Char('j') | KeyCode::Down => match app.focus {
+                        Focus::Files => {
+                            app.select_next();
+                            app.jump_to_selected();
+                        }
+                        Focus::Diff => app.scroll_down(1),
+                    },
+                    KeyCode::Char('k') | KeyCode::Up => match app.focus {
+                        Focus::Files => {
+                            app.select_prev();
+                            app.jump_to_selected();
+                        }
+                        Focus::Diff => app.scroll_up(1),
+                    },
+                    KeyCode::Char('H') => app.focus = Focus::Files,
+                    KeyCode::Char('L') => app.focus = Focus::Diff,
+                    KeyCode::Char('J') => {
                         app.select_next();
                         app.jump_to_selected();
                     }
-                    Focus::Diff => app.scroll_down(1),
-                },
-                KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                    Focus::Files => {
+                    KeyCode::Char('K') => {
                         app.select_prev();
                         app.jump_to_selected();
                     }
-                    Focus::Diff => app.scroll_up(1),
-                },
-                KeyCode::Char('H') => app.focus = Focus::Files,
-                KeyCode::Char('L') => app.focus = Focus::Diff,
-                KeyCode::Char('J') => {
-                    app.select_next();
-                    app.jump_to_selected();
-                }
-                KeyCode::Char('K') => {
-                    app.select_prev();
-                    app.jump_to_selected();
-                }
-                KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
-                    app.scroll_right(1)
-                }
-                KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => {
-                    app.scroll_left(1)
-                }
-                KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
-                KeyCode::Char('e') => {
-                    if let Some((path, line)) = app.edit_target() {
-                        let _ = run_editor(terminal, &path, line);
+                    KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
+                        app.scroll_right(1)
                     }
-                }
+                    KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => {
+                        app.scroll_left(1)
+                    }
+                    KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
+                    KeyCode::Char('e') => {
+                        if let Some((path, line)) = app.edit_target() {
+                            let _ = run_editor(terminal, &path, line);
+                        }
+                    }
+                    _ => {}
+                },
+                Event::Mouse(m) => handle_mouse(app, m),
                 _ => {}
             }
         }
     }
     Ok(())
+}
+
+fn handle_mouse(app: &mut App, m: event::MouseEvent) {
+    let pos = Position {
+        x: m.column,
+        y: m.row,
+    };
+    let in_files = app.files_area.contains(pos);
+    let in_diff = app.diff_content_area.contains(pos);
+    match m.kind {
+        MouseEventKind::ScrollDown => {
+            if in_files {
+                app.focus = Focus::Files;
+                app.select_next();
+                app.jump_to_selected();
+            } else if in_diff {
+                app.focus = Focus::Diff;
+                app.scroll_down(3);
+            }
+        }
+        MouseEventKind::ScrollUp => {
+            if in_files {
+                app.focus = Focus::Files;
+                app.select_prev();
+                app.jump_to_selected();
+            } else if in_diff {
+                app.focus = Focus::Diff;
+                app.scroll_up(3);
+            }
+        }
+        MouseEventKind::Down(MouseButton::Left) => {
+            if in_files {
+                app.focus = Focus::Files;
+                let inner_y = app.files_area.y.saturating_add(1);
+                if m.row >= inner_y {
+                    let row = (m.row - inner_y) as usize + app.file_state.offset();
+                    if row < app.changes.len() {
+                        app.file_state.select(Some(row));
+                        app.jump_to_selected();
+                    }
+                }
+            } else if in_diff {
+                app.focus = Focus::Diff;
+            }
+        }
+        _ => {}
+    }
 }
 
 fn is_interesting_event(event: &notify::Event) -> bool {
@@ -612,6 +667,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 }
 
 fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    app.files_area = area;
     let items: Vec<ListItem> = app
         .changes
         .iter()
@@ -638,6 +694,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let empty = Paragraph::new("(no changes)").style(Style::default().fg(Color::DarkGray));
         frame.render_widget(empty, inner);
         app.diff_viewport = inner.height;
+        app.diff_content_area = inner;
         return;
     }
 
@@ -648,6 +705,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let sticky_area = split[0];
     let content_area = split[1];
     app.diff_viewport = content_area.height;
+    app.diff_content_area = content_area;
 
     let current = app.current_file();
     if app.focus == Focus::Diff
