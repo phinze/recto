@@ -468,7 +468,10 @@ fn main() -> Result<()> {
 
     let backend: Box<dyn Backend> = Box::new(JjBackend::new());
     let hl = Highlighter::new();
-    let mut app = App::load(backend, hl, cli.base)?;
+    let mut app = App::load(backend, hl, cli.base).unwrap_or_else(|e| {
+        eprintln!("recto: {e}");
+        std::process::exit(2);
+    });
 
     let mut terminal = init_terminal()?;
     let result = run(&mut terminal, &mut app);
