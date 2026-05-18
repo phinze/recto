@@ -528,6 +528,11 @@ fn run_editor(
     Ok(())
 }
 
+enum Action {
+    Continue,
+    Quit,
+}
+
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
     let (tx, rx) = mpsc::channel::<()>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
@@ -556,56 +561,70 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if event::poll(POLL_INTERVAL)? {
-            match event::read()? {
-                Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-                    KeyCode::Char('q') | KeyCode::Esc => break,
-                    KeyCode::Tab => app.focus = app.focus.cycle(),
-                    KeyCode::Char('b') => app.cycle_base()?,
-                    KeyCode::Enter => app.jump_to_selected(),
-                    KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                        Focus::Files => {
-                            app.select_next();
-                            app.jump_to_selected();
-                        }
-                        Focus::Diff => app.scroll_down(1),
-                    },
-                    KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                        Focus::Files => {
-                            app.select_prev();
-                            app.jump_to_selected();
-                        }
-                        Focus::Diff => app.scroll_up(1),
-                    },
-                    KeyCode::Char('H') => app.focus = Focus::Files,
-                    KeyCode::Char('L') => app.focus = Focus::Diff,
-                    KeyCode::Char('J') => {
-                        app.select_next();
-                        app.jump_to_selected();
-                    }
-                    KeyCode::Char('K') => {
-                        app.select_prev();
-                        app.jump_to_selected();
-                    }
-                    KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
-                        app.scroll_right(1)
-                    }
-                    KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => {
-                        app.scroll_left(1)
-                    }
-                    KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
-                    KeyCode::Char('e') => {
-                        if let Some((path, line)) = app.edit_target() {
-                            let _ = run_editor(terminal, &path, line);
-                        }
-                    }
-                    _ => {}
-                },
-                Event::Mouse(m) => handle_mouse(app, m),
-                _ => {}
+            if matches!(handle_event(app, terminal, event::read()?)?, Action::Quit) {
+                break;
+            }
+            // Coalesce bursts (key autorepeat, mouse-scroll) into one redraw
+            // by draining everything already queued before drawing again.
+            while event::poll(Duration::ZERO)? {
+                if matches!(handle_event(app, terminal, event::read()?)?, Action::Quit) {
+                    return Ok(());
+                }
             }
         }
     }
     Ok(())
+}
+
+fn handle_event(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    event: Event,
+) -> Result<Action> {
+    match event {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+            KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
+            KeyCode::Tab => app.focus = app.focus.cycle(),
+            KeyCode::Char('b') => app.cycle_base()?,
+            KeyCode::Enter => app.jump_to_selected(),
+            KeyCode::Char('j') | KeyCode::Down => match app.focus {
+                Focus::Files => {
+                    app.select_next();
+                    app.jump_to_selected();
+                }
+                Focus::Diff => app.scroll_down(1),
+            },
+            KeyCode::Char('k') | KeyCode::Up => match app.focus {
+                Focus::Files => {
+                    app.select_prev();
+                    app.jump_to_selected();
+                }
+                Focus::Diff => app.scroll_up(1),
+            },
+            KeyCode::Char('H') => app.focus = Focus::Files,
+            KeyCode::Char('L') => app.focus = Focus::Diff,
+            KeyCode::Char('J') => {
+                app.select_next();
+                app.jump_to_selected();
+            }
+            KeyCode::Char('K') => {
+                app.select_prev();
+                app.jump_to_selected();
+            }
+            KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => app.scroll_right(1),
+            KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => app.scroll_left(1),
+            KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
+            KeyCode::Char('e') => {
+                if let Some((path, line)) = app.edit_target() {
+                    let _ = run_editor(terminal, &path, line);
+                }
+            }
+            _ => {}
+        },
+        Event::Mouse(m) => handle_mouse(app, m),
+        _ => {}
+    }
+    Ok(Action::Continue)
 }
 
 fn handle_mouse(app: &mut App, m: event::MouseEvent) {
