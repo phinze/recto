@@ -137,12 +137,25 @@ enum Cursor {
     Rev(usize),
 }
 
+/// Top-level interaction mode. `CommitPicker` swaps the file pane for a list
+/// of revs; selection is a tentative pick that only commits on Enter, so
+/// scrubbing doesn't fire worker loads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Mode {
+    Normal,
+    /// Picker index: 0 = "all changes", 1..=revs.len() = revs[i-1].
+    CommitPicker {
+        selected: usize,
+    },
+}
+
 struct App {
     worker: Worker,
     bases: Vec<Base>,
     base_idx: usize,
     revs: Vec<Rev>,
     cursor: Cursor,
+    mode: Mode,
     loading: Option<Loading>,
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
@@ -194,6 +207,7 @@ impl App {
             base_idx,
             revs,
             cursor: Cursor::All,
+            mode: Mode::Normal,
             loading: None,
             changes: loaded.changes,
             rendered: loaded.rendered,
@@ -289,6 +303,48 @@ impl App {
         self.request_current_scope();
     }
 
+    fn open_commit_picker(&mut self) {
+        let selected = match self.cursor {
+            Cursor::All => 0,
+            Cursor::Rev(i) => i + 1,
+        };
+        self.mode = Mode::CommitPicker { selected };
+    }
+
+    fn picker_select_next(&mut self) {
+        if let Mode::CommitPicker { selected } = &mut self.mode {
+            let max = self.revs.len();
+            *selected = (*selected + 1).min(max);
+        }
+    }
+
+    fn picker_select_prev(&mut self) {
+        if let Mode::CommitPicker { selected } = &mut self.mode {
+            *selected = selected.saturating_sub(1);
+        }
+    }
+
+    fn picker_commit(&mut self) {
+        let Mode::CommitPicker { selected } = self.mode else {
+            return;
+        };
+        let new_cursor = if selected == 0 {
+            Cursor::All
+        } else {
+            Cursor::Rev(selected - 1)
+        };
+        let changed = new_cursor != self.cursor;
+        self.cursor = new_cursor;
+        self.mode = Mode::Normal;
+        if changed {
+            self.request_current_scope();
+        }
+    }
+
+    fn picker_cancel(&mut self) {
+        self.mode = Mode::Normal;
+    }
+
     fn request_current_scope(&mut self) {
         let scope = self.scope();
         let label = Self::scope_label(&scope, &self.revs);
@@ -347,6 +403,9 @@ impl App {
         }
         if let Some(revs) = loaded.revs {
             self.revs = revs;
+            // The picker was looking at an older list; the user's mental
+            // pick no longer maps cleanly. Drop them back to normal mode.
+            self.mode = Mode::Normal;
         }
 
         let new_idx = prev_path
@@ -742,48 +801,63 @@ fn handle_event(
     event: Event,
 ) -> Result<Action> {
     match event {
-        Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
-            KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
-            KeyCode::Tab => app.focus = app.focus.cycle(),
-            KeyCode::Char('b') => app.cycle_base(),
-            KeyCode::Char(']') => app.cycle_rev_next(),
-            KeyCode::Char('[') => app.cycle_rev_prev(),
-            KeyCode::Enter => app.jump_to_selected(),
-            KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                Focus::Files => {
+        Event::Key(key) if key.kind == KeyEventKind::Press => match app.mode {
+            Mode::CommitPicker { .. } => match key.code {
+                KeyCode::Char('q') => return Ok(Action::Quit),
+                KeyCode::Esc | KeyCode::Char('c') => app.picker_cancel(),
+                KeyCode::Enter => app.picker_commit(),
+                KeyCode::Char('j') | KeyCode::Down => app.picker_select_next(),
+                KeyCode::Char('k') | KeyCode::Up => app.picker_select_prev(),
+                _ => {}
+            },
+            Mode::Normal => match key.code {
+                KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
+                KeyCode::Tab => app.focus = app.focus.cycle(),
+                KeyCode::Char('b') => app.cycle_base(),
+                KeyCode::Char(']') => app.cycle_rev_next(),
+                KeyCode::Char('[') => app.cycle_rev_prev(),
+                KeyCode::Char('c') => app.open_commit_picker(),
+                KeyCode::Enter => app.jump_to_selected(),
+                KeyCode::Char('j') | KeyCode::Down => match app.focus {
+                    Focus::Files => {
+                        app.select_next();
+                        app.jump_to_selected();
+                    }
+                    Focus::Diff => app.scroll_down(1),
+                },
+                KeyCode::Char('k') | KeyCode::Up => match app.focus {
+                    Focus::Files => {
+                        app.select_prev();
+                        app.jump_to_selected();
+                    }
+                    Focus::Diff => app.scroll_up(1),
+                },
+                KeyCode::Char('H') => app.focus = Focus::Files,
+                KeyCode::Char('L') => app.focus = Focus::Diff,
+                KeyCode::Char('J') => {
                     app.select_next();
                     app.jump_to_selected();
                 }
-                Focus::Diff => app.scroll_down(1),
-            },
-            KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                Focus::Files => {
+                KeyCode::Char('K') => {
                     app.select_prev();
                     app.jump_to_selected();
                 }
-                Focus::Diff => app.scroll_up(1),
-            },
-            KeyCode::Char('H') => app.focus = Focus::Files,
-            KeyCode::Char('L') => app.focus = Focus::Diff,
-            KeyCode::Char('J') => {
-                app.select_next();
-                app.jump_to_selected();
-            }
-            KeyCode::Char('K') => {
-                app.select_prev();
-                app.jump_to_selected();
-            }
-            KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => app.scroll_right(1),
-            KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => app.scroll_left(1),
-            KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
-            KeyCode::Char('e') => {
-                if let Some((path, line)) = app.edit_target() {
-                    let _ = run_editor(terminal, &path, line);
+                KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
+                    app.scroll_right(1)
                 }
-            }
-            _ => {}
+                KeyCode::Char('h') | KeyCode::Left if app.focus == Focus::Diff => {
+                    app.scroll_left(1)
+                }
+                KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
+                KeyCode::Char('e') => {
+                    if let Some((path, line)) = app.edit_target() {
+                        let _ = run_editor(terminal, &path, line);
+                    }
+                }
+                _ => {}
+            },
         },
-        Event::Mouse(m) => handle_mouse(app, m),
+        Event::Mouse(m) if matches!(app.mode, Mode::Normal) => handle_mouse(app, m),
         _ => {}
     }
     Ok(Action::Continue)
@@ -902,11 +976,19 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(rows[1]);
 
-    draw_files(frame, panes[0], app);
+    if matches!(app.mode, Mode::CommitPicker { .. }) {
+        draw_commits(frame, panes[0], app);
+    } else {
+        draw_files(frame, panes[0], app);
+    }
     draw_diff(frame, panes[1], app);
 
-    let footer = Paragraph::new(Line::from("q quit · tab focus · b base · ] [ rev · e edit"))
-        .style(Style::default().fg(theme::OVERLAY0));
+    let footer_text = match app.mode {
+        Mode::Normal => "q quit · tab focus · b base · ] [ rev · c pick · e edit",
+        Mode::CommitPicker { .. } => "↵ select · esc cancel · j k move",
+    };
+    let footer =
+        Paragraph::new(Line::from(footer_text)).style(Style::default().fg(theme::OVERLAY0));
     frame.render_widget(footer, rows[2]);
 }
 
@@ -929,8 +1011,62 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     frame.render_stateful_widget(tree, area, &mut app.file_state);
 }
 
+fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Mode::CommitPicker { selected } = app.mode else {
+        return;
+    };
+    // Marker for the rev the user is *currently viewing*, distinct from the
+    // tentative picker selection (rendered via highlight_style).
+    let cursor_idx: usize = match app.cursor {
+        Cursor::All => 0,
+        Cursor::Rev(i) => i + 1,
+    };
+
+    let mut items: Vec<ListItem> = Vec::with_capacity(app.revs.len() + 1);
+
+    let all_marker = if cursor_idx == 0 { "▸ " } else { "  " };
+    items.push(ListItem::new(Line::from(vec![
+        Span::styled(
+            all_marker,
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            "all changes",
+            Style::default().add_modifier(Modifier::ITALIC),
+        ),
+    ])));
+
+    for (i, rev) in app.revs.iter().enumerate() {
+        let marker = if cursor_idx == i + 1 { "▸ " } else { "  " };
+        items.push(ListItem::new(Line::from(vec![
+            Span::styled(
+                marker,
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{} ", rev.short_id),
+                Style::default().fg(theme::TEAL),
+            ),
+            Span::raw(rev.summary.clone()),
+        ])));
+    }
+
+    let list = List::new(items)
+        .block(pane_block("Revs", true))
+        .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
+
+    let mut state = ListState::default();
+    state.select(Some(selected));
+    frame.render_stateful_widget(list, area, &mut state);
+}
+
 fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let block = pane_block("Diff", app.focus == Focus::Diff);
+    let diff_focused = app.focus == Focus::Diff && matches!(app.mode, Mode::Normal);
+    let block = pane_block("Diff", diff_focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
