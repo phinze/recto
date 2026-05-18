@@ -25,7 +25,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -164,6 +164,7 @@ struct App {
     line_info: Vec<LineInfo>,
     scroll: u16,
     h_scroll: u16,
+    wrap: bool,
     diff_viewport: u16,
     focus: Focus,
     file_state: ListState,
@@ -216,6 +217,7 @@ impl App {
             line_info: loaded.line_info,
             scroll: 0,
             h_scroll: 0,
+            wrap: false,
             diff_viewport: 0,
             focus: Focus::Files,
             file_state,
@@ -851,6 +853,12 @@ fn handle_event(
                     app.scroll_left(1)
                 }
                 KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
+                KeyCode::Char('w') => {
+                    app.wrap = !app.wrap;
+                    if app.wrap {
+                        app.h_scroll = 0;
+                    }
+                }
                 KeyCode::Char('e') => {
                     if let Some((path, line)) = app.edit_target() {
                         let _ = run_editor(terminal, &path, line);
@@ -986,7 +994,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     draw_diff(frame, panes[1], app);
 
     let footer_text = match app.mode {
-        Mode::Normal => "q quit · tab focus · b base · ] [ rev · c pick · e edit",
+        Mode::Normal => "q quit · tab focus · b base · ] [ rev · c pick · w wrap · e edit",
         Mode::CommitPicker { .. } => "↵ select · esc cancel · j k move",
     };
     let footer =
@@ -1106,11 +1114,20 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let scroll = app.scroll.min(app.max_scroll()) as usize;
     let total = app.rendered.len();
     let start = scroll.min(total);
-    let end = start
-        .saturating_add(content_area.height as usize)
-        .min(total);
-    let window = app.rendered[start..end].to_vec();
-    let content = Paragraph::new(window).scroll((0, app.h_scroll));
+    // In wrap mode we can't pre-trim to viewport height — a single source line
+    // may span many visual rows. Slice to the end and let Paragraph stop when
+    // the area fills. `app.scroll` stays a source-line offset, so file jumps
+    // land correctly; vertical scrolling moves by source line, not visual row.
+    let content = if app.wrap {
+        let window = app.rendered[start..].to_vec();
+        Paragraph::new(window).wrap(Wrap { trim: false })
+    } else {
+        let end = start
+            .saturating_add(content_area.height as usize)
+            .min(total);
+        let window = app.rendered[start..end].to_vec();
+        Paragraph::new(window).scroll((0, app.h_scroll))
+    };
     frame.render_widget(content, content_area);
 }
 
