@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::path::Path;
 use std::process::Command;
-use std::sync::mpsc;
+use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
@@ -30,7 +30,7 @@ use ratatui::{
 
 use notify::{EventKind, RecursiveMode, Watcher};
 
-use crate::backend::{Backend, Base, FileChange, FileStatus, detect_backend};
+use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope, detect_backend};
 
 type LineInfo = Option<(usize, u32)>;
 
@@ -39,6 +39,9 @@ struct LoadedDiff {
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
     line_info: Vec<LineInfo>,
+    /// Populated only when the load was for `Scope::Range`. Rev loads don't
+    /// refresh the rev list — selecting a rev shouldn't redraw the strip.
+    revs: Option<Vec<Rev>>,
 }
 use crate::highlight::{Highlighter, ext_for_path};
 
@@ -49,22 +52,23 @@ const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦
 const SPINNER_FRAME_MS: u128 = 80;
 
 struct Loading {
-    base: Base,
+    scope: Scope,
+    label: String,
     started: Instant,
 }
 
 struct Worker {
-    request_tx: mpsc::Sender<Base>,
-    response_rx: mpsc::Receiver<(Base, Result<LoadedDiff>)>,
+    request_tx: mpsc::Sender<Scope>,
+    response_rx: mpsc::Receiver<(Scope, Result<LoadedDiff>)>,
 }
 
-fn spawn_worker(backend: Box<dyn Backend>, hl: Highlighter) -> Worker {
-    let (request_tx, request_rx) = mpsc::channel::<Base>();
-    let (response_tx, response_rx) = mpsc::channel::<(Base, Result<LoadedDiff>)>();
+fn spawn_worker(backend: Arc<dyn Backend>, hl: Highlighter) -> Worker {
+    let (request_tx, request_rx) = mpsc::channel::<Scope>();
+    let (response_tx, response_rx) = mpsc::channel::<(Scope, Result<LoadedDiff>)>();
     std::thread::spawn(move || {
-        while let Ok(base) = request_rx.recv() {
-            let result = load_diff(&*backend, &hl, &base);
-            if response_tx.send((base, result)).is_err() {
+        while let Ok(scope) = request_rx.recv() {
+            let result = load_diff(&*backend, &hl, &scope);
+            if response_tx.send((scope, result)).is_err() {
                 break;
             }
         }
@@ -75,15 +79,20 @@ fn spawn_worker(backend: Box<dyn Backend>, hl: Highlighter) -> Worker {
     }
 }
 
-fn load_diff(backend: &dyn Backend, hl: &Highlighter, base: &Base) -> Result<LoadedDiff> {
-    let changes = backend.list_changes(base)?;
-    let diff = backend.unified_diff(base)?;
+fn load_diff(backend: &dyn Backend, hl: &Highlighter, scope: &Scope) -> Result<LoadedDiff> {
+    let changes = backend.list_changes(scope)?;
+    let diff = backend.unified_diff(scope)?;
+    let revs = match scope {
+        Scope::Range(base) => Some(backend.list_revs(base)?),
+        Scope::Rev(_) => None,
+    };
     let (rendered, file_starts, line_info) = render_diff(&diff, &changes, hl);
     Ok(LoadedDiff {
         changes,
         rendered,
         file_starts,
         line_info,
+        revs,
     })
 }
 
@@ -120,10 +129,20 @@ impl Focus {
     }
 }
 
+/// Where the rev cursor is sitting. `All` means "show the full range diff
+/// for the current base"; `Rev(i)` narrows to a single rev in `revs`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Cursor {
+    All,
+    Rev(usize),
+}
+
 struct App {
     worker: Worker,
     bases: Vec<Base>,
     base_idx: usize,
+    revs: Vec<Rev>,
+    cursor: Cursor,
     loading: Option<Loading>,
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
@@ -140,7 +159,7 @@ struct App {
 
 impl App {
     fn load(
-        backend: Box<dyn Backend>,
+        backend: Arc<dyn Backend>,
         hl: Highlighter,
         initial: Option<String>,
         pr: bool,
@@ -161,7 +180,9 @@ impl App {
         } else {
             0
         };
-        let loaded = load_diff(&*backend, &hl, &bases[base_idx])?;
+        let initial_scope = Scope::Range(bases[base_idx].clone());
+        let loaded = load_diff(&*backend, &hl, &initial_scope)?;
+        let revs = loaded.revs.clone().unwrap_or_default();
         let worker = spawn_worker(backend, hl);
         let mut file_state = ListState::default();
         if !loaded.changes.is_empty() {
@@ -171,6 +192,8 @@ impl App {
             worker,
             bases,
             base_idx,
+            revs,
+            cursor: Cursor::All,
             loading: None,
             changes: loaded.changes,
             rendered: loaded.rendered,
@@ -190,6 +213,29 @@ impl App {
         &self.bases[self.base_idx]
     }
 
+    /// The scope implied by the current base + cursor. Source of truth for
+    /// what we'd ask the backend to load right now.
+    fn scope(&self) -> Scope {
+        match self.cursor {
+            Cursor::All => Scope::Range(self.base().clone()),
+            Cursor::Rev(i) => Scope::Rev(self.revs[i].id.clone()),
+        }
+    }
+
+    fn scope_label(scope: &Scope, revs: &[Rev]) -> String {
+        match scope {
+            Scope::Range(base) => format!("base: {}", base.display()),
+            Scope::Rev(id) => {
+                let short = revs
+                    .iter()
+                    .find(|r| &r.id == id)
+                    .map(|r| r.short_id.clone())
+                    .unwrap_or_else(|| id.chars().take(8).collect());
+                format!("rev: {short}")
+            }
+        }
+    }
+
     /// Cycle to the next base. Worker loads in the background; current diff
     /// stays visible until the response arrives. Repeated presses advance from
     /// the in-flight target, so a burst of `b`s lands on the right base.
@@ -197,44 +243,85 @@ impl App {
         let current = self
             .loading
             .as_ref()
-            .and_then(|l| self.bases.iter().position(|b| b == &l.base))
+            .and_then(|l| match &l.scope {
+                Scope::Range(b) => self.bases.iter().position(|x| x == b),
+                Scope::Rev(_) => None,
+            })
             .unwrap_or(self.base_idx);
         let next_idx = (current + 1) % self.bases.len();
         let next_base = self.bases[next_idx].clone();
-        let _ = self.worker.request_tx.send(next_base.clone());
+        let scope = Scope::Range(next_base.clone());
+        let label = format!("base: {}", next_base.display());
+        let _ = self.worker.request_tx.send(scope.clone());
+        // Cursor follows the new range — old rev indices won't map to the
+        // freshly-loaded revs, so the only safe landing is the overview.
+        self.cursor = Cursor::All;
         self.loading = Some(Loading {
-            base: next_base,
+            scope,
+            label,
             started: Instant::now(),
         });
     }
 
-    /// Request a fresh load of the current base (file watcher). No-op while a
-    /// load is already in flight — the in-flight one will reflect whatever's
+    /// Advance the rev cursor: `All → rev[0] → … → rev[N-1] → All`. No-op if
+    /// the range is empty.
+    fn cycle_rev_next(&mut self) {
+        if self.revs.is_empty() {
+            return;
+        }
+        self.cursor = match self.cursor {
+            Cursor::All => Cursor::Rev(0),
+            Cursor::Rev(i) if i + 1 >= self.revs.len() => Cursor::All,
+            Cursor::Rev(i) => Cursor::Rev(i + 1),
+        };
+        self.request_current_scope();
+    }
+
+    fn cycle_rev_prev(&mut self) {
+        if self.revs.is_empty() {
+            return;
+        }
+        self.cursor = match self.cursor {
+            Cursor::All => Cursor::Rev(self.revs.len() - 1),
+            Cursor::Rev(0) => Cursor::All,
+            Cursor::Rev(i) => Cursor::Rev(i - 1),
+        };
+        self.request_current_scope();
+    }
+
+    fn request_current_scope(&mut self) {
+        let scope = self.scope();
+        let label = Self::scope_label(&scope, &self.revs);
+        let _ = self.worker.request_tx.send(scope.clone());
+        self.loading = Some(Loading {
+            scope,
+            label,
+            started: Instant::now(),
+        });
+    }
+
+    /// Request a fresh load of the current scope (file watcher). No-op while
+    /// a load is already in flight — the in-flight one will reflect whatever's
     /// on disk by the time it completes.
     fn request_reload(&mut self) {
         if self.loading.is_some() {
             return;
         }
-        let base = self.bases[self.base_idx].clone();
-        let _ = self.worker.request_tx.send(base.clone());
-        self.loading = Some(Loading {
-            base,
-            started: Instant::now(),
-        });
+        self.request_current_scope();
     }
 
     /// Drain any worker responses. Apply only the one matching the in-flight
     /// target; stale responses (superseded by a newer request) are discarded.
     fn poll_load(&mut self) {
-        while let Ok((base, result)) = self.worker.response_rx.try_recv() {
+        while let Ok((scope, result)) = self.worker.response_rx.try_recv() {
             let Some(loading) = self.loading.as_ref() else {
                 continue;
             };
-            if base != loading.base {
+            if scope != loading.scope {
                 continue;
             }
             match result {
-                Ok(loaded) => self.apply_loaded(base, loaded),
+                Ok(loaded) => self.apply_loaded(scope, loaded),
                 Err(_) => {
                     // TODO: surface error somewhere. For now: silently clear.
                     self.loading = None;
@@ -243,7 +330,7 @@ impl App {
         }
     }
 
-    fn apply_loaded(&mut self, base: Base, loaded: LoadedDiff) {
+    fn apply_loaded(&mut self, scope: Scope, loaded: LoadedDiff) {
         let prev_path = self
             .file_state
             .selected()
@@ -253,8 +340,13 @@ impl App {
         self.rendered = loaded.rendered;
         self.file_starts = loaded.file_starts;
         self.line_info = loaded.line_info;
-        if let Some(i) = self.bases.iter().position(|b| b == &base) {
+        if let Scope::Range(base) = &scope
+            && let Some(i) = self.bases.iter().position(|b| b == base)
+        {
             self.base_idx = i;
+        }
+        if let Some(revs) = loaded.revs {
+            self.revs = revs;
         }
 
         let new_idx = prev_path
@@ -654,6 +746,8 @@ fn handle_event(
             KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
             KeyCode::Tab => app.focus = app.focus.cycle(),
             KeyCode::Char('b') => app.cycle_base(),
+            KeyCode::Char(']') => app.cycle_rev_next(),
+            KeyCode::Char('[') => app.cycle_rev_prev(),
             KeyCode::Enter => app.jump_to_selected(),
             KeyCode::Char('j') | KeyCode::Down => match app.focus {
                 Focus::Files => {
@@ -770,12 +864,23 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
+    let n_revs = app.revs.len();
+    let n_files = app.changes.len();
+    let cursor_str = match app.cursor {
+        Cursor::All => format!(
+            "all changes · {n_revs} rev{}",
+            if n_revs == 1 { "" } else { "s" }
+        ),
+        Cursor::Rev(i) => {
+            let r = &app.revs[i];
+            format!("rev {}/{} · {} {}", i + 1, n_revs, r.short_id, r.summary)
+        }
+    };
     let mut header_spans = vec![Span::styled(
         format!(
-            "recto — base: {} · {} changed file{}",
+            "recto — base: {} · {cursor_str} · {n_files} file{}",
             app.base().display(),
-            app.changes.len(),
-            if app.changes.len() == 1 { "" } else { "s" },
+            if n_files == 1 { "" } else { "s" },
         ),
         Style::default()
             .fg(theme::MAUVE)
@@ -785,11 +890,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         let frame_idx = (loading.started.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
             % SPINNER_FRAMES.len();
         header_spans.push(Span::styled(
-            format!(
-                " · {} loading {}",
-                SPINNER_FRAMES[frame_idx],
-                loading.base.display()
-            ),
+            format!(" · {} loading {}", SPINNER_FRAMES[frame_idx], loading.label),
             Style::default().fg(theme::TEAL),
         ));
     }
@@ -804,7 +905,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     draw_files(frame, panes[0], app);
     draw_diff(frame, panes[1], app);
 
-    let footer = Paragraph::new(Line::from("q quit · tab focus · b cycle base · e edit"))
+    let footer = Paragraph::new(Line::from("q quit · tab focus · b base · ] [ rev · e edit"))
         .style(Style::default().fg(theme::OVERLAY0));
     frame.render_widget(footer, rows[2]);
 }

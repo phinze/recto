@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, anyhow};
 
@@ -21,6 +22,34 @@ impl Base {
             Base::MergeBase { against } => format!("merge-base({})", against.display()),
         }
     }
+
+    /// The leaf revision string that anchors this base. Used by the git backend
+    /// for `git log <ref>..HEAD`, where merge-base/three-dot semantics already
+    /// fall out of `<ref>..HEAD` (commits reachable from HEAD but not the ref).
+    fn anchor_ref(&self) -> String {
+        match self {
+            Base::Revision(r) => r.clone(),
+            Base::MergeBase { against } => against.anchor_ref(),
+        }
+    }
+}
+
+/// What slice of history we're looking at. `Range` is the default "PR view"
+/// (everything between a base and `@`); `Rev` narrows to a single revision's
+/// own diff against its parent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Scope {
+    Range(Base),
+    Rev(String),
+}
+
+/// A revision in the current range. `id` is the canonical handle we pass back
+/// to the backend (jj change-id, git sha); `short_id` is the truncated display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Rev {
+    pub id: String,
+    pub short_id: String,
+    pub summary: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -50,23 +79,24 @@ pub struct FileChange {
     pub status: FileStatus,
 }
 
-pub trait Backend: Send {
-    fn list_changes(&self, base: &Base) -> Result<Vec<FileChange>>;
-    fn unified_diff(&self, base: &Base) -> Result<String>;
+pub trait Backend: Send + Sync {
+    fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>>;
+    fn unified_diff(&self, scope: &Scope) -> Result<String>;
+    fn list_revs(&self, base: &Base) -> Result<Vec<Rev>>;
     fn default_bases(&self) -> Vec<Base>;
 }
 
 /// Walk up from cwd looking for `.jj/` (preferred) then `.git/`.
 /// jj wins on colocated repos since it's the source of truth for working-copy state.
-pub fn detect_backend() -> Result<Box<dyn Backend>> {
+pub fn detect_backend() -> Result<Arc<dyn Backend>> {
     let cwd = std::env::current_dir().context("could not read current directory")?;
     let mut dir: Option<&Path> = Some(&cwd);
     while let Some(d) = dir {
         if d.join(".jj").is_dir() {
-            return Ok(Box::new(JjBackend::new()));
+            return Ok(Arc::new(JjBackend::new()));
         }
         if d.join(".git").exists() {
-            return Ok(Box::new(GitBackend::new()));
+            return Ok(Arc::new(GitBackend::new()));
         }
         dir = d.parent();
     }
@@ -113,15 +143,44 @@ impl JjBackend {
 }
 
 impl Backend for JjBackend {
-    fn list_changes(&self, base: &Base) -> Result<Vec<FileChange>> {
-        let rev = Self::revset(base);
-        let out = self.run(&["diff", "--summary", "--from", &rev])?;
+    fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>> {
+        let out = match scope {
+            Scope::Range(base) => {
+                let rev = Self::revset(base);
+                self.run(&["diff", "--summary", "--from", &rev])?
+            }
+            Scope::Rev(id) => self.run(&["diff", "--summary", "-r", id])?,
+        };
         Ok(out.lines().filter_map(parse_summary_line).collect())
     }
 
-    fn unified_diff(&self, base: &Base) -> Result<String> {
+    fn unified_diff(&self, scope: &Scope) -> Result<String> {
+        match scope {
+            Scope::Range(base) => {
+                let rev = Self::revset(base);
+                self.run(&["diff", "--git", "--from", &rev])
+            }
+            Scope::Rev(id) => self.run(&["diff", "--git", "-r", id]),
+        }
+    }
+
+    fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
         let rev = Self::revset(base);
-        self.run(&["diff", "--git", "--from", &rev])
+        let revset = format!("{rev}..@");
+        // Use change_id as the canonical handle (jj resolves it as a revset).
+        // change_id stays stable across rewrites, which is the whole point —
+        // squash mid-review shouldn't yank our cursor.
+        let template = r#"change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\n""#;
+        let out = self.run(&[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "--reversed",
+            "-T",
+            template,
+        ])?;
+        Ok(out.lines().filter_map(parse_jj_rev_line).collect())
     }
 
     fn default_bases(&self) -> Vec<Base> {
@@ -179,15 +238,34 @@ impl GitBackend {
 }
 
 impl Backend for GitBackend {
-    fn list_changes(&self, base: &Base) -> Result<Vec<FileChange>> {
-        let arg = Self::diff_arg(base);
-        let out = self.run(&["diff", "--name-status", &arg])?;
+    fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>> {
+        let out = match scope {
+            Scope::Range(base) => {
+                let arg = Self::diff_arg(base);
+                self.run(&["diff", "--name-status", &arg])?
+            }
+            Scope::Rev(sha) => self.run(&["show", "--name-status", "--format=", sha])?,
+        };
         Ok(out.lines().filter_map(parse_git_name_status).collect())
     }
 
-    fn unified_diff(&self, base: &Base) -> Result<String> {
-        let arg = Self::diff_arg(base);
-        self.run(&["diff", &arg])
+    fn unified_diff(&self, scope: &Scope) -> Result<String> {
+        match scope {
+            Scope::Range(base) => {
+                let arg = Self::diff_arg(base);
+                self.run(&["diff", &arg])
+            }
+            Scope::Rev(sha) => self.run(&["show", "--format=", sha]),
+        }
+    }
+
+    fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
+        // `<ref>..HEAD` lists commits reachable from HEAD but not from ref,
+        // which is also what `merge-base..HEAD` would give us — so the
+        // merge-base case collapses to the same form.
+        let arg = format!("{}..HEAD", base.anchor_ref());
+        let out = self.run(&["log", "--format=%H%x09%h%x09%s", "--reverse", &arg])?;
+        Ok(out.lines().filter_map(parse_git_rev_line).collect())
     }
 
     fn default_bases(&self) -> Vec<Base> {
@@ -201,6 +279,41 @@ impl Backend for GitBackend {
             Base::Revision("HEAD~1".into()),
         ]
     }
+}
+
+fn parse_jj_rev_line(line: &str) -> Option<Rev> {
+    let mut fields = line.splitn(3, '\t');
+    let id = fields.next()?.trim().to_string();
+    let short_id = fields.next()?.trim().to_string();
+    let summary = fields.next().unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    let summary = if summary.is_empty() {
+        "(no description set)".to_string()
+    } else {
+        summary
+    };
+    Some(Rev {
+        id,
+        short_id,
+        summary,
+    })
+}
+
+fn parse_git_rev_line(line: &str) -> Option<Rev> {
+    let mut fields = line.splitn(3, '\t');
+    let id = fields.next()?.trim().to_string();
+    let short_id = fields.next()?.trim().to_string();
+    let summary = fields.next().unwrap_or("").trim().to_string();
+    if id.is_empty() {
+        return None;
+    }
+    Some(Rev {
+        id,
+        short_id,
+        summary,
+    })
 }
 
 fn parse_summary_line(line: &str) -> Option<FileChange> {
