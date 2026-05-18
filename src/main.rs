@@ -764,8 +764,14 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let sticky = Paragraph::new(sticky_text).style(Style::default().bg(theme::SURFACE0));
     frame.render_widget(sticky, sticky_area);
 
-    let content = Paragraph::new(app.rendered.clone())
-        .scroll((app.scroll.min(app.max_scroll()), app.h_scroll));
+    let scroll = app.scroll.min(app.max_scroll()) as usize;
+    let total = app.rendered.len();
+    let start = scroll.min(total);
+    let end = start
+        .saturating_add(content_area.height as usize)
+        .min(total);
+    let window = app.rendered[start..end].to_vec();
+    let content = Paragraph::new(window).scroll((0, app.h_scroll));
     frame.render_widget(content, content_area);
 }
 
