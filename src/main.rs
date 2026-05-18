@@ -43,13 +43,14 @@ struct LoadedDiff {
     /// refresh the rev list — selecting a rev shouldn't redraw the strip.
     revs: Option<Vec<Rev>>,
 }
-use crate::highlight::{Highlighter, ext_for_path};
+use crate::highlight::{Highlighter, expand_tabs, ext_for_path};
 
 const SCROLLOFF: u16 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_MS: u128 = 80;
+const TAB_WIDTH: usize = 4;
 
 struct Loading {
     scope: Scope,
@@ -626,7 +627,8 @@ fn diff_body_line(line: &str, ext: &str, hl: &Highlighter) -> Line<'static> {
             .fg(marker_color)
             .add_modifier(Modifier::BOLD),
     )];
-    spans.extend(hl.line_spans(body, ext));
+    let body = expand_tabs(body, TAB_WIDTH);
+    spans.extend(hl.line_spans(&body, ext));
 
     let mut result = Line::from(spans);
     if let Some(bg) = line_bg {

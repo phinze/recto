@@ -60,3 +60,27 @@ pub fn ext_for_path(path: &str) -> &str {
         .and_then(|s| s.to_str())
         .unwrap_or("")
 }
+
+/// ratatui doesn't expand `\t` when laying out cells, so a leading tab renders
+/// as a single column and indentation collapses. Pre-expand to tabstops so the
+/// rendered diff matches what the file looks like in an editor.
+pub fn expand_tabs(s: &str, width: usize) -> String {
+    if !s.contains('\t') {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
+    let mut col = 0usize;
+    for ch in s.chars() {
+        if ch == '\t' {
+            let spaces = width - (col % width);
+            for _ in 0..spaces {
+                out.push(' ');
+            }
+            col += spaces;
+        } else {
+            out.push(ch);
+            col += 1;
+        }
+    }
+    out
+}
