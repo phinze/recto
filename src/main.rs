@@ -9,7 +9,7 @@ use std::process::Command;
 use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
-use anyhow::Result;
+use anyhow::{Result, anyhow};
 use clap::Parser;
 use crossterm::{
     event::{
@@ -95,6 +95,11 @@ struct Cli {
     #[arg(long, value_name = "REVSET")]
     base: Option<String>,
 
+    /// PR review mode: start with the merge-base against trunk, so the diff
+    /// shows what's on this branch and nothing upstream. Overridden by --base.
+    #[arg(long)]
+    pr: bool,
+
     /// Run as if started from this directory. Matches jj's `-R`.
     #[arg(short = 'R', long, value_name = "PATH")]
     repository: Option<std::path::PathBuf>,
@@ -134,18 +139,27 @@ struct App {
 }
 
 impl App {
-    fn load(backend: Box<dyn Backend>, hl: Highlighter, initial: Option<String>) -> Result<Self> {
+    fn load(
+        backend: Box<dyn Backend>,
+        hl: Highlighter,
+        initial: Option<String>,
+        pr: bool,
+    ) -> Result<Self> {
         let mut bases = backend.default_bases();
-        let base_idx = match initial {
-            Some(r) => {
-                if let Some(i) = bases.iter().position(|b| b.display() == r) {
-                    i
-                } else {
-                    bases.insert(0, Base::Revision(r));
-                    0
-                }
+        let base_idx = if let Some(r) = initial {
+            if let Some(i) = bases.iter().position(|b| b.display() == r) {
+                i
+            } else {
+                bases.insert(0, Base::Revision(r));
+                0
             }
-            None => 0,
+        } else if pr {
+            bases
+                .iter()
+                .position(|b| matches!(b, Base::MergeBase { .. }))
+                .ok_or_else(|| anyhow!("--pr: no merge-base configured for this backend"))?
+        } else {
+            0
         };
         let loaded = load_diff(&*backend, &hl, &bases[base_idx])?;
         let worker = spawn_worker(backend, hl);
@@ -535,7 +549,7 @@ fn main() -> Result<()> {
         std::process::exit(2);
     });
     let hl = Highlighter::new();
-    let mut app = App::load(backend, hl, cli.base).unwrap_or_else(|e| {
+    let mut app = App::load(backend, hl, cli.base, cli.pr).unwrap_or_else(|e| {
         eprintln!("recto: {e}");
         std::process::exit(2);
     });

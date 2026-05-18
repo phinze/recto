@@ -6,12 +6,19 @@ use anyhow::{Context, Result, anyhow};
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Base {
     Revision(String),
+    /// Latest common ancestor of `@` and `against`. The right base for "show
+    /// me what's on this branch and nothing else" — equivalent to git's
+    /// `against...@` three-dot form or jj's `heads(::@ & ::against)`.
+    MergeBase {
+        against: Box<Base>,
+    },
 }
 
 impl Base {
-    pub fn display(&self) -> &str {
+    pub fn display(&self) -> String {
         match self {
-            Base::Revision(r) => r,
+            Base::Revision(r) => r.clone(),
+            Base::MergeBase { against } => format!("merge-base({})", against.display()),
         }
     }
 }
@@ -94,19 +101,35 @@ impl JjBackend {
     }
 }
 
+impl JjBackend {
+    /// Native revset string for a base. `MergeBase` becomes `heads(::@ & ::X)`
+    /// which is jj's idiom for the latest common ancestor of `@` and X.
+    fn revset(base: &Base) -> String {
+        match base {
+            Base::Revision(r) => r.clone(),
+            Base::MergeBase { against } => format!("heads(::@ & ::{})", Self::revset(against)),
+        }
+    }
+}
+
 impl Backend for JjBackend {
     fn list_changes(&self, base: &Base) -> Result<Vec<FileChange>> {
-        let out = self.run(&["diff", "--summary", "--from", base.display()])?;
+        let rev = Self::revset(base);
+        let out = self.run(&["diff", "--summary", "--from", &rev])?;
         Ok(out.lines().filter_map(parse_summary_line).collect())
     }
 
     fn unified_diff(&self, base: &Base) -> Result<String> {
-        self.run(&["diff", "--git", "--from", base.display()])
+        let rev = Self::revset(base);
+        self.run(&["diff", "--git", "--from", &rev])
     }
 
     fn default_bases(&self) -> Vec<Base> {
         vec![
             Base::Revision("@-".into()),
+            Base::MergeBase {
+                against: Box::new(Base::Revision("trunk()".into())),
+            },
             Base::Revision("trunk()".into()),
             Base::Revision("@--".into()),
             Base::Revision("root()".into()),
@@ -143,19 +166,36 @@ impl GitBackend {
     }
 }
 
+impl GitBackend {
+    /// Git diff arg for a base. `MergeBase` becomes git's three-dot syntax
+    /// (`X...HEAD`), which means "diff from merge-base(X, HEAD) to HEAD" —
+    /// committed-only, excluding the working tree.
+    fn diff_arg(base: &Base) -> String {
+        match base {
+            Base::Revision(r) => r.clone(),
+            Base::MergeBase { against } => format!("{}...HEAD", Self::diff_arg(against)),
+        }
+    }
+}
+
 impl Backend for GitBackend {
     fn list_changes(&self, base: &Base) -> Result<Vec<FileChange>> {
-        let out = self.run(&["diff", "--name-status", base.display()])?;
+        let arg = Self::diff_arg(base);
+        let out = self.run(&["diff", "--name-status", &arg])?;
         Ok(out.lines().filter_map(parse_git_name_status).collect())
     }
 
     fn unified_diff(&self, base: &Base) -> Result<String> {
-        self.run(&["diff", base.display()])
+        let arg = Self::diff_arg(base);
+        self.run(&["diff", &arg])
     }
 
     fn default_bases(&self) -> Vec<Base> {
         vec![
             Base::Revision("HEAD".into()),
+            Base::MergeBase {
+                against: Box::new(Base::Revision("main".into())),
+            },
             Base::Revision("main".into()),
             Base::Revision("master".into()),
             Base::Revision("HEAD~1".into()),
