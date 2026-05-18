@@ -45,6 +45,47 @@ use crate::highlight::{Highlighter, ext_for_path};
 const SCROLLOFF: u16 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
+const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+const SPINNER_FRAME_MS: u128 = 80;
+
+struct Loading {
+    base: Base,
+    started: Instant,
+}
+
+struct Worker {
+    request_tx: mpsc::Sender<Base>,
+    response_rx: mpsc::Receiver<(Base, Result<LoadedDiff>)>,
+}
+
+fn spawn_worker(backend: Box<dyn Backend>, hl: Highlighter) -> Worker {
+    let (request_tx, request_rx) = mpsc::channel::<Base>();
+    let (response_tx, response_rx) = mpsc::channel::<(Base, Result<LoadedDiff>)>();
+    std::thread::spawn(move || {
+        while let Ok(base) = request_rx.recv() {
+            let result = load_diff(&*backend, &hl, &base);
+            if response_tx.send((base, result)).is_err() {
+                break;
+            }
+        }
+    });
+    Worker {
+        request_tx,
+        response_rx,
+    }
+}
+
+fn load_diff(backend: &dyn Backend, hl: &Highlighter, base: &Base) -> Result<LoadedDiff> {
+    let changes = backend.list_changes(base)?;
+    let diff = backend.unified_diff(base)?;
+    let (rendered, file_starts, line_info) = render_diff(&diff, &changes, hl);
+    Ok(LoadedDiff {
+        changes,
+        rendered,
+        file_starts,
+        line_info,
+    })
+}
 
 /// recto — a jj-first terminal diff viewer.
 #[derive(Parser, Debug)]
@@ -75,10 +116,10 @@ impl Focus {
 }
 
 struct App {
-    backend: Box<dyn Backend>,
-    hl: Highlighter,
+    worker: Worker,
     bases: Vec<Base>,
     base_idx: usize,
+    loading: Option<Loading>,
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
@@ -106,22 +147,21 @@ impl App {
             }
             None => 0,
         };
-        let changes = backend.list_changes(&bases[base_idx])?;
-        let diff = backend.unified_diff(&bases[base_idx])?;
-        let (rendered, file_starts, line_info) = render_diff(&diff, &changes, &hl);
+        let loaded = load_diff(&*backend, &hl, &bases[base_idx])?;
+        let worker = spawn_worker(backend, hl);
         let mut file_state = ListState::default();
-        if !changes.is_empty() {
+        if !loaded.changes.is_empty() {
             file_state.select(Some(0));
         }
         Ok(Self {
-            backend,
-            hl,
+            worker,
             bases,
             base_idx,
-            changes,
-            rendered,
-            file_starts,
-            line_info,
+            loading: None,
+            changes: loaded.changes,
+            rendered: loaded.rendered,
+            file_starts: loaded.file_starts,
+            line_info: loaded.line_info,
             scroll: 0,
             h_scroll: 0,
             diff_viewport: 0,
@@ -136,60 +176,72 @@ impl App {
         &self.bases[self.base_idx]
     }
 
-    fn cycle_base(&mut self) -> Result<()> {
-        let attempts = self.bases.len();
-        for _ in 0..attempts {
-            let next_idx = (self.base_idx + 1) % self.bases.len();
-            let new_base = self.bases[next_idx].clone();
-            match self.try_load_base(&new_base) {
-                Ok(loaded) => {
-                    self.base_idx = next_idx;
-                    self.changes = loaded.changes;
-                    self.rendered = loaded.rendered;
-                    self.file_starts = loaded.file_starts;
-                    self.line_info = loaded.line_info;
-                    self.scroll = 0;
-                    self.h_scroll = 0;
-                    self.file_state.select(if self.changes.is_empty() {
-                        None
-                    } else {
-                        Some(0)
-                    });
-                    return Ok(());
-                }
+    /// Cycle to the next base. Worker loads in the background; current diff
+    /// stays visible until the response arrives. Repeated presses advance from
+    /// the in-flight target, so a burst of `b`s lands on the right base.
+    fn cycle_base(&mut self) {
+        let current = self
+            .loading
+            .as_ref()
+            .and_then(|l| self.bases.iter().position(|b| b == &l.base))
+            .unwrap_or(self.base_idx);
+        let next_idx = (current + 1) % self.bases.len();
+        let next_base = self.bases[next_idx].clone();
+        let _ = self.worker.request_tx.send(next_base.clone());
+        self.loading = Some(Loading {
+            base: next_base,
+            started: Instant::now(),
+        });
+    }
+
+    /// Request a fresh load of the current base (file watcher). No-op while a
+    /// load is already in flight — the in-flight one will reflect whatever's
+    /// on disk by the time it completes.
+    fn request_reload(&mut self) {
+        if self.loading.is_some() {
+            return;
+        }
+        let base = self.bases[self.base_idx].clone();
+        let _ = self.worker.request_tx.send(base.clone());
+        self.loading = Some(Loading {
+            base,
+            started: Instant::now(),
+        });
+    }
+
+    /// Drain any worker responses. Apply only the one matching the in-flight
+    /// target; stale responses (superseded by a newer request) are discarded.
+    fn poll_load(&mut self) {
+        while let Ok((base, result)) = self.worker.response_rx.try_recv() {
+            let Some(loading) = self.loading.as_ref() else {
+                continue;
+            };
+            if base != loading.base {
+                continue;
+            }
+            match result {
+                Ok(loaded) => self.apply_loaded(base, loaded),
                 Err(_) => {
-                    self.base_idx = next_idx;
+                    // TODO: surface error somewhere. For now: silently clear.
+                    self.loading = None;
                 }
             }
         }
-        Ok(())
     }
 
-    fn try_load_base(&self, base: &Base) -> Result<LoadedDiff> {
-        let changes = self.backend.list_changes(base)?;
-        let diff = self.backend.unified_diff(base)?;
-        let (rendered, file_starts, line_info) = render_diff(&diff, &changes, &self.hl);
-        Ok(LoadedDiff {
-            changes,
-            rendered,
-            file_starts,
-            line_info,
-        })
-    }
-
-    /// Re-fetch from the current base, preserving file selection by path.
-    fn reload(&mut self) -> Result<()> {
+    fn apply_loaded(&mut self, base: Base, loaded: LoadedDiff) {
         let prev_path = self
             .file_state
             .selected()
             .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
 
-        let base = self.bases[self.base_idx].clone();
-        let loaded = self.try_load_base(&base)?;
         self.changes = loaded.changes;
         self.rendered = loaded.rendered;
         self.file_starts = loaded.file_starts;
         self.line_info = loaded.line_info;
+        if let Some(i) = self.bases.iter().position(|b| b == &base) {
+            self.base_idx = i;
+        }
 
         let new_idx = prev_path
             .and_then(|p| self.changes.iter().position(|c| c.path == p))
@@ -204,7 +256,7 @@ impl App {
             self.scroll = 0;
         }
         self.h_scroll = 0;
-        Ok(())
+        self.loading = None;
     }
 
     fn rendered_lines(&self) -> u16 {
@@ -550,13 +602,15 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         terminal.draw(|f| draw(f, app))?;
         app.scroll = app.scroll.min(app.max_scroll());
 
+        app.poll_load();
+
         while rx.try_recv().is_ok() {
             pending_reload = Some(Instant::now());
         }
         if let Some(t) = pending_reload
             && t.elapsed() >= RELOAD_DEBOUNCE
         {
-            let _ = app.reload();
+            app.request_reload();
             pending_reload = None;
         }
 
@@ -585,7 +639,7 @@ fn handle_event(
         Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
             KeyCode::Char('q') | KeyCode::Esc => return Ok(Action::Quit),
             KeyCode::Tab => app.focus = app.focus.cycle(),
-            KeyCode::Char('b') => app.cycle_base()?,
+            KeyCode::Char('b') => app.cycle_base(),
             KeyCode::Enter => app.jump_to_selected(),
             KeyCode::Char('j') | KeyCode::Down => match app.focus {
                 Focus::Files => {
@@ -702,17 +756,30 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
-    let header = Paragraph::new(Line::from(format!(
-        "recto — base: {} · {} changed file{}",
-        app.base().display(),
-        app.changes.len(),
-        if app.changes.len() == 1 { "" } else { "s" },
-    )))
-    .style(
+    let mut header_spans = vec![Span::styled(
+        format!(
+            "recto — base: {} · {} changed file{}",
+            app.base().display(),
+            app.changes.len(),
+            if app.changes.len() == 1 { "" } else { "s" },
+        ),
         Style::default()
             .fg(theme::MAUVE)
             .add_modifier(Modifier::BOLD),
-    );
+    )];
+    if let Some(loading) = &app.loading {
+        let frame_idx = (loading.started.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
+            % SPINNER_FRAMES.len();
+        header_spans.push(Span::styled(
+            format!(
+                " · {} loading {}",
+                SPINNER_FRAMES[frame_idx],
+                loading.base.display()
+            ),
+            Style::default().fg(theme::TEAL),
+        ));
+    }
+    let header = Paragraph::new(Line::from(header_spans));
     frame.render_widget(header, rows[0]);
 
     let panes = Layout::default()

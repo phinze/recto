@@ -3,7 +3,7 @@ use std::process::Command;
 
 use anyhow::{Context, Result, anyhow};
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Base {
     Revision(String),
 }
@@ -43,7 +43,7 @@ pub struct FileChange {
     pub status: FileStatus,
 }
 
-pub trait Backend {
+pub trait Backend: Send {
     fn list_changes(&self, base: &Base) -> Result<Vec<FileChange>>;
     fn unified_diff(&self, base: &Base) -> Result<String>;
     fn default_bases(&self) -> Vec<Base>;
