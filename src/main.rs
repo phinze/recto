@@ -40,6 +40,8 @@ struct LoadedDiff {
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
     line_info: Vec<LineInfo>,
+    /// Added/removed line counts per file, parallel to `changes`.
+    file_stats: Vec<(u32, u32)>,
     /// Populated only when the load was for `Scope::Range`. Rev loads don't
     /// refresh the rev list — selecting a rev shouldn't redraw the strip.
     revs: Option<Vec<Rev>>,
@@ -88,12 +90,13 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, scope: &Scope) -> Result<L
         Scope::Range(base) => Some(backend.list_revs(base)?),
         Scope::Rev(_) => None,
     };
-    let (rendered, file_starts, line_info) = render_diff(&diff, &changes, hl);
+    let rd = render_diff(&diff, &changes, hl);
     Ok(LoadedDiff {
         changes,
-        rendered,
-        file_starts,
-        line_info,
+        rendered: rd.lines,
+        file_starts: rd.file_starts,
+        line_info: rd.line_info,
+        file_stats: rd.file_stats,
         revs,
     })
 }
@@ -163,6 +166,7 @@ struct App {
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
     line_info: Vec<LineInfo>,
+    file_stats: Vec<(u32, u32)>,
     scroll: u16,
     h_scroll: u16,
     wrap: bool,
@@ -216,6 +220,7 @@ impl App {
             rendered: loaded.rendered,
             file_starts: loaded.file_starts,
             line_info: loaded.line_info,
+            file_stats: loaded.file_stats,
             scroll: 0,
             h_scroll: 0,
             wrap: false,
@@ -400,6 +405,7 @@ impl App {
         self.rendered = loaded.rendered;
         self.file_starts = loaded.file_starts;
         self.line_info = loaded.line_info;
+        self.file_stats = loaded.file_stats;
         if let Scope::Range(base) = &scope
             && let Some(i) = self.bases.iter().position(|b| b == base)
         {
@@ -522,6 +528,15 @@ impl App {
     }
 }
 
+/// Output of `render_diff`: pre-styled lines plus the parallel metadata the
+/// UI uses to map cursor position back to a file/line and to surface stats.
+struct RenderedDiff {
+    lines: Vec<Line<'static>>,
+    file_starts: Vec<u16>,
+    line_info: Vec<LineInfo>,
+    file_stats: Vec<(u32, u32)>,
+}
+
 /// A `-` or `+` body row queued for batch flushing. We hold them so we can
 /// pair adjacent minuses and pluses index-for-index and compute a word-level
 /// refinement for each pair before emitting the rendered lines.
@@ -545,11 +560,7 @@ struct Gutter {
     new_w: usize,
 }
 
-fn render_diff(
-    diff: &str,
-    changes: &[FileChange],
-    hl: &Highlighter,
-) -> (Vec<Line<'static>>, Vec<u16>, Vec<LineInfo>) {
+fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> RenderedDiff {
     let path_to_idx: HashMap<&str, usize> = changes
         .iter()
         .enumerate()
@@ -557,6 +568,7 @@ fn render_diff(
         .collect();
 
     let gutter = gutter_widths(diff);
+    let file_stats = compute_file_stats(diff, &path_to_idx, changes.len());
 
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut line_info: Vec<LineInfo> = Vec::new();
@@ -582,11 +594,14 @@ fn render_diff(
             );
             let idx = path_to_idx.get(b).copied();
             let status = idx.map(|i| changes[i].status);
+            let stats = idx
+                .and_then(|i| file_stats.get(i).copied())
+                .unwrap_or((0, 0));
             let line_no = rendered.len().min(u16::MAX as usize) as u16;
             if let Some(i) = idx {
                 file_starts[i] = line_no;
             }
-            rendered.push(file_separator(b, status));
+            rendered.push(file_separator(b, status, stats));
             line_info.push(None);
             in_metadata = true;
             current_ext = ext_for_path(b).to_string();
@@ -673,7 +688,45 @@ fn render_diff(
         gutter,
     );
 
-    (rendered, file_starts, line_info)
+    RenderedDiff {
+        lines: rendered,
+        file_starts,
+        line_info,
+        file_stats,
+    }
+}
+
+/// Single-pass count of `+`/`-` body lines per file. We need this up front so
+/// the file separator can carry its stats when first emitted; recomputing on
+/// the fly would mean either deferring the separator (which scrambles output
+/// order) or patching it after the fact (which is fiddlier than a tiny scan).
+fn compute_file_stats(diff: &str, path_to_idx: &HashMap<&str, usize>, n: usize) -> Vec<(u32, u32)> {
+    let mut stats = vec![(0u32, 0u32); n];
+    let mut current: Option<usize> = None;
+    let mut in_metadata = false;
+    for line in diff.lines() {
+        if let Some(rest) = line.strip_prefix("diff --git ")
+            && let Some((_, b)) = rest.split_once(" b/")
+        {
+            current = path_to_idx.get(b).copied();
+            in_metadata = true;
+            continue;
+        }
+        if in_metadata {
+            if line.starts_with("@@") {
+                in_metadata = false;
+            }
+            continue;
+        }
+        if let Some(i) = current {
+            match line.chars().next() {
+                Some('+') => stats[i].0 = stats[i].0.saturating_add(1),
+                Some('-') => stats[i].1 = stats[i].1.saturating_add(1),
+                _ => {}
+            }
+        }
+    }
+    stats
 }
 
 /// Pair adjacent minus/plus rows and compute per-row character ranges that
@@ -965,10 +1018,10 @@ fn diff_body_line(
     result
 }
 
-fn file_separator(path: &str, status: Option<FileStatus>) -> Line<'static> {
+fn file_separator(path: &str, status: Option<FileStatus>, stats: (u32, u32)) -> Line<'static> {
     let glyph = status.map_or(' ', |s| s.glyph());
     let color = status.map_or(theme::SUBTEXT0, status_color);
-    Line::from(vec![
+    let mut spans = vec![
         Span::styled("── ", Style::default().fg(theme::SURFACE1)),
         Span::styled(
             format!("{glyph} "),
@@ -980,16 +1033,34 @@ fn file_separator(path: &str, status: Option<FileStatus>) -> Line<'static> {
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled(
-            " ──────────────────────────────────────────────",
-            Style::default().fg(theme::SURFACE1),
-        ),
-    ])
+    ];
+    spans.extend(stats_spans(stats));
+    spans.push(Span::styled(
+        " ──────────────────────────────────────────────",
+        Style::default().fg(theme::SURFACE1),
+    ));
+    Line::from(spans)
 }
 
-fn sticky_line(change: &FileChange) -> Line<'static> {
+/// `+N -M` formatted spans, leading with a space so callers can drop them
+/// inline next to a filename. Returns an empty vec when both counts are zero
+/// so pure renames/copies don't pick up `+0 -0` noise.
+fn stats_spans(stats: (u32, u32)) -> Vec<Span<'static>> {
+    let (add, del) = stats;
+    if add == 0 && del == 0 {
+        return Vec::new();
+    }
+    vec![
+        Span::raw(" "),
+        Span::styled(format!("+{add}"), Style::default().fg(theme::GREEN)),
+        Span::raw(" "),
+        Span::styled(format!("-{del}"), Style::default().fg(theme::RED)),
+    ]
+}
+
+fn sticky_line(change: &FileChange, stats: (u32, u32)) -> Line<'static> {
     let color = status_color(change.status);
-    Line::from(vec![
+    let mut spans = vec![
         Span::raw(" "),
         Span::styled(
             format!("{} ", change.status.glyph()),
@@ -1001,8 +1072,9 @@ fn sticky_line(change: &FileChange) -> Line<'static> {
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::BOLD),
         ),
-    ])
-    .style(Style::default().bg(theme::SURFACE0))
+    ];
+    spans.extend(stats_spans(stats));
+    Line::from(spans).style(Style::default().bg(theme::SURFACE0))
 }
 
 fn status_color(status: FileStatus) -> Color {
@@ -1333,12 +1405,16 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let items: Vec<ListItem> = app
         .changes
         .iter()
-        .map(|c| {
+        .enumerate()
+        .map(|(i, c)| {
             let style = Style::default().fg(status_color(c.status));
-            ListItem::new(Line::from(vec![
+            let stats = app.file_stats.get(i).copied().unwrap_or((0, 0));
+            let mut spans = vec![
                 Span::styled(format!("{} ", c.status.glyph()), style),
                 Span::raw(c.path.clone()),
-            ]))
+            ];
+            spans.extend(stats_spans(stats));
+            ListItem::new(Line::from(spans))
         })
         .collect();
     let tree = List::new(items)
@@ -1432,7 +1508,10 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 
     let sticky_text = current
-        .map(|i| sticky_line(&app.changes[i]))
+        .map(|i| {
+            let stats = app.file_stats.get(i).copied().unwrap_or((0, 0));
+            sticky_line(&app.changes[i], stats)
+        })
         .unwrap_or_else(|| Line::from(""));
     let sticky = Paragraph::new(sticky_text).style(Style::default().bg(theme::SURFACE0));
     frame.render_widget(sticky, sticky_area);
