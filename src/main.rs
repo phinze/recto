@@ -29,6 +29,7 @@ use ratatui::{
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
+use similar::{ChangeTag, TextDiff};
 
 use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope, detect_backend};
 
@@ -521,6 +522,29 @@ impl App {
     }
 }
 
+/// A `-` or `+` body row queued for batch flushing. We hold them so we can
+/// pair adjacent minuses and pluses index-for-index and compute a word-level
+/// refinement for each pair before emitting the rendered lines.
+struct PendingBody {
+    line: String,
+    is_plus: bool,
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    info: LineInfo,
+}
+
+/// Byte ranges (on the tab-expanded body) marking diverging spans within a
+/// refined `-`/`+` row.
+type RefineRanges = Vec<(usize, usize)>;
+
+/// Width of the old/new line-number columns. Bundled together so the gutter
+/// geometry travels as one value through the render pipeline.
+#[derive(Clone, Copy)]
+struct Gutter {
+    old_w: usize,
+    new_w: usize,
+}
+
 fn render_diff(
     diff: &str,
     changes: &[FileChange],
@@ -532,7 +556,7 @@ fn render_diff(
         .map(|(i, c)| (c.path.as_str(), i))
         .collect();
 
-    let (old_w, new_w) = gutter_widths(diff);
+    let gutter = gutter_widths(diff);
 
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut line_info: Vec<LineInfo> = Vec::new();
@@ -542,11 +566,20 @@ fn render_diff(
     let mut current_file: Option<usize> = None;
     let mut new_line: u32 = 0;
     let mut old_line: u32 = 0;
+    let mut pending: Vec<PendingBody> = Vec::new();
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ")
             && let Some((_, b)) = rest.split_once(" b/")
         {
+            flush_pending(
+                &mut pending,
+                &mut rendered,
+                &mut line_info,
+                &current_ext,
+                hl,
+                gutter,
+            );
             let idx = path_to_idx.get(b).copied();
             let status = idx.map(|i| changes[i].status);
             let line_no = rendered.len().min(u16::MAX as usize) as u16;
@@ -573,44 +606,218 @@ fn render_diff(
             }
             continue;
         }
-        let (old_no, new_no) = match line.chars().next() {
-            Some('+') => (None, Some(new_line)),
-            Some('-') => (Some(old_line), None),
-            Some(' ') => (Some(old_line), Some(new_line)),
-            _ => (None, None),
-        };
-        rendered.push(diff_body_line(
-            line,
-            &current_ext,
-            hl,
-            old_no,
-            new_no,
-            old_w,
-            new_w,
-        ));
-        let info = match line.chars().next() {
-            Some('+') => {
-                let i = current_file.map(|f| (f, new_line));
-                new_line += 1;
-                i
+        let first = line.chars().next();
+        match first {
+            Some('+') | Some('-') => {
+                let is_plus = first == Some('+');
+                let (old_no, new_no) = if is_plus {
+                    (None, Some(new_line))
+                } else {
+                    (Some(old_line), None)
+                };
+                let info = current_file.map(|f| (f, new_line));
+                pending.push(PendingBody {
+                    line: line.to_string(),
+                    is_plus,
+                    old_no,
+                    new_no,
+                    info,
+                });
+                if is_plus {
+                    new_line += 1;
+                } else {
+                    old_line += 1;
+                }
             }
-            Some(' ') => {
-                let i = current_file.map(|f| (f, new_line));
-                new_line += 1;
-                old_line += 1;
-                i
+            _ => {
+                flush_pending(
+                    &mut pending,
+                    &mut rendered,
+                    &mut line_info,
+                    &current_ext,
+                    hl,
+                    gutter,
+                );
+                let (old_no, new_no) = match first {
+                    Some(' ') => (Some(old_line), Some(new_line)),
+                    _ => (None, None),
+                };
+                rendered.push(diff_body_line(
+                    line,
+                    &current_ext,
+                    hl,
+                    old_no,
+                    new_no,
+                    gutter,
+                    None,
+                ));
+                let info = match first {
+                    Some(' ') => current_file.map(|f| (f, new_line)),
+                    _ => None,
+                };
+                line_info.push(info);
+                if matches!(first, Some(' ')) {
+                    new_line += 1;
+                    old_line += 1;
+                }
             }
-            Some('-') => {
-                let i = current_file.map(|f| (f, new_line));
-                old_line += 1;
-                i
-            }
-            _ => None,
-        };
-        line_info.push(info);
+        }
     }
 
+    flush_pending(
+        &mut pending,
+        &mut rendered,
+        &mut line_info,
+        &current_ext,
+        hl,
+        gutter,
+    );
+
     (rendered, file_starts, line_info)
+}
+
+/// Pair adjacent minus/plus rows and compute per-row character ranges that
+/// changed. Rows past the shorter side stay unrefined and fall back to the
+/// row tint. The pairing is positional, not similarity-matched: it's the
+/// shape unified diff produces and lines up well with what humans expect when
+/// reviewing an edit.
+fn flush_pending(
+    pending: &mut Vec<PendingBody>,
+    rendered: &mut Vec<Line<'static>>,
+    line_info: &mut Vec<LineInfo>,
+    ext: &str,
+    hl: &Highlighter,
+    gutter: Gutter,
+) {
+    if pending.is_empty() {
+        return;
+    }
+    let minus_idx: Vec<usize> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| !p.is_plus)
+        .map(|(i, _)| i)
+        .collect();
+    let plus_idx: Vec<usize> = pending
+        .iter()
+        .enumerate()
+        .filter(|(_, p)| p.is_plus)
+        .map(|(i, _)| i)
+        .collect();
+    let pair_count = minus_idx.len().min(plus_idx.len());
+
+    let mut refines: Vec<Option<RefineRanges>> = (0..pending.len()).map(|_| None).collect();
+    for k in 0..pair_count {
+        let m_i = minus_idx[k];
+        let p_i = plus_idx[k];
+        let m_exp = expand_tabs(&pending[m_i].line[1..], TAB_WIDTH);
+        let p_exp = expand_tabs(&pending[p_i].line[1..], TAB_WIDTH);
+        if let Some((m_r, p_r)) = refine_word_diff(&m_exp, &p_exp) {
+            refines[m_i] = Some(m_r);
+            refines[p_i] = Some(p_r);
+        }
+    }
+
+    for (i, row) in std::mem::take(pending).into_iter().enumerate() {
+        let r = refines[i].as_deref();
+        rendered.push(diff_body_line(
+            &row.line, ext, hl, row.old_no, row.new_no, gutter, r,
+        ));
+        line_info.push(row.info);
+    }
+}
+
+/// Word-level diff between two body strings (already tab-expanded). Returns
+/// byte-range lists for the minus side and plus side identifying spans that
+/// were deleted or inserted. Returns `None` when the lines are too dissimilar
+/// to refine meaningfully — at that point the whole-row tint communicates
+/// "replaced" better than a forest of refinement spans would.
+fn refine_word_diff(minus: &str, plus: &str) -> Option<(RefineRanges, RefineRanges)> {
+    if minus.is_empty() || plus.is_empty() {
+        return None;
+    }
+    let diff = TextDiff::from_words(minus, plus);
+    let mut m_ranges = Vec::new();
+    let mut p_ranges = Vec::new();
+    let mut m_pos = 0usize;
+    let mut p_pos = 0usize;
+    let mut changed_m = 0usize;
+
+    for change in diff.iter_all_changes() {
+        let len = change.value().len();
+        match change.tag() {
+            ChangeTag::Equal => {
+                m_pos += len;
+                p_pos += len;
+            }
+            ChangeTag::Delete => {
+                m_ranges.push((m_pos, m_pos + len));
+                m_pos += len;
+                changed_m += len;
+            }
+            ChangeTag::Insert => {
+                p_ranges.push((p_pos, p_pos + len));
+                p_pos += len;
+            }
+        }
+    }
+
+    let m_total = minus.len();
+    if m_total == 0 {
+        return None;
+    }
+    if (changed_m as f64) / (m_total as f64) > 0.7 {
+        return None;
+    }
+    Some((m_ranges, p_ranges))
+}
+
+/// Slice each syntax-highlighted span at the byte boundaries of `ranges`, and
+/// paint the refined background on the slices that fall inside a range. Spans
+/// outside all ranges pass through unchanged.
+fn apply_refines(
+    spans: Vec<Span<'static>>,
+    ranges: &[(usize, usize)],
+    refined_bg: Color,
+) -> Vec<Span<'static>> {
+    if ranges.is_empty() {
+        return spans;
+    }
+    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
+    let mut pos = 0usize;
+    for span in spans {
+        let content = span.content.clone().into_owned();
+        let len = content.len();
+        let span_start = pos;
+        let span_end = pos + len;
+
+        let mut bounds: Vec<usize> = vec![span_start, span_end];
+        for &(s, e) in ranges {
+            if s < span_end && e > span_start {
+                bounds.push(s.max(span_start));
+                bounds.push(e.min(span_end));
+            }
+        }
+        bounds.sort();
+        bounds.dedup();
+
+        for w in bounds.windows(2) {
+            let (a, b) = (w[0], w[1]);
+            if a == b {
+                continue;
+            }
+            let chunk = &content[a - span_start..b - span_start];
+            let in_range = ranges.iter().any(|(s, e)| *s <= a && b <= *e);
+            let mut style = span.style;
+            if in_range {
+                style = style.bg(refined_bg);
+            }
+            out.push(Span::styled(chunk.to_string(), style));
+        }
+
+        pos = span_end;
+    }
+    out
 }
 
 fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
@@ -628,7 +835,7 @@ fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
 
 /// Scan hunk headers to size the old/new line-number columns. Empty diff
 /// collapses to single-digit columns so we still draw a sensible gutter.
-fn gutter_widths(diff: &str) -> (usize, usize) {
+fn gutter_widths(diff: &str) -> Gutter {
     let mut max_old = 0u32;
     let mut max_new = 0u32;
     for line in diff.lines() {
@@ -650,7 +857,10 @@ fn gutter_widths(diff: &str) -> (usize, usize) {
             *target = (*target).max(end);
         }
     }
-    (digits(max_old), digits(max_new))
+    Gutter {
+        old_w: digits(max_old),
+        new_w: digits(max_new),
+    }
 }
 
 fn digits(n: u32) -> usize {
@@ -672,23 +882,26 @@ fn diff_body_line(
     hl: &Highlighter,
     old_no: Option<u32>,
     new_no: Option<u32>,
-    old_w: usize,
-    new_w: usize,
+    gutter: Gutter,
+    refines: Option<&[(usize, usize)]>,
 ) -> Line<'static> {
-    let (body, marker_span, line_bg) = if let Some(rest) = line.strip_prefix('+') {
+    let Gutter { old_w, new_w } = gutter;
+    let (body, marker_span, line_bg, refined_bg) = if let Some(rest) = line.strip_prefix('+') {
         (
             rest,
             Span::styled("▎", Style::default().fg(theme::GREEN)),
             Some(theme::ADDED_BG),
+            Some(theme::ADDED_REFINED_BG),
         )
     } else if let Some(rest) = line.strip_prefix('-') {
         (
             rest,
             Span::styled("▎", Style::default().fg(theme::RED)),
             Some(theme::REMOVED_BG),
+            Some(theme::REMOVED_REFINED_BG),
         )
     } else if let Some(rest) = line.strip_prefix(' ') {
-        (rest, Span::raw(" "), None)
+        (rest, Span::raw(" "), None, None)
     } else if line.starts_with('\\') {
         let pad = " ".repeat(old_w + new_w + 5);
         return Line::from(Span::styled(
@@ -719,7 +932,12 @@ fn diff_body_line(
     ];
 
     let body = expand_tabs(body, TAB_WIDTH);
-    spans.extend(hl.line_spans(&body, ext));
+    let body_spans = hl.line_spans(&body, ext);
+    let body_spans = match (refines, refined_bg) {
+        (Some(ranges), Some(bg)) if !ranges.is_empty() => apply_refines(body_spans, ranges, bg),
+        _ => body_spans,
+    };
+    spans.extend(body_spans);
 
     let mut result = Line::from(spans);
     if let Some(bg) = line_bg {

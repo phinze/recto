@@ -21,3 +21,10 @@ pub const MAUVE: Color = Color::Rgb(0xcb, 0xa6, 0xf7);
 
 pub const ADDED_BG: Color = Color::Rgb(0x29, 0x35, 0x2c);
 pub const REMOVED_BG: Color = Color::Rgb(0x3a, 0x26, 0x2e);
+
+/// Brighter tints painted on the diverging spans within a paired `-`/`+` row,
+/// so the eye lands on the changed characters first instead of scanning the
+/// whole line. Picked to read as obviously "more" of the same hue against the
+/// row tint without going past Catppuccin's saturation budget.
+pub const ADDED_REFINED_BG: Color = Color::Rgb(0x3f, 0x5b, 0x3c);
+pub const REMOVED_REFINED_BG: Color = Color::Rgb(0x60, 0x36, 0x44);
