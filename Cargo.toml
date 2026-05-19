@@ -12,3 +12,4 @@ syntect = { version = "5.3.0", default-features = false, features = ["default-fa
 notify = "8.2.0"
 clap = { version = "4", features = ["derive"] }
 similar = "2"
+ignore = "0.4"

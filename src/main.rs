@@ -1161,7 +1161,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             let _ = tx.send(());
         }
     })?;
-    watcher.watch(Path::new("."), RecursiveMode::Recursive)?;
+    watch_tree_pruned(&mut watcher, Path::new("."));
 
     let mut pending_reload: Option<Instant> = None;
 
@@ -1319,19 +1319,33 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
 }
 
 fn is_interesting_event(event: &notify::Event) -> bool {
-    if !matches!(
+    matches!(
         event.kind,
         EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    ) {
-        return false;
+    )
+}
+
+/// Register a non-recursive inotify watch per source directory under `root`.
+/// We do the walk ourselves (instead of `RecursiveMode::Recursive`) so we can
+/// honor `.gitignore` / `.ignore` / `core.excludesFile` and skip hidden dirs
+/// like `.git`, `.jj`, `.direnv` — otherwise a `.direnv` full of vendored
+/// nixpkgs trees blows past `fs.inotify.max_user_watches` at startup.
+///
+/// `WalkBuilder`'s default `standard_filters(true)` covers all of that, and
+/// `follow_links(false)` keeps us out of `/nix/store` reachable from
+/// `.direnv/flake-inputs/...source` symlinks.
+fn watch_tree_pruned(watcher: &mut impl Watcher, root: &Path) {
+    for entry in ignore::WalkBuilder::new(root)
+        .follow_links(false)
+        .build()
+        .flatten()
+    {
+        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
+            // One bad directory (permission, ENOSPC) shouldn't take down
+            // the whole watcher. We just lose live-reload for that subtree.
+            let _ = watcher.watch(entry.path(), RecursiveMode::NonRecursive);
+        }
     }
-    event.paths.iter().any(|p| {
-        let s = p.to_string_lossy();
-        !s.contains("/.jj/")
-            && !s.contains("/.git/")
-            && !s.contains("/target/")
-            && !s.contains("/node_modules/")
-    })
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
