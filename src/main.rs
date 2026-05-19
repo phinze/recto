@@ -867,13 +867,32 @@ fn digits(n: u32) -> usize {
     if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
 }
 
+/// Render the `@@ -a,b +c,d @@` range bright teal and the trailing function
+/// context (if git's funcname patterns surfaced one) in dim italic, so the
+/// scope of a hunk reads at a glance without competing with the line numbers
+/// for attention.
 fn hunk_header(line: &str) -> Line<'static> {
-    Line::from(Span::styled(
-        line.to_string(),
-        Style::default()
-            .fg(theme::TEAL)
-            .add_modifier(Modifier::BOLD),
-    ))
+    let range_style = Style::default()
+        .fg(theme::TEAL)
+        .add_modifier(Modifier::BOLD);
+    if let Some(after_open) = line.strip_prefix("@@")
+        && let Some(close_off) = after_open.find("@@")
+    {
+        let range_end = 2 + close_off + 2;
+        let range = &line[..range_end];
+        let context = line[range_end..].trim_end();
+        let mut spans = vec![Span::styled(range.to_string(), range_style)];
+        if !context.is_empty() {
+            spans.push(Span::styled(
+                context.to_string(),
+                Style::default()
+                    .fg(theme::OVERLAY0)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        return Line::from(spans);
+    }
+    Line::from(Span::styled(line.to_string(), range_style))
 }
 
 fn diff_body_line(
