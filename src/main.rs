@@ -532,6 +532,8 @@ fn render_diff(
         .map(|(i, c)| (c.path.as_str(), i))
         .collect();
 
+    let (old_w, new_w) = gutter_widths(diff);
+
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut line_info: Vec<LineInfo> = Vec::new();
     let mut file_starts: Vec<u16> = vec![0; changes.len()];
@@ -539,6 +541,7 @@ fn render_diff(
     let mut current_ext = String::new();
     let mut current_file: Option<usize> = None;
     let mut new_line: u32 = 0;
+    let mut old_line: u32 = 0;
 
     for line in diff.lines() {
         if let Some(rest) = line.strip_prefix("diff --git ")
@@ -556,18 +559,35 @@ fn render_diff(
             current_ext = ext_for_path(b).to_string();
             current_file = idx;
             new_line = 0;
+            old_line = 0;
             continue;
         }
         if in_metadata {
             if line.starts_with("@@") {
                 in_metadata = false;
-                new_line = parse_hunk_new_start(line).unwrap_or(1);
+                let (o, n) = parse_hunk_starts(line).unwrap_or((1, 1));
+                old_line = o;
+                new_line = n;
                 rendered.push(hunk_header(line));
                 line_info.push(None);
             }
             continue;
         }
-        rendered.push(diff_body_line(line, &current_ext, hl));
+        let (old_no, new_no) = match line.chars().next() {
+            Some('+') => (None, Some(new_line)),
+            Some('-') => (Some(old_line), None),
+            Some(' ') => (Some(old_line), Some(new_line)),
+            _ => (None, None),
+        };
+        rendered.push(diff_body_line(
+            line,
+            &current_ext,
+            hl,
+            old_no,
+            new_no,
+            old_w,
+            new_w,
+        ));
         let info = match line.chars().next() {
             Some('+') => {
                 let i = current_file.map(|f| (f, new_line));
@@ -577,9 +597,14 @@ fn render_diff(
             Some(' ') => {
                 let i = current_file.map(|f| (f, new_line));
                 new_line += 1;
+                old_line += 1;
                 i
             }
-            Some('-') => current_file.map(|f| (f, new_line)),
+            Some('-') => {
+                let i = current_file.map(|f| (f, new_line));
+                old_line += 1;
+                i
+            }
             _ => None,
         };
         line_info.push(info);
@@ -588,12 +613,48 @@ fn render_diff(
     (rendered, file_starts, line_info)
 }
 
-fn parse_hunk_new_start(line: &str) -> Option<u32> {
-    let plus = line
-        .split_whitespace()
-        .find(|tok| tok.starts_with('+'))?
-        .trim_start_matches('+');
-    plus.split(',').next()?.parse().ok()
+fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
+    let mut old = None;
+    let mut new = None;
+    for tok in line.split_whitespace() {
+        if let Some(rest) = tok.strip_prefix('-') {
+            old = rest.split(',').next().and_then(|s| s.parse().ok());
+        } else if let Some(rest) = tok.strip_prefix('+') {
+            new = rest.split(',').next().and_then(|s| s.parse().ok());
+        }
+    }
+    Some((old?, new?))
+}
+
+/// Scan hunk headers to size the old/new line-number columns. Empty diff
+/// collapses to single-digit columns so we still draw a sensible gutter.
+fn gutter_widths(diff: &str) -> (usize, usize) {
+    let mut max_old = 0u32;
+    let mut max_new = 0u32;
+    for line in diff.lines() {
+        if !line.starts_with("@@") {
+            continue;
+        }
+        for tok in line.split_whitespace() {
+            let (target, rest) = if let Some(r) = tok.strip_prefix('-') {
+                (&mut max_old, r)
+            } else if let Some(r) = tok.strip_prefix('+') {
+                (&mut max_new, r)
+            } else {
+                continue;
+            };
+            let mut parts = rest.split(',');
+            let start: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
+            let count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
+            let end = start.saturating_add(count.saturating_sub(1));
+            *target = (*target).max(end);
+        }
+    }
+    (digits(max_old), digits(max_new))
+}
+
+fn digits(n: u32) -> usize {
+    if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
 }
 
 fn hunk_header(line: &str) -> Line<'static> {
@@ -605,16 +666,33 @@ fn hunk_header(line: &str) -> Line<'static> {
     ))
 }
 
-fn diff_body_line(line: &str, ext: &str, hl: &Highlighter) -> Line<'static> {
-    let (marker_char, body, marker_color, line_bg) = if let Some(rest) = line.strip_prefix('+') {
-        ('+', rest, theme::GREEN, Some(theme::ADDED_BG))
+fn diff_body_line(
+    line: &str,
+    ext: &str,
+    hl: &Highlighter,
+    old_no: Option<u32>,
+    new_no: Option<u32>,
+    old_w: usize,
+    new_w: usize,
+) -> Line<'static> {
+    let (body, marker_span, line_bg) = if let Some(rest) = line.strip_prefix('+') {
+        (
+            rest,
+            Span::styled("▎", Style::default().fg(theme::GREEN)),
+            Some(theme::ADDED_BG),
+        )
     } else if let Some(rest) = line.strip_prefix('-') {
-        ('-', rest, theme::RED, Some(theme::REMOVED_BG))
+        (
+            rest,
+            Span::styled("▎", Style::default().fg(theme::RED)),
+            Some(theme::REMOVED_BG),
+        )
     } else if let Some(rest) = line.strip_prefix(' ') {
-        (' ', rest, theme::OVERLAY0, None)
+        (rest, Span::raw(" "), None)
     } else if line.starts_with('\\') {
+        let pad = " ".repeat(old_w + new_w + 5);
         return Line::from(Span::styled(
-            line.to_string(),
+            format!("{pad}{line}"),
             Style::default()
                 .fg(theme::OVERLAY0)
                 .add_modifier(Modifier::ITALIC),
@@ -623,12 +701,23 @@ fn diff_body_line(line: &str, ext: &str, hl: &Highlighter) -> Line<'static> {
         return Line::from(line.to_string());
     };
 
-    let mut spans = vec![Span::styled(
-        marker_char.to_string(),
-        Style::default()
-            .fg(marker_color)
-            .add_modifier(Modifier::BOLD),
-    )];
+    let old_text = match old_no {
+        Some(n) => format!(" {:>w$} ", n, w = old_w),
+        None => " ".repeat(old_w + 2),
+    };
+    let new_text = match new_no {
+        Some(n) => format!("{:>w$} ", n, w = new_w),
+        None => " ".repeat(new_w + 1),
+    };
+
+    let gutter_style = Style::default().fg(theme::OVERLAY0);
+    let mut spans = vec![
+        Span::styled(old_text, gutter_style),
+        Span::styled(new_text, gutter_style),
+        marker_span,
+        Span::raw(" "),
+    ];
+
     let body = expand_tabs(body, TAB_WIDTH);
     spans.extend(hl.line_spans(&body, ext));
 
