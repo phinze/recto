@@ -413,9 +413,12 @@ impl App {
         }
         if let Some(revs) = loaded.revs {
             self.revs = revs;
-            // The picker was looking at an older list; the user's mental
-            // pick no longer maps cleanly. Drop them back to normal mode.
-            self.mode = Mode::Normal;
+            // Clamping selected in CommitPicker, otherwise default back to Normal mode.
+            if let Mode::CommitPicker { selected } = &mut self.mode {
+                *selected = (*selected).min(self.revs.len());
+            } else {
+                self.mode = Mode::Normal;
+            }
         }
 
         let new_idx = prev_path
@@ -1210,6 +1213,7 @@ fn handle_event(
                 KeyCode::Enter => app.picker_commit(),
                 KeyCode::Char('j') | KeyCode::Down => app.picker_select_next(),
                 KeyCode::Char('k') | KeyCode::Up => app.picker_select_prev(),
+                KeyCode::Char('b') => app.cycle_base(),
                 _ => {}
             },
             Mode::Normal => match key.code {
@@ -1398,16 +1402,24 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
         .split(rows[1]);
 
+    draw_files(frame, panes[0], app);
+
     if matches!(app.mode, Mode::CommitPicker { .. }) {
-        draw_commits(frame, panes[0], app);
+        let height = panes[1].height;
+        let picker_height = (height / 3).clamp(8, 15).min(height.saturating_sub(5));
+        let right_panes = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(0), Constraint::Length(picker_height)])
+            .split(panes[1]);
+        draw_diff(frame, right_panes[0], app);
+        draw_commits(frame, right_panes[1], app);
     } else {
-        draw_files(frame, panes[0], app);
+        draw_diff(frame, panes[1], app);
     }
-    draw_diff(frame, panes[1], app);
 
     let footer_text = match app.mode {
         Mode::Normal => "q quit · tab focus · b base · ] [ rev · c pick · w wrap · e edit",
-        Mode::CommitPicker { .. } => "↵ select · esc cancel · j k move",
+        Mode::CommitPicker { .. } => "↵ select · esc cancel · j k move · b base",
     };
     let footer =
         Paragraph::new(Line::from(footer_text)).style(Style::default().fg(theme::OVERLAY0));
@@ -1431,8 +1443,9 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             ListItem::new(Line::from(spans))
         })
         .collect();
+    let files_focused = app.focus == Focus::Files && matches!(app.mode, Mode::Normal);
     let tree = List::new(items)
-        .block(pane_block("Files", app.focus == Focus::Files))
+        .block(pane_block("Files", files_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(tree, area, &mut app.file_state);
 }
