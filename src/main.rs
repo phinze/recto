@@ -1471,6 +1471,7 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .fg(theme::MAUVE)
                 .add_modifier(Modifier::BOLD),
         ),
+        Span::styled("  ", Style::default()), // aligned to bullet
         Span::styled(
             "all changes",
             Style::default().add_modifier(Modifier::ITALIC),
@@ -1479,19 +1480,67 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
     for (i, rev) in app.revs.iter().enumerate() {
         let marker = if cursor_idx == i + 1 { "▸ " } else { "  " };
-        items.push(ListItem::new(Line::from(vec![
+
+        let bullet = if rev.is_base {
+            Span::styled(
+                "○ ",
+                Style::default()
+                    .fg(theme::YELLOW)
+                    .add_modifier(Modifier::BOLD),
+            )
+        } else if rev.is_in_range {
+            Span::styled("● ", Style::default().fg(theme::GREEN))
+        } else {
+            Span::styled("· ", Style::default().fg(theme::OVERLAY0))
+        };
+
+        let is_dimmed = !rev.is_in_range && !rev.is_base && !rev.is_head;
+        let id_style = if is_dimmed {
+            Style::default().fg(theme::SURFACE1)
+        } else {
+            Style::default().fg(theme::TEAL)
+        };
+        let summary_style = if is_dimmed {
+            Style::default().fg(theme::OVERLAY0)
+        } else {
+            Style::default().fg(theme::TEXT)
+        };
+
+        let mut spans = vec![
             Span::styled(
                 marker,
                 Style::default()
                     .fg(theme::MAUVE)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                format!("{} ", rev.short_id),
-                Style::default().fg(theme::TEAL),
-            ),
-            Span::raw(rev.summary.clone()),
-        ])));
+            bullet,
+            Span::styled(format!("{} ", rev.short_id), id_style),
+            Span::styled(rev.summary.clone(), summary_style),
+        ];
+
+        if rev.is_base {
+            spans.push(Span::styled(
+                " (base)",
+                Style::default()
+                    .fg(theme::YELLOW)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        if rev.is_head {
+            let head_label = if rev.id.len() == 32 {
+                " (@)"
+            } else {
+                " (HEAD)"
+            };
+            spans.push(Span::styled(
+                head_label,
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+
+        items.push(ListItem::new(Line::from(spans)));
     }
 
     let list = List::new(items)

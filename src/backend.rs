@@ -50,6 +50,9 @@ pub struct Rev {
     pub id: String,
     pub short_id: String,
     pub summary: String,
+    pub is_base: bool,
+    pub is_head: bool,
+    pub is_in_range: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -165,22 +168,54 @@ impl Backend for JjBackend {
     }
 
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
-        let rev = Self::revset(base);
-        let revset = format!("{rev}..@");
-        // Use change_id as the canonical handle (jj resolves it as a revset).
-        // change_id stays stable across rewrites, which is the whole point —
-        // squash mid-review shouldn't yank our cursor.
-        let template = r#"change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\n""#;
+        let base_revset = Self::revset(base);
+
+        // Resolve base to its canonical change_id
+        let base_id = self
+            .run(&["log", "-r", &base_revset, "--no-graph", "-T", "change_id"])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // Get the set of change_ids that fall within the range `base_revset..@`
+        let range_output = self
+            .run(&[
+                "log",
+                "-r",
+                &format!("{base_revset}..@"),
+                "--no-graph",
+                "-T",
+                "change_id ++ \"\n\"",
+            ])
+            .unwrap_or_default();
+        let range_ids: std::collections::HashSet<String> = range_output
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
+
+        // Fetch a slice of recent history (up to 20 revisions) leading to @ and base
+        let revset = format!("::@ | ::{base_revset}");
+        let template = r#"change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\n""#;
         let out = self.run(&[
             "log",
             "-r",
             &revset,
+            "--limit",
+            "20",
             "--no-graph",
-            "--reversed",
             "-T",
             template,
         ])?;
-        Ok(out.lines().filter_map(parse_jj_rev_line).collect())
+
+        let mut revs: Vec<Rev> = out.lines().filter_map(parse_jj_rev_line).collect();
+
+        // Post-process to set relationships
+        for r in &mut revs {
+            r.is_base = r.id == base_id;
+            r.is_in_range = range_ids.contains(&r.id);
+        }
+
+        Ok(revs)
     }
 
     fn default_bases(&self) -> Vec<Base> {
@@ -260,12 +295,50 @@ impl Backend for GitBackend {
     }
 
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
-        // `<ref>..HEAD` lists commits reachable from HEAD but not from ref,
-        // which is also what `merge-base..HEAD` would give us — so the
-        // merge-base case collapses to the same form.
-        let arg = format!("{}..HEAD", base.anchor_ref());
-        let out = self.run(&["log", "--format=%H%x09%h%x09%s", "--reverse", &arg])?;
-        Ok(out.lines().filter_map(parse_git_rev_line).collect())
+        let base_ref = base.anchor_ref();
+
+        // Resolve base to its full SHA
+        let base_id = self
+            .run(&["rev-parse", &base_ref])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // Resolve HEAD to its full SHA
+        let head_id = self
+            .run(&["rev-parse", "HEAD"])
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // Get the set of SHAs in `base..HEAD`
+        let range_output = self
+            .run(&["log", "--format=%H", &format!("{base_ref}..HEAD")])
+            .unwrap_or_default();
+        let range_ids: std::collections::HashSet<String> = range_output
+            .lines()
+            .map(|line| line.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+            .collect();
+
+        // Fetch a slice of recent history (up to 20 commits) reachable from HEAD or base_ref
+        let out = self.run(&[
+            "log",
+            "--format=%H%x09%h%x09%s",
+            "-n",
+            "20",
+            "HEAD",
+            &base_ref,
+        ])?;
+
+        let mut revs: Vec<Rev> = out.lines().filter_map(parse_git_rev_line).collect();
+
+        // Post-process to set relationships
+        for r in &mut revs {
+            r.is_base = r.id == base_id;
+            r.is_head = r.id == head_id;
+            r.is_in_range = range_ids.contains(&r.id);
+        }
+
+        Ok(revs)
     }
 
     fn default_bases(&self) -> Vec<Base> {
@@ -282,10 +355,11 @@ impl Backend for GitBackend {
 }
 
 fn parse_jj_rev_line(line: &str) -> Option<Rev> {
-    let mut fields = line.splitn(3, '\t');
+    let mut fields = line.splitn(4, '\t');
     let id = fields.next()?.trim().to_string();
     let short_id = fields.next()?.trim().to_string();
     let summary = fields.next().unwrap_or("").trim().to_string();
+    let is_wc = fields.next().is_some_and(|s| s.trim() == "true");
     if id.is_empty() {
         return None;
     }
@@ -298,6 +372,9 @@ fn parse_jj_rev_line(line: &str) -> Option<Rev> {
         id,
         short_id,
         summary,
+        is_base: false,
+        is_head: is_wc,
+        is_in_range: false,
     })
 }
 
@@ -313,6 +390,9 @@ fn parse_git_rev_line(line: &str) -> Option<Rev> {
         id,
         short_id,
         summary,
+        is_base: false,
+        is_head: false,
+        is_in_range: false,
     })
 }
 
