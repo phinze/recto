@@ -442,6 +442,9 @@ impl App {
     }
 
     fn max_scroll(&self) -> u16 {
+        if self.wrap {
+            return self.max_scroll_wrapped();
+        }
         let overflow = self.rendered_lines().saturating_sub(self.diff_viewport);
         if overflow == 0 {
             0
@@ -450,12 +453,49 @@ impl App {
         }
     }
 
+    /// Walk backwards through `rendered`, summing each line's wrapped row
+    /// count, until we reach a source-line index where everything from there
+    /// to the end just fills the viewport. That index is our scroll ceiling
+    /// (plus SCROLLOFF for breathing room), since `app.scroll` is a
+    /// source-line offset and the render path slices `rendered[scroll..]`.
+    fn max_scroll_wrapped(&self) -> u16 {
+        let width = self.diff_content_area.width;
+        let viewport = self.diff_viewport;
+        if width == 0 || viewport == 0 || self.rendered.is_empty() {
+            return 0;
+        }
+        let mut accum: u32 = 0;
+        let mut start: usize = self.rendered.len();
+        for idx in (0..self.rendered.len()).rev() {
+            let rows = Paragraph::new(vec![self.rendered[idx].clone()])
+                .wrap(Wrap { trim: false })
+                .line_count(width) as u32;
+            accum = accum.saturating_add(rows);
+            if accum >= viewport as u32 {
+                start = idx;
+                break;
+            }
+        }
+        if accum < viewport as u32 {
+            return 0;
+        }
+        (start as u16).saturating_add(SCROLLOFF)
+    }
+
+    /// Both directions deliberately skip the max-scroll clamp: in wrap mode
+    /// `max_scroll` is non-trivial, and a mouse-wheel burst can queue dozens
+    /// of events between redraws. Draw clamps once via `clamp_scroll`, which
+    /// covers correctness for display and for any reads that follow.
     fn scroll_down(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_add(n).min(self.max_scroll());
+        self.scroll = self.scroll.saturating_add(n);
     }
 
     fn scroll_up(&mut self, n: u16) {
         self.scroll = self.scroll.saturating_sub(n);
+    }
+
+    fn clamp_scroll(&mut self) {
+        self.scroll = self.scroll.min(self.max_scroll());
     }
 
     fn select_next(&mut self) {
@@ -1170,7 +1210,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
     loop {
         terminal.draw(|f| draw(f, app))?;
-        app.scroll = app.scroll.min(app.max_scroll());
 
         app.poll_load();
 
@@ -1417,9 +1456,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         draw_diff(frame, panes[1], app);
     }
 
+    let wrap_hint = if app.wrap { "w unwrap" } else { "w wrap" };
     let footer_text = match app.mode {
-        Mode::Normal => "q quit · tab focus · b base · ] [ rev · c pick · w wrap · e edit",
-        Mode::CommitPicker { .. } => "↵ select · esc cancel · j k move · b base",
+        Mode::Normal => {
+            format!("q quit · tab focus · b base · ] [ rev · c pick · {wrap_hint} · e edit")
+        }
+        Mode::CommitPicker { .. } => "↵ select · esc cancel · j k move · b base".to_string(),
     };
     let footer =
         Paragraph::new(Line::from(footer_text)).style(Style::default().fg(theme::OVERLAY0));
@@ -1574,6 +1616,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let content_area = split[1];
     app.diff_viewport = content_area.height;
     app.diff_content_area = content_area;
+    app.clamp_scroll();
 
     let current = app.current_file();
     if app.focus == Focus::Diff
@@ -1592,21 +1635,21 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let sticky = Paragraph::new(sticky_text).style(Style::default().bg(theme::SURFACE0));
     frame.render_widget(sticky, sticky_area);
 
-    let scroll = app.scroll.min(app.max_scroll()) as usize;
+    let scroll = app.scroll as usize;
     let total = app.rendered.len();
     let start = scroll.min(total);
-    // In wrap mode we can't pre-trim to viewport height — a single source line
-    // may span many visual rows. Slice to the end and let Paragraph stop when
-    // the area fills. `app.scroll` stays a source-line offset, so file jumps
-    // land correctly; vertical scrolling moves by source line, not visual row.
+    // `app.scroll` is a source-line offset, and a wrapped source line can span
+    // many visual rows — but each contributes at least one row, so slicing
+    // `content_area.height` source lines is always enough to fill the viewport
+    // in either mode. Bounding the slice keeps the per-frame Line clones small
+    // on large diffs.
+    let end = start
+        .saturating_add(content_area.height as usize)
+        .min(total);
+    let window = app.rendered[start..end].to_vec();
     let content = if app.wrap {
-        let window = app.rendered[start..].to_vec();
         Paragraph::new(window).wrap(Wrap { trim: false })
     } else {
-        let end = start
-            .saturating_add(content_area.height as usize)
-            .min(total);
-        let window = app.rendered[start..end].to_vec();
         Paragraph::new(window).scroll((0, app.h_scroll))
     };
     frame.render_widget(content, content_area);
