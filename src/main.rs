@@ -123,13 +123,29 @@ struct Cli {
 enum Focus {
     Files,
     Diff,
+    Commits,
 }
 
 impl Focus {
-    fn cycle(self) -> Self {
+    fn cycle(self, show_files: bool, show_commits: bool) -> Self {
         match self {
             Focus::Files => Focus::Diff,
-            Focus::Diff => Focus::Files,
+            Focus::Diff => {
+                if show_commits {
+                    Focus::Commits
+                } else if show_files {
+                    Focus::Files
+                } else {
+                    Focus::Diff
+                }
+            }
+            Focus::Commits => {
+                if show_files {
+                    Focus::Files
+                } else {
+                    Focus::Diff
+                }
+            }
         }
     }
 }
@@ -142,19 +158,11 @@ enum Cursor {
     Rev(usize),
 }
 
-/// Top-level interaction mode. `CommitPicker` swaps the file pane for a list
-/// of revs; selection is a tentative pick that only commits on Enter, so
-/// scrubbing doesn't fire worker loads.
+/// Top-level interaction mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
     Normal,
-    /// Picker index: 0 = "all changes", 1..=revs.len() = revs[i-1].
-    CommitPicker {
-        selected: usize,
-    },
-    SearchInput {
-        query: String,
-    },
+    SearchInput { query: String },
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -188,6 +196,8 @@ struct App {
     search_query: Option<String>,
     search_matches: Vec<SearchMatch>,
     search_active_idx: Option<usize>,
+    pub show_files: bool,
+    pub show_commits: bool,
 }
 
 impl App {
@@ -245,11 +255,20 @@ impl App {
             search_query: None,
             search_matches: Vec::new(),
             search_active_idx: None,
+            show_files: true,
+            show_commits: true,
         })
     }
 
     fn base(&self) -> &Base {
         &self.bases[self.base_idx]
+    }
+
+    fn toggle_files(&mut self) {
+        self.show_files = !self.show_files;
+        if !self.show_files && self.focus == Focus::Files {
+            self.focus = Focus::Diff;
+        }
     }
 
     /// The scope implied by the current base + cursor. Source of truth for
@@ -328,46 +347,46 @@ impl App {
         self.request_current_scope();
     }
 
-    fn open_commit_picker(&mut self) {
-        let selected = match self.cursor {
+    fn commits_select_next(&mut self) {
+        let current_idx = match self.cursor {
             Cursor::All => 0,
             Cursor::Rev(i) => i + 1,
         };
-        self.mode = Mode::CommitPicker { selected };
-    }
-
-    fn picker_select_next(&mut self) {
-        if let Mode::CommitPicker { selected } = &mut self.mode {
-            let max = self.revs.len();
-            *selected = (*selected + 1).min(max);
-        }
-    }
-
-    fn picker_select_prev(&mut self) {
-        if let Mode::CommitPicker { selected } = &mut self.mode {
-            *selected = selected.saturating_sub(1);
-        }
-    }
-
-    fn picker_commit(&mut self) {
-        let Mode::CommitPicker { selected } = self.mode.clone() else {
-            return;
-        };
-        let new_cursor = if selected == 0 {
+        let max = self.revs.len();
+        let next_idx = (current_idx + 1).min(max);
+        let new_cursor = if next_idx == 0 {
             Cursor::All
         } else {
-            Cursor::Rev(selected - 1)
+            Cursor::Rev(next_idx - 1)
         };
-        let changed = new_cursor != self.cursor;
-        self.cursor = new_cursor;
-        self.mode = Mode::Normal;
-        if changed {
+        if new_cursor != self.cursor {
+            self.cursor = new_cursor;
             self.request_current_scope();
         }
     }
 
-    fn picker_cancel(&mut self) {
-        self.mode = Mode::Normal;
+    fn commits_select_prev(&mut self) {
+        let current_idx = match self.cursor {
+            Cursor::All => 0,
+            Cursor::Rev(i) => i + 1,
+        };
+        let prev_idx = current_idx.saturating_sub(1);
+        let new_cursor = if prev_idx == 0 {
+            Cursor::All
+        } else {
+            Cursor::Rev(prev_idx - 1)
+        };
+        if new_cursor != self.cursor {
+            self.cursor = new_cursor;
+            self.request_current_scope();
+        }
+    }
+
+    fn toggle_commits(&mut self) {
+        self.show_commits = !self.show_commits;
+        if !self.show_commits && self.focus == Focus::Commits {
+            self.focus = Focus::Diff;
+        }
     }
 
     /// Re-scans all pre-rendered lines, finding all occurrences of the query (case-insensitively, Unicode-safe).
@@ -637,11 +656,14 @@ impl App {
         }
         if let Some(revs) = loaded.revs {
             self.revs = revs;
-            // Clamping selected in CommitPicker, otherwise default back to Normal mode.
-            if let Mode::CommitPicker { selected } = &mut self.mode {
-                *selected = (*selected).min(self.revs.len());
-            } else {
-                self.mode = Mode::Normal;
+            if let Cursor::Rev(i) = self.cursor
+                && i >= self.revs.len()
+            {
+                self.cursor = if self.revs.is_empty() {
+                    Cursor::All
+                } else {
+                    Cursor::Rev(self.revs.len() - 1)
+                };
             }
         }
 
@@ -770,7 +792,7 @@ impl App {
     fn edit_target(&self) -> Option<(String, u32)> {
         let start = match self.focus {
             Focus::Files => *self.file_starts.get(self.file_state.selected()?)?,
-            Focus::Diff => self.scroll,
+            Focus::Diff | Focus::Commits => self.scroll,
         };
         let (fidx, line) = self
             .line_info
@@ -1475,21 +1497,6 @@ fn handle_event(
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
             match &mut mode {
-                Mode::CommitPicker { .. } => match key.code {
-                    KeyCode::Char('q') => return Ok(Action::Quit),
-                    KeyCode::Esc | KeyCode::Char('c') => {
-                        app.picker_cancel();
-                        mode = app.mode.clone();
-                    }
-                    KeyCode::Enter => {
-                        app.picker_commit();
-                        mode = app.mode.clone();
-                    }
-                    KeyCode::Char('j') | KeyCode::Down => app.picker_select_next(),
-                    KeyCode::Char('k') | KeyCode::Up => app.picker_select_prev(),
-                    KeyCode::Char('b') => app.cycle_base(),
-                    _ => {}
-                },
                 Mode::SearchInput { query } => match key.code {
                     KeyCode::Esc => {
                         app.mode = Mode::Normal;
@@ -1522,39 +1529,76 @@ fn handle_event(
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if app.search_query.is_some() {
                             app.clear_search();
+                        } else if app.focus == Focus::Commits {
+                            app.focus = Focus::Diff;
                         } else {
                             return Ok(Action::Quit);
                         }
                     }
-                    KeyCode::Tab => app.focus = app.focus.cycle(),
+                    KeyCode::Tab => {
+                        app.focus = app.focus.cycle(app.show_files, app.show_commits);
+                    }
                     KeyCode::Char('b') => app.cycle_base(),
                     KeyCode::Char(']') => app.cycle_rev_next(),
                     KeyCode::Char('[') => app.cycle_rev_prev(),
-                    KeyCode::Char('c') => app.open_commit_picker(),
+                    KeyCode::Char('c') => {
+                        if !app.show_commits {
+                            app.show_commits = true;
+                        }
+                        app.focus = Focus::Commits;
+                    }
+                    KeyCode::Char('C') => {
+                        app.toggle_commits();
+                    }
+                    KeyCode::Char('f') => {
+                        app.toggle_files();
+                    }
                     KeyCode::Enter => app.jump_to_selected(),
                     KeyCode::Char('j') | KeyCode::Down => match app.focus {
-                        Focus::Files => {
+                        Focus::Files if app.show_files => {
                             app.select_next();
                             app.jump_to_selected();
                         }
-                        Focus::Diff => app.scroll_down(1),
+                        Focus::Commits if app.show_commits => {
+                            app.commits_select_next();
+                        }
+                        _ => app.scroll_down(1),
                     },
                     KeyCode::Char('k') | KeyCode::Up => match app.focus {
-                        Focus::Files => {
+                        Focus::Files if app.show_files => {
                             app.select_prev();
                             app.jump_to_selected();
                         }
-                        Focus::Diff => app.scroll_up(1),
+                        Focus::Commits if app.show_commits => {
+                            let current_idx = match app.cursor {
+                                Cursor::All => 0,
+                                Cursor::Rev(i) => i + 1,
+                            };
+                            if current_idx == 0 {
+                                app.focus = Focus::Diff;
+                            } else {
+                                app.commits_select_prev();
+                            }
+                        }
+                        _ => app.scroll_up(1),
                     },
-                    KeyCode::Char('H') => app.focus = Focus::Files,
+                    KeyCode::Char('H') => {
+                        if app.show_files {
+                            app.focus = Focus::Files;
+                        }
+                    }
                     KeyCode::Char('L') => app.focus = Focus::Diff,
                     KeyCode::Char('J') => {
-                        app.select_next();
-                        app.jump_to_selected();
+                        if app.show_files {
+                            app.select_next();
+                            app.jump_to_selected();
+                        }
                     }
                     KeyCode::Char('K') => {
-                        app.select_prev();
-                        app.jump_to_selected();
+                        if app.show_files {
+                            app.select_prev();
+                            app.jump_to_selected();
+                        }
                     }
                     KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
                         app.scroll_right(1)
@@ -1717,14 +1761,26 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let header = Paragraph::new(Line::from(header_spans));
     frame.render_widget(header, rows[0]);
 
+    let horizontal_constraints = if app.show_files {
+        [Constraint::Percentage(30), Constraint::Percentage(70)]
+    } else {
+        [Constraint::Length(0), Constraint::Percentage(100)]
+    };
+
     let panes = Layout::default()
         .direction(Direction::Horizontal)
-        .constraints([Constraint::Percentage(30), Constraint::Percentage(70)])
+        .constraints(horizontal_constraints)
         .split(rows[1]);
 
-    draw_files(frame, panes[0], app);
+    if app.show_files {
+        draw_files(frame, panes[0], app);
+    } else {
+        app.files_area = Rect::default();
+    }
 
-    if matches!(app.mode, Mode::CommitPicker { .. }) {
+    let show_commits_panel = app.show_commits;
+
+    if show_commits_panel {
         let height = panes[1].height;
         let picker_height = (height / 3).clamp(8, 15).min(height.saturating_sub(5));
         let right_panes = Layout::default()
@@ -1753,12 +1809,23 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         _ => {
             let wrap_hint = if app.wrap { "w unwrap" } else { "w wrap" };
             let mut text = match &app.mode {
-                Mode::Normal => {
-                    format!("q quit · tab focus · b base · ] [ rev · c pick · {wrap_hint} · e edit")
-                }
-                Mode::CommitPicker { .. } => {
-                    "↵ select · esc cancel · j k move · b base".to_string()
-                }
+                Mode::Normal => match app.focus {
+                    Focus::Commits => {
+                        format!(
+                            "q quit · j k select · esc focus diff · b base · f files · C revs · {wrap_hint}"
+                        )
+                    }
+                    Focus::Files => {
+                        format!(
+                            "q quit · tab focus · b base · ] [ rev · c revs · f files · C revs · {wrap_hint}"
+                        )
+                    }
+                    Focus::Diff => {
+                        format!(
+                            "q quit · tab focus · b base · ] [ rev · c revs · f files · C revs · {wrap_hint} · e edit"
+                        )
+                    }
+                },
                 _ => String::new(),
             };
             if let Some(ref query) = app.search_query {
@@ -1803,14 +1870,17 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
-    let Mode::CommitPicker { selected } = app.mode else {
-        return;
-    };
     // Marker for the rev the user is *currently viewing*, distinct from the
     // tentative picker selection (rendered via highlight_style).
     let cursor_idx: usize = match app.cursor {
         Cursor::All => 0,
         Cursor::Rev(i) => i + 1,
+    };
+    let commits_focused = app.focus == Focus::Commits && matches!(app.mode, Mode::Normal);
+    let selected = if commits_focused {
+        Some(cursor_idx)
+    } else {
+        None
     };
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.revs.len() + 1);
@@ -1896,11 +1966,11 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 
     let list = List::new(items)
-        .block(pane_block("Revs", true))
+        .block(pane_block("Revs", commits_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     let mut state = ListState::default();
-    state.select(Some(selected));
+    state.select(selected);
     frame.render_stateful_widget(list, area, &mut state);
 }
 
