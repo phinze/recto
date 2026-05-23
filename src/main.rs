@@ -193,6 +193,8 @@ struct App {
     file_state: ListState,
     files_area: Rect,
     diff_content_area: Rect,
+    commits_area: Rect,
+    commits_state: ListState,
     search_query: Option<String>,
     search_matches: Vec<SearchMatch>,
     search_active_idx: Option<usize>,
@@ -252,6 +254,8 @@ impl App {
             file_state,
             files_area: Rect::default(),
             diff_content_area: Rect::default(),
+            commits_area: Rect::default(),
+            commits_state: ListState::default(),
             search_query: None,
             search_matches: Vec::new(),
             search_active_idx: None,
@@ -1646,6 +1650,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     };
     let in_files = app.files_area.contains(pos);
     let in_diff = app.diff_content_area.contains(pos);
+    let in_commits = app.commits_area.contains(pos);
     match m.kind {
         MouseEventKind::ScrollDown => {
             if in_files {
@@ -1655,6 +1660,9 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             } else if in_diff {
                 app.focus = Focus::Diff;
                 app.scroll_down(3);
+            } else if in_commits {
+                app.focus = Focus::Commits;
+                app.commits_select_next();
             }
         }
         MouseEventKind::ScrollUp => {
@@ -1665,6 +1673,9 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             } else if in_diff {
                 app.focus = Focus::Diff;
                 app.scroll_up(3);
+            } else if in_commits {
+                app.focus = Focus::Commits;
+                app.commits_select_prev();
             }
         }
         MouseEventKind::Down(MouseButton::Left) => {
@@ -1680,6 +1691,23 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 }
             } else if in_diff {
                 app.focus = Focus::Diff;
+            } else if in_commits {
+                app.focus = Focus::Commits;
+                let inner_y = app.commits_area.y.saturating_add(1);
+                if m.row >= inner_y {
+                    let row = (m.row - inner_y) as usize + app.commits_state.offset();
+                    if row <= app.revs.len() {
+                        let new_cursor = if row == 0 {
+                            Cursor::All
+                        } else {
+                            Cursor::Rev(row - 1)
+                        };
+                        if app.cursor != new_cursor {
+                            app.cursor = new_cursor;
+                            app.request_current_scope();
+                        }
+                    }
+                }
             }
         }
         _ => {}
@@ -1791,6 +1819,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         draw_commits(frame, right_panes[1], app);
     } else {
         draw_diff(frame, panes[1], app);
+        app.commits_area = Rect::default();
     }
 
     let footer_widget = match &app.mode {
@@ -1870,6 +1899,7 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 }
 
 fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    app.commits_area = area;
     // Marker for the rev the user is *currently viewing*, distinct from the
     // tentative picker selection (rendered via highlight_style).
     let cursor_idx: usize = match app.cursor {
@@ -1877,11 +1907,7 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Cursor::Rev(i) => i + 1,
     };
     let commits_focused = app.focus == Focus::Commits && matches!(app.mode, Mode::Normal);
-    let selected = if commits_focused {
-        Some(cursor_idx)
-    } else {
-        None
-    };
+    let selected = Some(cursor_idx);
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.revs.len() + 1);
 
@@ -1969,9 +1995,8 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .block(pane_block("Revs", commits_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
-    let mut state = ListState::default();
-    state.select(selected);
-    frame.render_stateful_widget(list, area, &mut state);
+    app.commits_state.select(selected);
+    frame.render_stateful_widget(list, area, &mut app.commits_state);
 }
 
 fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
