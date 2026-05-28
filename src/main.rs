@@ -1,4 +1,5 @@
 mod backend;
+mod funcname;
 mod highlight;
 mod theme;
 
@@ -872,6 +873,10 @@ fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> Rendered
     let mut in_metadata = false;
     let mut current_ext = String::new();
     let mut current_file: Option<usize> = None;
+    // Working-copy content of the current file, read once on `diff --git` and
+    // reused for every hunk header in the file. Slice 1 limitation: working
+    // copy only; non-WC revs follow when a backend `file_content` lands.
+    let mut current_content: Option<String> = None;
     let mut new_line: u32 = 0;
     let mut old_line: u32 = 0;
     let mut pending: Vec<PendingBody> = Vec::new();
@@ -902,6 +907,7 @@ fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> Rendered
             in_metadata = true;
             current_ext = ext_for_path(b).to_string();
             current_file = idx;
+            current_content = std::fs::read_to_string(b).ok();
             new_line = 0;
             old_line = 0;
             continue;
@@ -912,7 +918,9 @@ fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> Rendered
                 let (o, n) = parse_hunk_starts(line).unwrap_or((1, 1));
                 old_line = o;
                 new_line = n;
-                rendered.push(hunk_header(line));
+                let augmented =
+                    augment_hunk_header(line, &current_ext, current_content.as_deref(), n);
+                rendered.push(hunk_header(&augmented));
                 line_info.push(None);
             }
             continue;
@@ -1167,6 +1175,33 @@ fn apply_refines(
         pos = span_end;
     }
     out
+}
+
+/// If a `@@` header has no trailing function-context text (jj's diff doesn't
+/// emit one), synthesize one for known languages so the hunk reads with the
+/// same scope cue git users get for free.
+fn augment_hunk_header(line: &str, ext: &str, content: Option<&str>, new_start: u32) -> String {
+    let Some(after_open) = line.strip_prefix("@@") else {
+        return line.to_string();
+    };
+    let Some(close_off) = after_open.find("@@") else {
+        return line.to_string();
+    };
+    let range_end = 2 + close_off + 2;
+    if !line[range_end..].trim().is_empty() {
+        return line.to_string();
+    }
+    let Some(content) = content else {
+        return line.to_string();
+    };
+    let ctx = match ext {
+        "go" => funcname::go_enclosing(content, new_start),
+        _ => None,
+    };
+    match ctx {
+        Some(c) => format!("{}{}", &line[..range_end], c),
+        None => line.to_string(),
+    }
 }
 
 fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
@@ -2080,4 +2115,55 @@ fn pane_block(title: &str, focused: bool) -> Block<'_> {
         .borders(Borders::ALL)
         .border_style(style)
         .title(title)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const GO_SAMPLE: &str = r#"package x
+
+func extractHTTPPort(spec *Sandbox) (int64, bool) {
+    a := 1
+    b := 2
+    c := 3
+    d := 4
+    e := 5
+    f := 6
+    g := 7
+    h := 8
+    return int64(a + b + c + d + e + f + g + h), true
+}
+"#;
+
+    #[test]
+    fn augment_fills_empty_go_header() {
+        let header = "@@ -3,11 +3,11 @@";
+        let out = augment_hunk_header(header, "go", Some(GO_SAMPLE), 7);
+        assert_eq!(
+            out,
+            "@@ -3,11 +3,11 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {"
+        );
+    }
+
+    #[test]
+    fn augment_preserves_existing_context() {
+        let header = "@@ -3,11 +3,11 @@ already there";
+        let out = augment_hunk_header(header, "go", Some(GO_SAMPLE), 7);
+        assert_eq!(out, header);
+    }
+
+    #[test]
+    fn augment_noop_for_unknown_ext() {
+        let header = "@@ -3,11 +3,11 @@";
+        let out = augment_hunk_header(header, "rs", Some(GO_SAMPLE), 7);
+        assert_eq!(out, header);
+    }
+
+    #[test]
+    fn augment_noop_when_content_unavailable() {
+        let header = "@@ -3,11 +3,11 @@";
+        let out = augment_hunk_header(header, "go", None, 7);
+        assert_eq!(out, header);
+    }
 }
