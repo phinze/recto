@@ -87,6 +87,11 @@ pub trait Backend: Send + Sync {
     fn unified_diff(&self, scope: &Scope) -> Result<String>;
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>>;
     fn default_bases(&self) -> Vec<Base>;
+    /// Raw bytes of `path` as it exists at `rev`. Used by the renderer to
+    /// fetch the post-image of a hunk when the diff isn't against the working
+    /// copy — i.e. `Scope::Rev`, where reading disk would land on whatever
+    /// `@` happens to be instead of the rev being viewed.
+    fn file_content(&self, rev: &str, path: &str) -> Result<String>;
 }
 
 /// Walk up from cwd looking for `.jj/` (preferred) then `.git/`.
@@ -229,6 +234,10 @@ impl Backend for JjBackend {
             Base::Revision("root()".into()),
         ]
     }
+
+    fn file_content(&self, rev: &str, path: &str) -> Result<String> {
+        self.run(&["file", "show", "-r", rev, path])
+    }
 }
 
 pub struct GitBackend {
@@ -351,6 +360,10 @@ impl Backend for GitBackend {
             Base::Revision("master".into()),
             Base::Revision("HEAD~1".into()),
         ]
+    }
+
+    fn file_content(&self, rev: &str, path: &str) -> Result<String> {
+        self.run(&["show", &format!("{rev}:{path}")])
     }
 }
 

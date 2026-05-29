@@ -36,6 +36,10 @@ use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope, detect_b
 
 type LineInfo = Option<(usize, u32)>;
 
+/// Resolves a repo-relative path to its post-image content. Routed by scope
+/// in `load_diff` and consumed by the hunk-header augmenter in `render_diff`.
+type FetchContent<'a> = dyn Fn(&str) -> Option<String> + 'a;
+
 struct LoadedDiff {
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
@@ -91,7 +95,17 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, scope: &Scope) -> Result<L
         Scope::Range(base) => Some(backend.list_revs(base)?),
         Scope::Rev(_) => None,
     };
-    let rd = render_diff(&diff, &changes, hl);
+    // Post-image source per scope: Range's post-image is `@` (jj) or
+    // working tree (git), which disk approximates well and cheaply. Rev's
+    // post-image is that rev's tree, so we have to ask the backend.
+    let fetch: Box<FetchContent> = match scope {
+        Scope::Range(_) => Box::new(|path: &str| std::fs::read_to_string(path).ok()),
+        Scope::Rev(id) => {
+            let id = id.clone();
+            Box::new(move |path: &str| backend.file_content(&id, path).ok())
+        }
+    };
+    let rd = render_diff(&diff, &changes, hl, &*fetch);
     Ok(LoadedDiff {
         changes,
         rendered: rd.lines,
@@ -857,7 +871,12 @@ struct Gutter {
     new_w: usize,
 }
 
-fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> RenderedDiff {
+fn render_diff(
+    diff: &str,
+    changes: &[FileChange],
+    hl: &Highlighter,
+    fetch_content: &FetchContent,
+) -> RenderedDiff {
     let path_to_idx: HashMap<&str, usize> = changes
         .iter()
         .enumerate()
@@ -873,9 +892,9 @@ fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> Rendered
     let mut in_metadata = false;
     let mut current_ext = String::new();
     let mut current_file: Option<usize> = None;
-    // Working-copy content of the current file, read once on `diff --git` and
-    // reused for every hunk header in the file. Slice 1 limitation: working
-    // copy only; non-WC revs follow when a backend `file_content` lands.
+    // Post-image content of the current file, fetched once on `diff --git` and
+    // reused for every hunk header in the file. The fetcher routes by scope:
+    // disk for Range (cheap, accurate for jj `@`), backend for Rev.
     let mut current_content: Option<String> = None;
     let mut new_line: u32 = 0;
     let mut old_line: u32 = 0;
@@ -907,7 +926,7 @@ fn render_diff(diff: &str, changes: &[FileChange], hl: &Highlighter) -> Rendered
             in_metadata = true;
             current_ext = ext_for_path(b).to_string();
             current_file = idx;
-            current_content = std::fs::read_to_string(b).ok();
+            current_content = fetch_content(b);
             new_line = 0;
             old_line = 0;
             continue;
