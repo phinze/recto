@@ -1611,7 +1611,12 @@ fn run_client(command: ClientCommand) -> i32 {
         }
     };
     match link::send(&socket, &request) {
-        Ok(resp) if resp.ok => 0,
+        Ok(resp) if resp.ok => {
+            if let Some(note) = resp.note {
+                eprintln!("recto: {note}");
+            }
+            0
+        }
         Ok(resp) => {
             eprintln!(
                 "recto: {}",
@@ -1698,22 +1703,57 @@ fn run_editor(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     path: &str,
     line: u32,
+    editor_link: &link::EditorLink,
 ) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let mut parts = editor.split_whitespace();
     let prog = parts.next().unwrap_or("vi");
     let extra_args: Vec<&str> = parts.collect();
 
+    // If the editor is neovim, hand it an RPC socket via `--listen` so the
+    // agent link can drive its cursor and highlight while we're parked here.
+    // Anything else gets the plain handoff; focus is deferred to our return.
+    let nvim_addr = if editor_is_nvim(prog) {
+        let addr = link::nvim_addr(std::process::id());
+        let _ = std::fs::remove_file(&addr);
+        Some(addr)
+    } else {
+        None
+    };
+
     restore_terminal()?;
-    let _ = Command::new(prog)
-        .args(&extra_args)
-        .arg(format!("+{line}"))
-        .arg(path)
-        .status();
+    editor_link.enter(nvim_addr.as_ref().map(|addr| link::NvimHandle {
+        prog: prog.to_string(),
+        addr: addr.clone(),
+    }));
+
+    let mut cmd = Command::new(prog);
+    cmd.args(&extra_args);
+    if let Some(addr) = &nvim_addr {
+        cmd.arg("--listen").arg(addr);
+    }
+    let _ = cmd.arg(format!("+{line}")).arg(path).status();
+
+    editor_link.leave();
+    if let Some(addr) = &nvim_addr {
+        let _ = std::fs::remove_file(addr);
+    }
+
     enable_raw_mode()?;
     execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
     terminal.clear()?;
     Ok(())
+}
+
+/// Whether `prog` is neovim, and thus speaks `--listen`/`--remote-expr`. Plain
+/// vim's `+clientserver` is usually absent in terminal builds, so we gate the
+/// live-drive path on neovim specifically and let everything else fall back.
+fn editor_is_nvim(prog: &str) -> bool {
+    Command::new(prog)
+        .arg("--version")
+        .output()
+        .map(|o| o.status.success() && o.stdout.starts_with(b"NVIM"))
+        .unwrap_or(false)
 }
 
 enum Action {
@@ -1734,8 +1774,11 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
     // Agent link: companion sessions reach us over a per-workspace socket.
     // A bind failure shouldn't sink the TUI — the link is best-effort.
+    // `editor_link` lets the listener drive a live neovim (and stay responsive)
+    // while we're parked in the `e` editor handoff.
+    let editor_link = Arc::new(link::EditorLink::default());
     let link_rx = link::socket_for_cwd()
-        .and_then(|p| link::spawn_listener(&p))
+        .and_then(|p| link::spawn_listener(&p, editor_link.clone()))
         .ok();
 
     let mut pending_reload: Option<Instant> = None;
@@ -1763,13 +1806,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if event::poll(POLL_INTERVAL)? {
-            if matches!(handle_event(app, terminal, event::read()?)?, Action::Quit) {
+            if matches!(
+                handle_event(app, terminal, event::read()?, &editor_link)?,
+                Action::Quit
+            ) {
                 break;
             }
             // Coalesce bursts (key autorepeat, mouse-scroll) into one redraw
             // by draining everything already queued before drawing again.
             while event::poll(Duration::ZERO)? {
-                if matches!(handle_event(app, terminal, event::read()?)?, Action::Quit) {
+                if matches!(
+                    handle_event(app, terminal, event::read()?, &editor_link)?,
+                    Action::Quit
+                ) {
                     return Ok(());
                 }
             }
@@ -1782,6 +1831,7 @@ fn handle_event(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     event: Event,
+    editor_link: &link::EditorLink,
 ) -> Result<Action> {
     let mut mode = app.mode.clone();
     match event {
@@ -1911,7 +1961,7 @@ fn handle_event(
                     }
                     KeyCode::Char('e') => {
                         if let Some((path, line)) = app.edit_target() {
-                            let _ = run_editor(terminal, &path, line);
+                            let _ = run_editor(terminal, &path, line, editor_link);
                         }
                     }
                     KeyCode::Char('/') => {

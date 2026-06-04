@@ -8,7 +8,9 @@ use std::hash::{Hash, Hasher};
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex, mpsc};
 use std::thread;
 use std::time::Duration;
 
@@ -35,11 +37,15 @@ pub enum Request {
 
 /// Reply to a [`Request`]. `error` carries the reason when `ok` is false, so a
 /// driving agent can learn (e.g.) that a target wasn't in the current diff.
+/// `note` carries an informational aside on success — e.g. that recto was in an
+/// editor and drove neovim directly rather than scrolling the TUI.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Response {
     pub ok: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub note: Option<String>,
 }
 
 impl Response {
@@ -47,6 +53,15 @@ impl Response {
         Self {
             ok: true,
             error: None,
+            note: None,
+        }
+    }
+
+    pub fn ok_note(msg: impl Into<String>) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            note: Some(msg.into()),
         }
     }
 
@@ -54,6 +69,7 @@ impl Response {
         Self {
             ok: false,
             error: Some(msg.into()),
+            note: None,
         }
     }
 }
@@ -63,6 +79,45 @@ impl Response {
 pub struct Incoming {
     pub request: Request,
     pub respond: mpsc::Sender<Response>,
+}
+
+/// Live handle to a neovim instance recto launched via the `e` keybind. While
+/// it's up, the main loop is parked in the editor handoff, so the listener
+/// thread drives the editor directly over this RPC address instead.
+pub struct NvimHandle {
+    /// The editor program (e.g. `vim` or `nvim`); also our `--remote-expr` client.
+    pub prog: String,
+    /// The `--listen` socket we handed neovim, our handle to drive it.
+    pub addr: PathBuf,
+}
+
+/// Whether recto is suspended in an editor, and if so whether that editor is a
+/// drivable neovim. The main loop sets this around the editor handoff; the
+/// listener thread reads it to decide whether to answer requests itself rather
+/// than queue them for a loop that can't tick until the editor exits.
+#[derive(Default)]
+pub struct EditorLink {
+    active: AtomicBool,
+    nvim: Mutex<Option<NvimHandle>>,
+}
+
+impl EditorLink {
+    /// Mark recto as entering an editor handoff, recording the neovim handle if
+    /// the editor is drivable.
+    pub fn enter(&self, nvim: Option<NvimHandle>) {
+        *self.nvim.lock().unwrap() = nvim;
+        self.active.store(true, Ordering::SeqCst);
+    }
+
+    /// Mark the editor handoff as finished; the main loop is ticking again.
+    pub fn leave(&self) {
+        self.active.store(false, Ordering::SeqCst);
+        *self.nvim.lock().unwrap() = None;
+    }
+
+    fn is_active(&self) -> bool {
+        self.active.load(Ordering::SeqCst)
+    }
 }
 
 /// Walk up from `start` looking for `.jj/` (preferred) then `.git/`, mirroring
@@ -93,6 +148,13 @@ pub fn socket_path(root: &Path) -> PathBuf {
     runtime_dir().join(format!("{base}-{hash:016x}.sock"))
 }
 
+/// RPC socket address to hand neovim via `--listen`, so the listener can drive
+/// it. Keyed by recto's pid so concurrent instances don't fight over one
+/// address; lives beside the control socket in the same hardened dir.
+pub fn nvim_addr(pid: u32) -> PathBuf {
+    runtime_dir().join(format!("nvim-{pid}.sock"))
+}
+
 /// `$XDG_RUNTIME_DIR/recto` (0700 by virtue of its parent), falling back to a
 /// `recto-<uid>` dir under the system temp dir when the runtime dir is unset.
 fn runtime_dir() -> PathBuf {
@@ -121,7 +183,7 @@ pub fn socket_for_cwd() -> Result<PathBuf> {
 /// Bind the listener and spawn its accept thread. Returns a receiver the main
 /// loop drains each tick. Last-one-wins: a stale or live socket at `path` is
 /// unlinked and rebound, so the newest recto owns the workspace.
-pub fn spawn_listener(path: &Path) -> Result<mpsc::Receiver<Incoming>> {
+pub fn spawn_listener(path: &Path, editor: Arc<EditorLink>) -> Result<mpsc::Receiver<Incoming>> {
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent).ok();
         harden_dir(parent);
@@ -135,7 +197,7 @@ pub fn spawn_listener(path: &Path) -> Result<mpsc::Receiver<Incoming>> {
     thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(stream) = stream else { continue };
-            handle_conn(stream, &tx);
+            handle_conn(stream, &tx, &editor);
         }
     });
     Ok(rx)
@@ -143,7 +205,7 @@ pub fn spawn_listener(path: &Path) -> Result<mpsc::Receiver<Incoming>> {
 
 /// Read one request line, hand it to the main loop, and write back the reply.
 /// Connections are served serially; commands are rare enough that this is fine.
-fn handle_conn(stream: UnixStream, tx: &mpsc::Sender<Incoming>) {
+fn handle_conn(stream: UnixStream, tx: &mpsc::Sender<Incoming>, editor: &EditorLink) {
     let Ok(read_half) = stream.try_clone() else {
         return;
     };
@@ -160,6 +222,17 @@ fn handle_conn(stream: UnixStream, tx: &mpsc::Sender<Incoming>) {
             return;
         }
     };
+
+    // While recto is suspended in an editor the main loop can't answer, so we
+    // reply on this thread instead of waiting it out. A live neovim gets driven
+    // directly (cursor + highlight where the user's eyes already are); we still
+    // queue the focus so recto's own sticky highlight is set for the return.
+    if editor.is_active() {
+        let resp = handle_while_in_editor(&request, tx, editor);
+        write_response(&mut writer, &resp);
+        return;
+    }
+
     let (rtx, rrx) = mpsc::channel::<Response>();
     if tx
         .send(Incoming {
@@ -170,12 +243,120 @@ fn handle_conn(stream: UnixStream, tx: &mpsc::Sender<Incoming>) {
     {
         return;
     }
-    // The main loop drains commands each ~50ms tick, except while blocked in
-    // an editor handoff — bound the wait so a client never hangs forever.
+    // The main loop drains commands each ~50ms tick; bound the wait so a client
+    // never hangs forever if the loop is wedged for some unforeseen reason.
     let resp = rrx
         .recv_timeout(Duration::from_secs(5))
         .unwrap_or_else(|_| Response::err("recto did not respond in time"));
     write_response(&mut writer, &resp);
+}
+
+/// Answer a request that arrived while recto is parked in an editor handoff.
+/// Drives neovim when we can; always queues the request so the main loop
+/// applies it (sets the sticky focus) once it resumes.
+fn handle_while_in_editor(
+    request: &Request,
+    tx: &mpsc::Sender<Incoming>,
+    editor: &EditorLink,
+) -> Response {
+    let nvim = editor.nvim.lock().unwrap();
+    match request {
+        Request::Ping => Response::ok_note("recto is in an editor"),
+        Request::Clear => {
+            if let Some(h) = nvim.as_ref() {
+                drive_nvim_clear(h);
+            }
+            queue(tx, request.clone());
+            Response::ok()
+        }
+        Request::Focus { path, start, end } => {
+            let drove = nvim
+                .as_ref()
+                .map(|h| drive_nvim_focus(h, path, *start, *end))
+                .unwrap_or(false);
+            queue(tx, request.clone());
+            if drove {
+                Response::ok_note("recto is in neovim; drove the editor there")
+            } else {
+                Response::ok_note("recto is in an editor; focus will apply when you return")
+            }
+        }
+    }
+}
+
+/// Hand a request to the main loop with a throwaway response channel. Used from
+/// the editor fast-path, where we've already replied on this thread — the loop
+/// applies the request on resume and its response simply goes nowhere.
+fn queue(tx: &mpsc::Sender<Incoming>, request: Request) {
+    let (respond, _) = mpsc::channel::<Response>();
+    let _ = tx.send(Incoming { request, respond });
+}
+
+/// Move the running neovim's cursor to a span and highlight the range. Prefers
+/// the `RectoFocus` Lua helper (shipped in nixvim-config) for a real range
+/// highlight, falling back to a plain edit + center over core Ex commands when
+/// the helper isn't loaded — so this works before nixvim-config catches up.
+fn drive_nvim_focus(h: &NvimHandle, path: &str, start: Option<u32>, end: Option<u32>) -> bool {
+    // The wire path is workspace-root-relative; neovim's cwd may be a subdir,
+    // so resolve to absolute before asking it to `:edit`.
+    let p = vim_squote(&abs_path(path));
+    let (s, e) = match start {
+        Some(s) => (s.to_string(), end.unwrap_or(s).max(s).to_string()),
+        None => ("v:null".into(), "v:null".into()),
+    };
+    if remote_expr(h, &format!("v:lua.RectoFocus('{p}', {s}, {e})")) {
+        return true;
+    }
+    let fallback = match start {
+        Some(s) => {
+            format!("execute('edit '.fnameescape('{p}').' | call cursor({s},1) | normal! zz')")
+        }
+        None => format!("execute('edit '.fnameescape('{p}'))"),
+    };
+    remote_expr(h, &fallback)
+}
+
+/// Clear neovim's focus highlight via the `RectoClear` helper. A no-op (returns
+/// false) if the helper isn't loaded; there's no core-Ex fallback worth the
+/// noise, since the highlight only exists when the helper set it.
+fn drive_nvim_clear(h: &NvimHandle) -> bool {
+    remote_expr(h, "v:lua.RectoClear()")
+}
+
+/// Evaluate a Vimscript expression in the running neovim over its RPC socket.
+/// Returns whether the client exited cleanly — false means the editor was gone
+/// or the expression errored (e.g. the helper function isn't defined).
+fn remote_expr(h: &NvimHandle, expr: &str) -> bool {
+    Command::new(&h.prog)
+        .arg("--server")
+        .arg(&h.addr)
+        .arg("--remote-expr")
+        .arg(expr)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false)
+}
+
+/// Resolve a workspace-root-relative path to absolute, against the workspace
+/// root recto is reviewing (not its cwd, which may differ from neovim's).
+/// Falls back to the input unchanged if discovery fails.
+fn abs_path(path: &str) -> String {
+    let p = Path::new(path);
+    if p.is_absolute() {
+        return path.to_string();
+    }
+    if let Ok(cwd) = std::env::current_dir() {
+        let base = workspace_root(&cwd).unwrap_or(cwd);
+        return base.join(p).to_string_lossy().into_owned();
+    }
+    path.to_string()
+}
+
+/// Escape a path for embedding in a single-quoted Vimscript string literal:
+/// double any single quotes. `fnameescape` (applied in the expression itself)
+/// then handles spaces and other special characters.
+fn vim_squote(s: &str) -> String {
+    s.replace('\'', "''")
 }
 
 fn write_response(writer: &mut UnixStream, resp: &Response) {
@@ -220,7 +401,7 @@ mod tests {
     fn round_trip_focus() {
         let path = std::env::temp_dir().join(format!("recto-test-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let rx = spawn_listener(&path).expect("bind");
+        let rx = spawn_listener(&path, Arc::new(EditorLink::default())).expect("bind");
 
         let worker = thread::spawn(move || {
             let incoming = rx.recv().expect("recv request");
@@ -254,7 +435,7 @@ mod tests {
     fn malformed_request_is_refused() {
         let path = std::env::temp_dir().join(format!("recto-bad-{}.sock", std::process::id()));
         let _ = std::fs::remove_file(&path);
-        let _rx = spawn_listener(&path).expect("bind");
+        let _rx = spawn_listener(&path, Arc::new(EditorLink::default())).expect("bind");
 
         let mut stream = UnixStream::connect(&path).expect("connect");
         stream.write_all(b"not json\n").expect("write");
