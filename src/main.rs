@@ -896,8 +896,7 @@ impl App {
 
         match rows_for_span(&self.line_info, file_idx, start, end) {
             Some(rows) => {
-                // Scroll to the top of the span; the highlight covers the rest.
-                self.scroll_to_line(*rows.start());
+                self.reveal_span(&rows);
                 self.take_diff_focus();
                 link::Response::ok()
             }
@@ -920,6 +919,20 @@ impl App {
             self.h_scroll = 0;
         }
         self.file_state.select(Some(file_idx));
+    }
+
+    /// Scroll a focus span into view, anchored near the top with a little
+    /// context above rather than centered. Centering (as search does) buries a
+    /// tall span's tail below the fold; top-anchoring lets the hunk read
+    /// top-down. Already-visible spans still re-anchor — a focus jump is an
+    /// explicit "look here", so consistent placement beats minimal movement.
+    fn reveal_span(&mut self, rows: &std::ops::RangeInclusive<usize>) {
+        let top = (*rows.start() as u16).saturating_sub(SCROLLOFF);
+        self.scroll = top.min(self.max_scroll());
+        self.h_scroll = 0;
+        if let Some(Some((file_idx, _))) = self.line_info.get(*rows.start()) {
+            self.file_state.select(Some(*file_idx));
+        }
     }
 
     /// Rendered-row range to paint for the active focus span, resolved against
