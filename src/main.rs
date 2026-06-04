@@ -1,6 +1,7 @@
 mod backend;
 mod funcname;
 mod highlight;
+mod link;
 mod theme;
 
 use std::collections::HashMap;
@@ -11,7 +12,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use clap::Parser;
+use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
         self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
@@ -120,6 +121,10 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, scope: &Scope) -> Result<L
 #[derive(Parser, Debug)]
 #[command(version, about, long_about = None)]
 struct Cli {
+    /// Drive a running recto for this workspace instead of opening the TUI.
+    #[command(subcommand)]
+    command: Option<ClientCommand>,
+
     /// Initial diff base (jj revset or git ref). Examples: `@-`, `trunk()`, `HEAD`.
     #[arg(long, value_name = "REVSET")]
     base: Option<String>,
@@ -132,6 +137,16 @@ struct Cli {
     /// Run as if started from this directory. Matches jj's `-R`.
     #[arg(short = 'R', long, value_name = "PATH")]
     repository: Option<std::path::PathBuf>,
+}
+
+/// Subcommands that talk to an already-running recto over its workspace socket.
+#[derive(Subcommand, Debug)]
+enum ClientCommand {
+    /// Focus a file or span in the running recto. PATHSPEC is `path`,
+    /// `path:LINE`, or `path:START-END` (new-side line numbers).
+    Focus { pathspec: String },
+    /// Check that a recto is listening for this workspace.
+    Ping,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,6 +843,15 @@ impl App {
         Some((change.path.clone(), line.max(1)))
     }
 
+    /// Handle a command from a companion session. Slice 1 proves the round
+    /// trip; `Focus`/`Clear` become real once resolution and highlighting land.
+    fn handle_request(&mut self, request: link::Request) -> link::Response {
+        match request {
+            link::Request::Ping => link::Response::ok(),
+            link::Request::Focus { .. } | link::Request::Clear => link::Response::ok(),
+        }
+    }
+
     /// Index into `changes` of the file owning the current scroll position.
     fn current_file(&self) -> Option<usize> {
         self.file_starts
@@ -1440,6 +1464,10 @@ fn main() -> Result<()> {
     let _ = color_eyre::install();
     let cli = Cli::parse();
 
+    if let Some(command) = cli.command {
+        std::process::exit(run_client(command));
+    }
+
     if let Some(path) = &cli.repository {
         std::env::set_current_dir(path).unwrap_or_else(|e| {
             eprintln!("recto: -R {}: {e}", path.display());
@@ -1461,6 +1489,95 @@ fn main() -> Result<()> {
     let result = run(&mut terminal, &mut app);
     restore_terminal()?;
     result
+}
+
+/// Run a client subcommand against the workspace's running recto. Returns the
+/// process exit code: 0 on `{"ok":true}`, 1 on a refused request (e.g. target
+/// not in the diff), 2 when we couldn't reach a recto at all.
+fn run_client(command: ClientCommand) -> i32 {
+    let socket = match link::socket_for_cwd() {
+        Ok(p) => p,
+        Err(e) => {
+            eprintln!("recto: {e}");
+            return 2;
+        }
+    };
+    let request = match build_request(&command) {
+        Ok(r) => r,
+        Err(e) => {
+            eprintln!("recto: {e}");
+            return 2;
+        }
+    };
+    match link::send(&socket, &request) {
+        Ok(resp) if resp.ok => 0,
+        Ok(resp) => {
+            eprintln!(
+                "recto: {}",
+                resp.error.unwrap_or_else(|| "request refused".into())
+            );
+            1
+        }
+        Err(e) => {
+            eprintln!("recto: {e}");
+            2
+        }
+    }
+}
+
+/// Turn a CLI subcommand into a wire [`link::Request`], normalizing focus paths
+/// to workspace-root-relative so the agent can pass whatever form it used.
+fn build_request(command: &ClientCommand) -> Result<link::Request> {
+    match command {
+        ClientCommand::Ping => Ok(link::Request::Ping),
+        ClientCommand::Focus { pathspec } => {
+            let (raw_path, start, end) = parse_pathspec(pathspec);
+            let cwd = std::env::current_dir()?;
+            let root = link::workspace_root(&cwd)
+                .ok_or_else(|| anyhow!("not inside a jj or git repository"))?;
+            Ok(link::Request::Focus {
+                path: normalize_path(&cwd, &root, raw_path),
+                start,
+                end,
+            })
+        }
+    }
+}
+
+/// Split `path`, `path:LINE`, or `path:START-END` into its parts. Only treats
+/// the tail after the last `:` as a range when it actually parses as one, so
+/// paths that happen to contain a colon survive.
+fn parse_pathspec(spec: &str) -> (&str, Option<u32>, Option<u32>) {
+    if let Some((path, tail)) = spec.rsplit_once(':')
+        && let Some((start, end)) = parse_range(tail)
+    {
+        return (path, Some(start), end);
+    }
+    (spec, None, None)
+}
+
+fn parse_range(tail: &str) -> Option<(u32, Option<u32>)> {
+    match tail.split_once('-') {
+        Some((a, b)) => Some((a.parse().ok()?, Some(b.parse().ok()?))),
+        None => Some((tail.parse().ok()?, None)),
+    }
+}
+
+/// Resolve `raw` (absolute or cwd-relative) to a path relative to the workspace
+/// root, matching the form the backend reports in `FileChange::path`. Falls back
+/// to the input unchanged if it can't be placed under the root.
+fn normalize_path(cwd: &Path, root: &Path, raw: &str) -> String {
+    let p = Path::new(raw);
+    let abs = if p.is_absolute() {
+        p.to_path_buf()
+    } else {
+        cwd.join(p)
+    };
+    let abs = abs.canonicalize().unwrap_or(abs);
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    abs.strip_prefix(&root)
+        .map(|r| r.to_string_lossy().replace('\\', "/"))
+        .unwrap_or_else(|_| raw.to_string())
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -1513,12 +1630,25 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     })?;
     watch_tree_pruned(&mut watcher, Path::new("."));
 
+    // Agent link: companion sessions reach us over a per-workspace socket.
+    // A bind failure shouldn't sink the TUI — the link is best-effort.
+    let link_rx = link::socket_for_cwd()
+        .and_then(|p| link::spawn_listener(&p))
+        .ok();
+
     let mut pending_reload: Option<Instant> = None;
 
     loop {
         terminal.draw(|f| draw(f, app))?;
 
         app.poll_load();
+
+        if let Some(link_rx) = &link_rx {
+            while let Ok(incoming) = link_rx.try_recv() {
+                let resp = app.handle_request(incoming.request);
+                let _ = incoming.respond.send(resp);
+            }
+        }
 
         while rx.try_recv().is_ok() {
             pending_reload = Some(Instant::now());
@@ -2188,5 +2318,32 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         let header = "@@ -3,11 +3,11 @@";
         let out = augment_hunk_header(header, "go", None, 7);
         assert_eq!(out, header);
+    }
+
+    #[test]
+    fn pathspec_range() {
+        assert_eq!(
+            parse_pathspec("src/main.rs:12-20"),
+            ("src/main.rs", Some(12), Some(20))
+        );
+    }
+
+    #[test]
+    fn pathspec_single_line() {
+        assert_eq!(
+            parse_pathspec("src/main.rs:12"),
+            ("src/main.rs", Some(12), None)
+        );
+    }
+
+    #[test]
+    fn pathspec_whole_file() {
+        assert_eq!(parse_pathspec("src/main.rs"), ("src/main.rs", None, None));
+    }
+
+    #[test]
+    fn pathspec_colon_in_path_without_range() {
+        // A trailing colon segment that isn't a number is part of the path.
+        assert_eq!(parse_pathspec("weird:name"), ("weird:name", None, None));
     }
 }

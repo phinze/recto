@@ -1473,6 +1473,8 @@ dependencies = [
  "ignore",
  "notify",
  "ratatui",
+ "serde",
+ "serde_json",
  "similar",
  "syntect",
  "tree-sitter",
