@@ -843,12 +843,70 @@ impl App {
         Some((change.path.clone(), line.max(1)))
     }
 
-    /// Handle a command from a companion session. Slice 1 proves the round
-    /// trip; `Focus`/`Clear` become real once resolution and highlighting land.
+    /// Handle a command from a companion session.
     fn handle_request(&mut self, request: link::Request) -> link::Response {
         match request {
             link::Request::Ping => link::Response::ok(),
-            link::Request::Focus { .. } | link::Request::Clear => link::Response::ok(),
+            link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
+            link::Request::Clear => link::Response::ok(),
+        }
+    }
+
+    /// Resolve a companion `focus` request against the current diff: scroll the
+    /// span into view and select its file in the tree. `start`/`end` are new-side
+    /// (post-image) line numbers; no range means whole-file. Stays passive about
+    /// the base — if the target isn't visible, it says so rather than switching.
+    fn focus_target(&mut self, path: &str, start: Option<u32>, end: Option<u32>) -> link::Response {
+        let Some(file_idx) = self.changes.iter().position(|c| c.path == path) else {
+            return link::Response::err(format!("not in current diff: {path}"));
+        };
+
+        let Some(start) = start else {
+            // Whole-file focus: jump to the file's first rendered row.
+            self.scroll_to_file(file_idx);
+            self.take_diff_focus();
+            return link::Response::ok();
+        };
+        let end = end.unwrap_or(start).max(start);
+
+        // First rendered body row of this file whose new-side line intersects
+        // the requested span. File blocks are contiguous in `line_info`, so the
+        // first match is the top of the span.
+        let anchor = self.line_info.iter().position(
+            |info| matches!(info, Some((fi, ln)) if *fi == file_idx && *ln >= start && *ln <= end),
+        );
+        match anchor {
+            Some(line_idx) => {
+                self.scroll_to_line(line_idx);
+                self.take_diff_focus();
+                link::Response::ok()
+            }
+            None => {
+                // The file is in the diff but those lines sit outside any shown
+                // hunk. Land on the file so the agent's pointer isn't lost, but
+                // tell it the span wasn't reachable.
+                self.scroll_to_file(file_idx);
+                self.take_diff_focus();
+                link::Response::err(format!(
+                    "{path}:{start}-{end} not in current diff (outside any shown hunk)"
+                ))
+            }
+        }
+    }
+
+    fn scroll_to_file(&mut self, file_idx: usize) {
+        if let Some(&offset) = self.file_starts.get(file_idx) {
+            self.scroll = offset.min(self.max_scroll());
+            self.h_scroll = 0;
+        }
+        self.file_state.select(Some(file_idx));
+    }
+
+    /// Move keyboard focus to the diff pane, unless the user is mid-search-input
+    /// (don't yank an in-progress query out from under them).
+    fn take_diff_focus(&mut self) {
+        if matches!(self.mode, Mode::Normal) {
+            self.focus = Focus::Diff;
         }
     }
 
