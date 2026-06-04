@@ -1609,6 +1609,12 @@ fn handle_event(
                         app.toggle_commits();
                     }
                     KeyCode::Char('f') => {
+                        if !app.show_files {
+                            app.show_files = true;
+                        }
+                        app.focus = Focus::Files;
+                    }
+                    KeyCode::Char('F') => {
                         app.toggle_files();
                     }
                     KeyCode::Enter => app.jump_to_selected(),
@@ -1647,15 +1653,13 @@ fn handle_event(
                     }
                     KeyCode::Char('L') => app.focus = Focus::Diff,
                     KeyCode::Char('J') => {
-                        if app.show_files {
-                            app.select_next();
-                            app.jump_to_selected();
+                        if app.focus == Focus::Diff && app.show_commits {
+                            app.focus = Focus::Commits;
                         }
                     }
                     KeyCode::Char('K') => {
-                        if app.show_files {
-                            app.select_prev();
-                            app.jump_to_selected();
+                        if app.focus == Focus::Commits {
+                            app.focus = Focus::Diff;
                         }
                     }
                     KeyCode::Char('l') | KeyCode::Right if app.focus == Focus::Diff => {
@@ -1895,17 +1899,17 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 Mode::Normal => match app.focus {
                     Focus::Commits => {
                         format!(
-                            "q quit · j k select · esc focus diff · b base · f files · C revs · {wrap_hint}"
+                            "q quit · j k select · esc focus diff · b base · c/C revs · f/F files · {wrap_hint}"
                         )
                     }
                     Focus::Files => {
                         format!(
-                            "q quit · tab focus · b base · ] [ rev · c revs · f files · C revs · {wrap_hint}"
+                            "q quit · tab focus · b base · ] [ rev · c/C revs · f/F files · {wrap_hint}"
                         )
                     }
                     Focus::Diff => {
                         format!(
-                            "q quit · tab focus · b base · ] [ rev · c revs · f files · C revs · {wrap_hint} · e edit"
+                            "q quit · tab focus · b base · ] [ rev · c/C revs · f/F files · {wrap_hint} · e edit"
                         )
                     }
                 },
