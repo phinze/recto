@@ -145,6 +145,8 @@ enum ClientCommand {
     /// Focus a file or span in the running recto. PATHSPEC is `path`,
     /// `path:LINE`, or `path:START-END` (new-side line numbers).
     Focus { pathspec: String },
+    /// Clear any active focus highlight in the running recto.
+    Clear,
     /// Check that a recto is listening for this workspace.
     Ping,
 }
@@ -202,6 +204,16 @@ struct SearchMatch {
     end: usize,   // character offset end
 }
 
+/// A span a companion session asked us to highlight. Stored logically (path +
+/// new-side line range) rather than as rendered-row indices, so it survives
+/// diff reloads — `focus_rows` re-resolves it against the current render.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct FocusSpan {
+    path: String,
+    start: u32,
+    end: u32,
+}
+
 struct App {
     worker: Worker,
     bases: Vec<Base>,
@@ -228,6 +240,8 @@ struct App {
     search_query: Option<String>,
     search_matches: Vec<SearchMatch>,
     search_active_idx: Option<usize>,
+    /// Active companion-driven focus, if any. Sticky until replaced or cleared.
+    focus_span: Option<FocusSpan>,
     pub show_files: bool,
     pub show_commits: bool,
 }
@@ -289,6 +303,7 @@ impl App {
             search_query: None,
             search_matches: Vec::new(),
             search_active_idx: None,
+            focus_span: None,
             show_files: true,
             show_commits: true,
         })
@@ -848,43 +863,48 @@ impl App {
         match request {
             link::Request::Ping => link::Response::ok(),
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
-            link::Request::Clear => link::Response::ok(),
+            link::Request::Clear => {
+                self.focus_span = None;
+                link::Response::ok()
+            }
         }
     }
 
     /// Resolve a companion `focus` request against the current diff: scroll the
-    /// span into view and select its file in the tree. `start`/`end` are new-side
-    /// (post-image) line numbers; no range means whole-file. Stays passive about
-    /// the base — if the target isn't visible, it says so rather than switching.
+    /// span into view, select its file in the tree, and set a sticky highlight.
+    /// `start`/`end` are new-side (post-image) line numbers; no range means
+    /// whole-file. Stays passive about the base — if the target isn't visible,
+    /// it says so rather than switching.
     fn focus_target(&mut self, path: &str, start: Option<u32>, end: Option<u32>) -> link::Response {
         let Some(file_idx) = self.changes.iter().position(|c| c.path == path) else {
             return link::Response::err(format!("not in current diff: {path}"));
         };
 
         let Some(start) = start else {
-            // Whole-file focus: jump to the file's first rendered row.
+            // Whole-file focus: jump to the file, no line highlight to carry.
+            self.focus_span = None;
             self.scroll_to_file(file_idx);
             self.take_diff_focus();
             return link::Response::ok();
         };
         let end = end.unwrap_or(start).max(start);
+        self.focus_span = Some(FocusSpan {
+            path: path.to_string(),
+            start,
+            end,
+        });
 
-        // First rendered body row of this file whose new-side line intersects
-        // the requested span. File blocks are contiguous in `line_info`, so the
-        // first match is the top of the span.
-        let anchor = self.line_info.iter().position(
-            |info| matches!(info, Some((fi, ln)) if *fi == file_idx && *ln >= start && *ln <= end),
-        );
-        match anchor {
-            Some(line_idx) => {
-                self.scroll_to_line(line_idx);
+        match rows_for_span(&self.line_info, file_idx, start, end) {
+            Some(rows) => {
+                // Scroll to the top of the span; the highlight covers the rest.
+                self.scroll_to_line(*rows.start());
                 self.take_diff_focus();
                 link::Response::ok()
             }
             None => {
                 // The file is in the diff but those lines sit outside any shown
-                // hunk. Land on the file so the agent's pointer isn't lost, but
-                // tell it the span wasn't reachable.
+                // hunk. Land on the file so the agent's pointer isn't lost, and
+                // keep the span set so it lights up if a reload reveals it.
                 self.scroll_to_file(file_idx);
                 self.take_diff_focus();
                 link::Response::err(format!(
@@ -900,6 +920,16 @@ impl App {
             self.h_scroll = 0;
         }
         self.file_state.select(Some(file_idx));
+    }
+
+    /// Rendered-row range to paint for the active focus span, resolved against
+    /// the current diff. Recomputed each draw, so it tracks the span across
+    /// reloads even as rendered indices shift. `None` when nothing's focused or
+    /// the span's lines aren't currently shown.
+    fn focus_rows(&self) -> Option<std::ops::RangeInclusive<usize>> {
+        let span = self.focus_span.as_ref()?;
+        let file_idx = self.changes.iter().position(|c| c.path == span.path)?;
+        rows_for_span(&self.line_info, file_idx, span.start, span.end)
     }
 
     /// Move keyboard focus to the diff pane, unless the user is mid-search-input
@@ -1588,6 +1618,7 @@ fn run_client(command: ClientCommand) -> i32 {
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
         ClientCommand::Ping => Ok(link::Request::Ping),
+        ClientCommand::Clear => Ok(link::Request::Clear),
         ClientCommand::Focus { pathspec } => {
             let (raw_path, start, end) = parse_pathspec(pathspec);
             let cwd = std::env::current_dir()?;
@@ -1775,6 +1806,8 @@ fn handle_event(
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if app.search_query.is_some() {
                             app.clear_search();
+                        } else if app.focus_span.is_some() {
+                            app.focus_span = None;
                         } else if app.focus == Focus::Commits {
                             app.focus = Focus::Diff;
                         } else {
@@ -2031,6 +2064,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             format!(" · {} loading {}", SPINNER_FRAMES[frame_idx], loading.label),
             Style::default().fg(theme::TEAL),
         ));
+    }
+    if let Some(span) = &app.focus_span {
+        let label = if span.start == span.end {
+            format!(" · ▸ focus {}:{}", span.path, span.start)
+        } else {
+            format!(" · ▸ focus {}:{}-{}", span.path, span.start, span.end)
+        };
+        header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
     }
     let header = Paragraph::new(Line::from(header_spans));
     frame.render_widget(header, rows[0]);
@@ -2297,14 +2338,19 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let end = start
         .saturating_add(content_area.height as usize)
         .min(total);
+    let focus_rows = app.focus_rows();
     let mut window = Vec::with_capacity(end - start);
     for (offset, line) in app.rendered[start..end].iter().enumerate() {
         let line_idx = start + offset;
-        if app.search_query.is_some() {
-            window.push(app.highlight_search_matches(line_idx, line.clone()));
+        let mut rendered = if app.search_query.is_some() {
+            app.highlight_search_matches(line_idx, line.clone())
         } else {
-            window.push(line.clone());
+            line.clone()
+        };
+        if focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx)) {
+            apply_focus_bar(&mut rendered);
         }
+        window.push(rendered);
     }
     let content = if app.wrap {
         Paragraph::new(window).wrap(Wrap { trim: false })
@@ -2312,6 +2358,50 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Paragraph::new(window).scroll((0, app.h_scroll))
     };
     frame.render_widget(content, content_area);
+}
+
+/// Inclusive rendered-row range whose new-side line numbers fall within
+/// `[start, end]` for `file_idx`. A file's body rows are contiguous in
+/// `line_info`, so this is the highlight span. `None` when none are shown.
+fn rows_for_span(
+    line_info: &[LineInfo],
+    file_idx: usize,
+    start: u32,
+    end: u32,
+) -> Option<std::ops::RangeInclusive<usize>> {
+    let mut first = None;
+    let mut last = None;
+    for (idx, info) in line_info.iter().enumerate() {
+        if let Some((fi, ln)) = info
+            && *fi == file_idx
+            && *ln >= start
+            && *ln <= end
+        {
+            first.get_or_insert(idx);
+            last = Some(idx);
+        }
+    }
+    Some(first?..=last?)
+}
+
+/// Paint a focus marker on a body line by swapping its leading column (the
+/// blank cell before the old line-number gutter) for a mauve bar. Replacing
+/// rather than inserting keeps every column aligned with unfocused rows.
+fn apply_focus_bar(line: &mut Line<'static>) {
+    let bar = Span::styled(
+        "▎",
+        Style::default()
+            .fg(theme::MAUVE)
+            .add_modifier(Modifier::BOLD),
+    );
+    match line.spans.first_mut() {
+        Some(first) => {
+            let rest: String = first.content.chars().skip(1).collect();
+            first.content = rest.into();
+            line.spans.insert(0, bar);
+        }
+        None => line.spans.push(bar),
+    }
 }
 
 fn pane_block(title: &str, focused: bool) -> Block<'_> {
@@ -2403,5 +2493,45 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn pathspec_colon_in_path_without_range() {
         // A trailing colon segment that isn't a number is part of the path.
         assert_eq!(parse_pathspec("weird:name"), ("weird:name", None, None));
+    }
+
+    // file 0: header (None), lines 10,11,12 ; file 1: header (None), line 5
+    fn sample_line_info() -> Vec<LineInfo> {
+        vec![
+            None,
+            Some((0, 10)),
+            Some((0, 11)),
+            Some((0, 12)),
+            None,
+            Some((1, 5)),
+        ]
+    }
+
+    #[test]
+    fn span_rows_intersecting_range() {
+        // Request 11-12 in file 0 → rendered rows 2..=3.
+        assert_eq!(rows_for_span(&sample_line_info(), 0, 11, 12), Some(2..=3));
+    }
+
+    #[test]
+    fn span_rows_clamps_to_shown_lines() {
+        // Request 12-99 in file 0; only line 12 (row 3) is shown.
+        assert_eq!(rows_for_span(&sample_line_info(), 0, 12, 99), Some(3..=3));
+    }
+
+    #[test]
+    fn span_rows_none_when_outside_hunk() {
+        // Lines 50-60 of file 0 aren't in the diff at all.
+        assert_eq!(rows_for_span(&sample_line_info(), 0, 50, 60), None);
+    }
+
+    #[test]
+    fn focus_bar_replaces_leading_column() {
+        let mut line = Line::from(vec![Span::raw(" 12 "), Span::raw("code")]);
+        apply_focus_bar(&mut line);
+        // Leading space becomes the bar; total width is preserved.
+        assert_eq!(line.spans[0].content.as_ref(), "▎");
+        assert_eq!(line.spans[1].content.as_ref(), "12 ");
+        assert_eq!(line.spans[2].content.as_ref(), "code");
     }
 }
