@@ -59,6 +59,15 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_MS: u128 = 80;
+/// How long the arrival flash takes to fade after a focus span lands.
+const FOCUS_FLASH: Duration = Duration::from_millis(450);
+/// Peak strength of the arrival flash: how far row backgrounds are washed
+/// toward mauve at t=0.
+const FOCUS_FLASH_ALPHA: f32 = 0.35;
+/// Period of the gutter bar's breathing pulse while a focus span is active.
+const FOCUS_PULSE_PERIOD: Duration = Duration::from_millis(2200);
+/// How far the pulse dims the bar toward the background at its low point.
+const FOCUS_PULSE_DEPTH: f32 = 0.55;
 const TAB_WIDTH: usize = 4;
 
 struct Loading {
@@ -212,6 +221,10 @@ struct FocusSpan {
     path: String,
     start: u32,
     end: u32,
+    /// When the span landed; drives the arrival flash and the pulse phase.
+    /// Re-focusing the same span resets it — "look here" deserves a fresh
+    /// flash even if the eyes-target hasn't moved.
+    set_at: Instant,
 }
 
 struct App {
@@ -910,6 +923,7 @@ impl App {
             path: path.to_string(),
             start,
             end,
+            set_at: Instant::now(),
         });
 
         match rows_for_span(&self.line_info, file_idx, start, end) {
@@ -2479,6 +2493,25 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .saturating_add(content_area.height as usize)
         .min(total);
     let focus_rows = app.focus_rows();
+    // Animation phase for the focus highlight, sampled once per frame: a brief
+    // background flash when the span lands, then a slow breathing pulse on the
+    // gutter bar for as long as it's active. The main loop redraws every
+    // POLL_INTERVAL anyway, so time-driven styles animate for free.
+    let (flash_alpha, focus_bar) = match &app.focus_span {
+        Some(span) => {
+            let t = span.set_at.elapsed().as_secs_f32();
+            let fade = (1.0 - t / FOCUS_FLASH.as_secs_f32()).max(0.0);
+            // Cosine starts the pulse at full brightness, right as the flash
+            // hands off, and eases both ends of each breath.
+            let phase = (t / FOCUS_PULSE_PERIOD.as_secs_f32() * std::f32::consts::TAU).cos();
+            let dim = (1.0 - phase) / 2.0 * FOCUS_PULSE_DEPTH;
+            (
+                FOCUS_FLASH_ALPHA * fade * fade,
+                theme::blend(theme::MAUVE, theme::BASE, dim),
+            )
+        }
+        None => (0.0, theme::MAUVE),
+    };
     let cursor = app.diff_cursor.map(|c| c as usize);
     let mut window = Vec::with_capacity(end - start);
     for (offset, line) in app.rendered[start..end].iter().enumerate() {
@@ -2488,12 +2521,16 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         } else {
             line.clone()
         };
+        let focused = focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx));
+        if focused && flash_alpha > 0.0 {
+            apply_flash(&mut rendered, flash_alpha);
+        }
         // Both markers claim the same gutter column, so the cursor wins outright
         // on its line rather than stacking (which would corrupt the column).
         if cursor == Some(line_idx) {
             apply_gutter_bar(&mut rendered, theme::TEAL);
-        } else if focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx)) {
-            apply_gutter_bar(&mut rendered, theme::MAUVE);
+        } else if focused {
+            apply_gutter_bar(&mut rendered, focus_bar);
         }
         window.push(rendered);
     }
@@ -2527,6 +2564,22 @@ fn rows_for_span(
         }
     }
     Some(first?..=last?)
+}
+
+/// Wash a row's background toward mauve at `alpha` — the focus arrival flash.
+/// The line-level bg (which Paragraph paints across the full row) blends from
+/// whatever tint the row already carries, and span-level bgs (word-diff
+/// refinements) blend too so they don't punch unwashed holes in the wash.
+/// Rows with no bg blend from BASE, assuming a Catppuccin-base terminal — the
+/// same assumption the rest of the hard-coded theme already makes.
+fn apply_flash(line: &mut Line<'static>, alpha: f32) {
+    let bg = line.style.bg.unwrap_or(theme::BASE);
+    line.style.bg = Some(theme::blend(bg, theme::MAUVE, alpha));
+    for span in &mut line.spans {
+        if let Some(sbg) = span.style.bg {
+            span.style.bg = Some(theme::blend(sbg, theme::MAUVE, alpha));
+        }
+    }
 }
 
 /// Paint a marker on a body line by swapping its leading column (the blank cell

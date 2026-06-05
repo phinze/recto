@@ -7,6 +7,7 @@
 
 use ratatui::style::Color;
 
+pub const BASE: Color = Color::Rgb(0x1e, 0x1e, 0x2e);
 pub const SURFACE0: Color = Color::Rgb(0x31, 0x32, 0x44);
 pub const SURFACE1: Color = Color::Rgb(0x45, 0x47, 0x5a);
 pub const OVERLAY0: Color = Color::Rgb(0x6c, 0x70, 0x86);
@@ -28,3 +29,14 @@ pub const REMOVED_BG: Color = Color::Rgb(0x3a, 0x26, 0x2e);
 /// row tint without going past Catppuccin's saturation budget.
 pub const ADDED_REFINED_BG: Color = Color::Rgb(0x3f, 0x5b, 0x3c);
 pub const REMOVED_REFINED_BG: Color = Color::Rgb(0x60, 0x36, 0x44);
+
+/// Linear blend from `a` toward `b` by `t` in `[0, 1]`. Only RGB pairs blend;
+/// any other color kind returns `a` unchanged — all our palette constants are
+/// RGB, so in practice this only bails on colors we didn't pick.
+pub fn blend(a: Color, b: Color, t: f32) -> Color {
+    let (Color::Rgb(r0, g0, b0), Color::Rgb(r1, g1, b1)) = (a, b) else {
+        return a;
+    };
+    let mix = |x: u8, y: u8| (x as f32 + (y as f32 - x as f32) * t).round() as u8;
+    Color::Rgb(mix(r0, r1), mix(g0, g1), mix(b0, b1))
+}
