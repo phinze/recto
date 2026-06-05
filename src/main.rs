@@ -1071,17 +1071,31 @@ fn render_diff(
             old_line = 0;
             continue;
         }
+        // Every hunk header re-seeds the line counters — not just the first.
+        // Gating this on `in_metadata` (true only until a file's first `@@`)
+        // meant later hunks fell through to the body path and the counter kept
+        // climbing from the previous hunk, so their gutter numbers and
+        // `line_info` were wrong. Flush first: a hunk boundary ends any pending
+        // +/- group from the hunk before it.
+        if line.starts_with("@@") {
+            in_metadata = false;
+            flush_pending(
+                &mut pending,
+                &mut rendered,
+                &mut line_info,
+                &current_ext,
+                hl,
+                gutter,
+            );
+            let (o, n) = parse_hunk_starts(line).unwrap_or((1, 1));
+            old_line = o;
+            new_line = n;
+            let augmented = augment_hunk_header(line, &current_ext, current_content.as_deref(), n);
+            rendered.push(hunk_header(&augmented));
+            line_info.push(None);
+            continue;
+        }
         if in_metadata {
-            if line.starts_with("@@") {
-                in_metadata = false;
-                let (o, n) = parse_hunk_starts(line).unwrap_or((1, 1));
-                old_line = o;
-                new_line = n;
-                let augmented =
-                    augment_hunk_header(line, &current_ext, current_content.as_deref(), n);
-                rendered.push(hunk_header(&augmented));
-                line_info.push(None);
-            }
             continue;
         }
         let first = line.chars().next();
@@ -1371,6 +1385,12 @@ fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
             old = rest.split(',').next().and_then(|s| s.parse().ok());
         } else if let Some(rest) = tok.strip_prefix('+') {
             new = rest.split(',').next().and_then(|s| s.parse().ok());
+        }
+        // The two range tokens come right after the opening `@@`; stop once we
+        // have both so a section heading like `... @@ return -1` can't clobber
+        // them with a stray +/- token.
+        if old.is_some() && new.is_some() {
+            break;
         }
     }
     Some((old?, new?))
@@ -2656,5 +2676,64 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert_eq!(line.spans[0].content.as_ref(), "▎");
         assert_eq!(line.spans[1].content.as_ref(), "12 ");
         assert_eq!(line.spans[2].content.as_ref(), "code");
+    }
+
+    /// A file with two hunks far apart on the new side. The second hunk's
+    /// header (`+110`) must re-seed the line counter; if it doesn't, every
+    /// line in the second hunk is mislabeled with numbers continuing from the
+    /// first hunk, and `recto focus path:<line-in-hunk-2>` reports "not in
+    /// current diff" — the runner.go / registration.go symptom.
+    const TWO_HUNK_DIFF: &str = "\
+diff --git a/foo.go b/foo.go
+index 1111111..2222222 100644
+--- a/foo.go
++++ b/foo.go
+@@ -1,3 +1,4 @@
+ ctx a
++added at new line 2
+ ctx b
+ ctx c
+@@ -100,3 +110,4 @@
+ ctx at new line 110
++added at new line 111
+ ctx at new line 112
+ ctx at new line 113
+";
+
+    #[test]
+    fn hunk_starts_ignore_section_heading() {
+        // A heading whose code contains a `-1` token must not clobber the
+        // real start lines, which sit right after the opening `@@`.
+        assert_eq!(
+            parse_hunk_starts("@@ -604,6 +607,175 @@ func f() { return -1 }"),
+            Some((604, 607))
+        );
+    }
+
+    #[test]
+    fn second_hunk_reseeds_line_numbers() {
+        let hl = Highlighter::new();
+        let changes = vec![FileChange {
+            path: "foo.go".into(),
+            status: FileStatus::Modified,
+        }];
+        let fetch: Box<FetchContent> = Box::new(|_| None);
+        let rd = render_diff(TWO_HUNK_DIFF, &changes, &hl, &*fetch);
+
+        // The added line in the second hunk is new-side line 111. With the
+        // bug it lands around line 6 (counter never jumped to 110), so a focus
+        // request for 111 resolves to nothing.
+        assert_eq!(
+            rows_for_span(&rd.line_info, 0, 111, 111).is_some(),
+            true,
+            "second-hunk line 111 should be focusable; line_info = {:?}",
+            rd.line_info
+        );
+        // And the whole second hunk should carry 110..=113, not 5..=8.
+        assert!(
+            rd.line_info.contains(&Some((0, 110))) && rd.line_info.contains(&Some((0, 113))),
+            "second hunk should be numbered 110..=113; line_info = {:?}",
+            rd.line_info
+        );
     }
 }
