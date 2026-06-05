@@ -242,6 +242,11 @@ struct App {
     search_active_idx: Option<usize>,
     /// Active companion-driven focus, if any. Sticky until replaced or cleared.
     focus_span: Option<FocusSpan>,
+    /// Source-line index of a click-placed edit cursor in the diff, if any.
+    /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
+    /// here, `e` goes here" marker. Cleared on reload since the index is
+    /// position-based, not path-resolved.
+    diff_cursor: Option<u16>,
     pub show_files: bool,
     pub show_commits: bool,
     /// Whether our terminal/tmux pane currently has focus. Driven by
@@ -307,6 +312,7 @@ impl App {
             search_matches: Vec::new(),
             search_active_idx: None,
             focus_span: None,
+            diff_cursor: None,
             show_files: true,
             show_commits: true,
             terminal_focused: true,
@@ -702,6 +708,9 @@ impl App {
         self.file_starts = loaded.file_starts;
         self.line_info = loaded.line_info;
         self.file_stats = loaded.file_stats;
+        // The cursor is a raw source-line index into the old render; it can't
+        // survive a reshuffle, so drop it rather than point it at a stale line.
+        self.diff_cursor = None;
         if let Scope::Range(base) = &scope
             && let Some(i) = self.bases.iter().position(|b| b == base)
         {
@@ -845,7 +854,9 @@ impl App {
     fn edit_target(&self) -> Option<(String, u32)> {
         let start = match self.focus {
             Focus::Files => *self.file_starts.get(self.file_state.selected()?)?,
-            Focus::Diff | Focus::Commits => self.scroll,
+            // A click-placed cursor wins over the top-of-viewport fallback.
+            Focus::Diff => self.diff_cursor.unwrap_or(self.scroll),
+            Focus::Commits => self.scroll,
         };
         let (fidx, line) = self
             .line_info
@@ -2057,6 +2068,18 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 }
             } else if in_diff {
                 app.focus = Focus::Diff;
+                // Drop an edit cursor on the clicked source line. `diff_content_area`
+                // already excludes the border and sticky header, and `in_diff`
+                // guarantees the row is inside it, so the offset maps straight to a
+                // rendered row. Wrap mode breaks the 1:1 row→line mapping, so we
+                // skip the cursor there and leave it a plain focus click.
+                if !app.wrap {
+                    let row = m.row - app.diff_content_area.y;
+                    let src = app.scroll.saturating_add(row);
+                    if (src as usize) < app.rendered.len() {
+                        app.diff_cursor = Some(src);
+                    }
+                }
             } else if in_commits {
                 app.focus = Focus::Commits;
                 let inner_y = app.commits_area.y.saturating_add(1);
@@ -2426,6 +2449,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .saturating_add(content_area.height as usize)
         .min(total);
     let focus_rows = app.focus_rows();
+    let cursor = app.diff_cursor.map(|c| c as usize);
     let mut window = Vec::with_capacity(end - start);
     for (offset, line) in app.rendered[start..end].iter().enumerate() {
         let line_idx = start + offset;
@@ -2434,8 +2458,12 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         } else {
             line.clone()
         };
-        if focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx)) {
-            apply_focus_bar(&mut rendered);
+        // Both markers claim the same gutter column, so the cursor wins outright
+        // on its line rather than stacking (which would corrupt the column).
+        if cursor == Some(line_idx) {
+            apply_gutter_bar(&mut rendered, theme::TEAL);
+        } else if focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx)) {
+            apply_gutter_bar(&mut rendered, theme::MAUVE);
         }
         window.push(rendered);
     }
@@ -2471,16 +2499,12 @@ fn rows_for_span(
     Some(first?..=last?)
 }
 
-/// Paint a focus marker on a body line by swapping its leading column (the
-/// blank cell before the old line-number gutter) for a mauve bar. Replacing
-/// rather than inserting keeps every column aligned with unfocused rows.
-fn apply_focus_bar(line: &mut Line<'static>) {
-    let bar = Span::styled(
-        "▎",
-        Style::default()
-            .fg(theme::MAUVE)
-            .add_modifier(Modifier::BOLD),
-    );
+/// Paint a marker on a body line by swapping its leading column (the blank cell
+/// before the old line-number gutter) for a colored bar. Replacing rather than
+/// inserting keeps every column aligned with unmarked rows. Mauve = agent focus
+/// span, teal = local edit cursor.
+fn apply_gutter_bar(line: &mut Line<'static>, color: Color) {
+    let bar = Span::styled("▎", Style::default().fg(color).add_modifier(Modifier::BOLD));
     match line.spans.first_mut() {
         Some(first) => {
             let rest: String = first.content.chars().skip(1).collect();
@@ -2621,7 +2645,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     #[test]
     fn focus_bar_replaces_leading_column() {
         let mut line = Line::from(vec![Span::raw(" 12 "), Span::raw("code")]);
-        apply_focus_bar(&mut line);
+        apply_gutter_bar(&mut line, theme::MAUVE);
         // Leading space becomes the bar; total width is preserved.
         assert_eq!(line.spans[0].content.as_ref(), "▎");
         assert_eq!(line.spans[1].content.as_ref(), "12 ");
