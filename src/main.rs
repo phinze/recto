@@ -15,8 +15,8 @@ use anyhow::{Result, anyhow};
 use clap::{Parser, Subcommand};
 use crossterm::{
     event::{
-        self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton,
-        MouseEventKind,
+        self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
+        Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
     },
     execute,
     terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
@@ -244,6 +244,9 @@ struct App {
     focus_span: Option<FocusSpan>,
     pub show_files: bool,
     pub show_commits: bool,
+    /// Whether our terminal/tmux pane currently has focus. Driven by
+    /// focus-change reports; stays `true` on terminals that don't send them.
+    terminal_focused: bool,
 }
 
 impl App {
@@ -306,6 +309,7 @@ impl App {
             focus_span: None,
             show_files: true,
             show_commits: true,
+            terminal_focused: true,
         })
     }
 
@@ -1689,13 +1693,23 @@ fn normalize_path(cwd: &Path, root: &Path, raw: &str) -> String {
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
     Ok(Terminal::new(CrosstermBackend::new(stdout()))?)
 }
 
 fn restore_terminal() -> Result<()> {
     disable_raw_mode()?;
-    execute!(stdout(), DisableMouseCapture, LeaveAlternateScreen)?;
+    execute!(
+        stdout(),
+        DisableFocusChange,
+        DisableMouseCapture,
+        LeaveAlternateScreen
+    )?;
     Ok(())
 }
 
@@ -1740,7 +1754,12 @@ fn run_editor(
     }
 
     enable_raw_mode()?;
-    execute!(stdout(), EnterAlternateScreen, EnableMouseCapture)?;
+    execute!(
+        stdout(),
+        EnterAlternateScreen,
+        EnableMouseCapture,
+        EnableFocusChange
+    )?;
     terminal.clear()?;
     Ok(())
 }
@@ -1962,6 +1981,9 @@ fn handle_event(
                     KeyCode::Char('e') => {
                         if let Some((path, line)) = app.edit_target() {
                             let _ = run_editor(terminal, &path, line, editor_link);
+                            // We're foreground again on return; some terminals
+                            // don't emit a fresh FocusGained after the handoff.
+                            app.terminal_focused = true;
                         }
                     }
                     KeyCode::Char('/') => {
@@ -1980,6 +2002,8 @@ fn handle_event(
             }
         }
         Event::Mouse(m) if matches!(app.mode, Mode::Normal) => handle_mouse(app, m),
+        Event::FocusGained => app.terminal_focused = true,
+        Event::FocusLost => app.terminal_focused = false,
         _ => {}
     }
     Ok(Action::Continue)
@@ -2243,7 +2267,7 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .collect();
     let files_focused = app.focus == Focus::Files && matches!(app.mode, Mode::Normal);
     let tree = List::new(items)
-        .block(pane_block("Files", files_focused))
+        .block(pane_block("Files", files_focused, app.terminal_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(tree, area, &mut app.file_state);
 }
@@ -2342,7 +2366,7 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 
     let list = List::new(items)
-        .block(pane_block("Revs", commits_focused))
+        .block(pane_block("Revs", commits_focused, app.terminal_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
     app.commits_state.select(selected);
@@ -2351,7 +2375,7 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
 fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let diff_focused = app.focus == Focus::Diff && matches!(app.mode, Mode::Normal);
-    let block = pane_block("Diff", diff_focused);
+    let block = pane_block("Diff", diff_focused, app.terminal_focused);
     let inner = block.inner(area);
     frame.render_widget(block, area);
 
@@ -2467,8 +2491,14 @@ fn apply_focus_bar(line: &mut Line<'static>) {
     }
 }
 
-fn pane_block(title: &str, focused: bool) -> Block<'_> {
-    let style = if focused {
+fn pane_block(title: &str, focused: bool, terminal_focused: bool) -> Block<'_> {
+    // When our pane is backgrounded, drop every accent to one uniformly dim
+    // border so the whole UI reads as inactive — that's the signal that a click
+    // will just refocus us rather than land on a target. No DIM modifier: it's
+    // unreliable across terminals and crushed SURFACE0 to invisible.
+    let style = if !terminal_focused {
+        Style::default().fg(theme::SURFACE0)
+    } else if focused {
         Style::default()
             .fg(theme::MAUVE)
             .add_modifier(Modifier::BOLD)
