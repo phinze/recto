@@ -2001,7 +2001,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 app.jump_to_selected();
             } else if in_diff {
                 app.focus = Focus::Diff;
-                app.scroll_down(3);
+                app.scroll_down(1);
             } else if in_commits {
                 app.focus = Focus::Commits;
                 app.commits_select_next();
@@ -2014,7 +2014,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 app.jump_to_selected();
             } else if in_diff {
                 app.focus = Focus::Diff;
-                app.scroll_up(3);
+                app.scroll_up(1);
             } else if in_commits {
                 app.focus = Focus::Commits;
                 app.commits_select_prev();
