@@ -2183,6 +2183,13 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         };
         header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
     }
+    if !app.terminal_focused {
+        // Recolor in place rather than restyling the Paragraph: per-span fg wins
+        // over a base style, so we have to overwrite each span to read as dimmed.
+        for span in &mut header_spans {
+            span.style = Style::default().fg(theme::OVERLAY0);
+        }
+    }
     let header = Paragraph::new(Line::from(header_spans));
     frame.render_widget(header, rows[0]);
 
@@ -2516,12 +2523,11 @@ fn apply_gutter_bar(line: &mut Line<'static>, color: Color) {
 }
 
 fn pane_block(title: &str, focused: bool, terminal_focused: bool) -> Block<'_> {
-    // When our pane is backgrounded, drop every accent to one uniformly dim
-    // border so the whole UI reads as inactive — that's the signal that a click
-    // will just refocus us rather than land on a target. No DIM modifier: it's
-    // unreliable across terminals and crushed SURFACE0 to invisible.
+    // When our pane is backgrounded, drop every accent to the inactive-border
+    // shade so the whole UI reads as one uniformly idle block — the signal that a
+    // click will just refocus us rather than land on a target.
     let style = if !terminal_focused {
-        Style::default().fg(theme::SURFACE0)
+        Style::default().fg(theme::SURFACE1)
     } else if focused {
         Style::default()
             .fg(theme::MAUVE)
