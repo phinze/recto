@@ -216,6 +216,8 @@ struct FocusSpan {
 
 struct App {
     worker: Worker,
+    /// Shared with the worker; the app side only uses it for labels.
+    backend: Arc<dyn Backend>,
     bases: Vec<Base>,
     base_idx: usize,
     revs: Vec<Rev>,
@@ -263,7 +265,7 @@ impl App {
     ) -> Result<Self> {
         let mut bases = backend.default_bases();
         let base_idx = if let Some(r) = initial {
-            if let Some(i) = bases.iter().position(|b| b.display() == r) {
+            if let Some(i) = bases.iter().position(|b| backend.base_label(b) == r) {
                 i
             } else {
                 bases.insert(0, Base::Revision(r));
@@ -280,13 +282,14 @@ impl App {
         let initial_scope = Scope::Range(bases[base_idx].clone());
         let loaded = load_diff(&*backend, &hl, &initial_scope)?;
         let revs = loaded.revs.clone().unwrap_or_default();
-        let worker = spawn_worker(backend, hl);
+        let worker = spawn_worker(backend.clone(), hl);
         let mut file_state = ListState::default();
         if !loaded.changes.is_empty() {
             file_state.select(Some(0));
         }
         Ok(Self {
             worker,
+            backend,
             bases,
             base_idx,
             revs,
@@ -339,11 +342,12 @@ impl App {
         }
     }
 
-    fn scope_label(scope: &Scope, revs: &[Rev]) -> String {
+    fn scope_label(&self, scope: &Scope) -> String {
         match scope {
-            Scope::Range(base) => format!("base: {}", base.display()),
+            Scope::Range(base) => format!("base: {}", self.backend.base_label(base)),
             Scope::Rev(id) => {
-                let short = revs
+                let short = self
+                    .revs
                     .iter()
                     .find(|r| &r.id == id)
                     .map(|r| r.short_id.clone())
@@ -366,9 +370,8 @@ impl App {
             })
             .unwrap_or(self.base_idx);
         let next_idx = (current + 1) % self.bases.len();
-        let next_base = self.bases[next_idx].clone();
-        let scope = Scope::Range(next_base.clone());
-        let label = format!("base: {}", next_base.display());
+        let scope = Scope::Range(self.bases[next_idx].clone());
+        let label = self.scope_label(&scope);
         let _ = self.worker.request_tx.send(scope.clone());
         // Cursor follows the new range — old rev indices won't map to the
         // freshly-loaded revs, so the only safe landing is the overview.
@@ -658,7 +661,7 @@ impl App {
 
     fn request_current_scope(&mut self) {
         let scope = self.scope();
-        let label = Self::scope_label(&scope, &self.revs);
+        let label = self.scope_label(&scope);
         let _ = self.worker.request_tx.send(scope.clone());
         self.loading = Some(Loading {
             scope,
@@ -2180,7 +2183,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let mut header_spans = vec![Span::styled(
         format!(
             "recto — base: {} · {cursor_str} · {n_files} file{}",
-            app.base().display(),
+            app.backend.base_label(app.base()),
             if n_files == 1 { "" } else { "s" },
         ),
         Style::default()

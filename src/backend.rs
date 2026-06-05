@@ -16,13 +16,6 @@ pub enum Base {
 }
 
 impl Base {
-    pub fn display(&self) -> String {
-        match self {
-            Base::Revision(r) => r.clone(),
-            Base::MergeBase { against } => format!("merge-base({})", against.display()),
-        }
-    }
-
     /// The leaf revision string that anchors this base. Used by the git backend
     /// for `git log <ref>..HEAD`, where merge-base/three-dot semantics already
     /// fall out of `<ref>..HEAD` (commits reachable from HEAD but not the ref).
@@ -83,6 +76,10 @@ pub struct FileChange {
 }
 
 pub trait Backend: Send + Sync {
+    /// Label for a base in the backend's own vocabulary — the exact string
+    /// you could paste into `jj diff --from` or `git diff`. This is what the
+    /// header shows and what `--base` is matched against.
+    fn base_label(&self, base: &Base) -> String;
     fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>>;
     fn unified_diff(&self, scope: &Scope) -> Result<String>;
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>>;
@@ -151,6 +148,10 @@ impl JjBackend {
 }
 
 impl Backend for JjBackend {
+    fn base_label(&self, base: &Base) -> String {
+        Self::revset(base)
+    }
+
     fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>> {
         let out = match scope {
             Scope::Range(base) => {
@@ -282,6 +283,10 @@ impl GitBackend {
 }
 
 impl Backend for GitBackend {
+    fn base_label(&self, base: &Base) -> String {
+        Self::diff_arg(base)
+    }
+
     fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>> {
         let out = match scope {
             Scope::Range(base) => {
