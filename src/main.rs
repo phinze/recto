@@ -154,7 +154,14 @@ enum ClientCommand {
     /// Focus a file or span in the running recto. PATHSPEC is `path`,
     /// `path:LINE`, or `path:START-END` (new-side line numbers).
     Focus { pathspec: String },
-    /// Clear any active focus highlight in the running recto.
+    /// Annotate spans in the running recto with numbered labels. Each SPEC is
+    /// `path:LINE=label` or `path:START-END=label`; argument order sets the
+    /// step numbers, and the new set replaces any previous one.
+    Annotate {
+        #[arg(required = true)]
+        specs: Vec<String>,
+    },
+    /// Clear any active focus highlight and annotations in the running recto.
     Clear,
     /// Check that a recto is listening for this workspace.
     Ping,
@@ -227,6 +234,17 @@ struct FocusSpan {
     set_at: Instant,
 }
 
+/// A companion-supplied labeled span — one step of a tour. Stored logically
+/// (path + new-side line range) like [`FocusSpan`]; `reweave` renders the set
+/// as numbered note rows woven into the diff, re-resolving after each reload.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Annotation {
+    path: String,
+    start: u32,
+    end: u32,
+    label: String,
+}
+
 struct App {
     worker: Worker,
     /// Shared with the worker; the app side only uses it for labels.
@@ -238,6 +256,12 @@ struct App {
     mode: Mode,
     loading: Option<Loading>,
     changes: Vec<FileChange>,
+    /// The pristine render as the worker produced it, before annotation note
+    /// rows are woven in. `reweave` rebuilds the viewed copies below from
+    /// these whenever the diff or the annotation set changes.
+    base_rendered: Vec<Line<'static>>,
+    base_file_starts: Vec<u16>,
+    base_line_info: Vec<LineInfo>,
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
     line_info: Vec<LineInfo>,
@@ -257,6 +281,9 @@ struct App {
     search_active_idx: Option<usize>,
     /// Active companion-driven focus, if any. Sticky until replaced or cleared.
     focus_span: Option<FocusSpan>,
+    /// Companion-driven tour annotations, in step order. Sticky like
+    /// `focus_span`; replaced wholesale by each `annotate` request.
+    annotations: Vec<Annotation>,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
     /// here, `e` goes here" marker. Cleared on reload since the index is
@@ -310,6 +337,9 @@ impl App {
             mode: Mode::Normal,
             loading: None,
             changes: loaded.changes,
+            base_rendered: loaded.rendered.clone(),
+            base_file_starts: loaded.file_starts.clone(),
+            base_line_info: loaded.line_info.clone(),
             rendered: loaded.rendered,
             file_starts: loaded.file_starts,
             line_info: loaded.line_info,
@@ -328,6 +358,7 @@ impl App {
             search_matches: Vec::new(),
             search_active_idx: None,
             focus_span: None,
+            annotations: Vec::new(),
             diff_cursor: None,
             show_files: true,
             show_commits: true,
@@ -720,10 +751,11 @@ impl App {
             .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
 
         self.changes = loaded.changes;
-        self.rendered = loaded.rendered;
-        self.file_starts = loaded.file_starts;
-        self.line_info = loaded.line_info;
+        self.base_rendered = loaded.rendered;
+        self.base_file_starts = loaded.file_starts;
+        self.base_line_info = loaded.line_info;
         self.file_stats = loaded.file_stats;
+        self.reweave();
         // The cursor is a raw source-line index into the old render; it can't
         // survive a reshuffle, so drop it rather than point it at a stale line.
         self.diff_cursor = None;
@@ -894,8 +926,13 @@ impl App {
         match request {
             link::Request::Ping => link::Response::ok(),
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
+            link::Request::Annotate { sites } => self.annotate(sites),
             link::Request::Clear => {
                 self.focus_span = None;
+                if !self.annotations.is_empty() {
+                    self.annotations.clear();
+                    self.reweave();
+                }
                 link::Response::ok()
             }
         }
@@ -982,6 +1019,130 @@ impl App {
     fn take_diff_focus(&mut self) {
         if matches!(self.mode, Mode::Normal) {
             self.focus = Focus::Diff;
+        }
+    }
+
+    /// Rebuild the viewed render from the pristine base, weaving each
+    /// resolvable annotation in as a note row above its span's first rendered
+    /// row. Note rows carry no line info, so cursor mapping, focus spans, and
+    /// editor jumps stay anchored to real diff lines; everything downstream
+    /// (scroll, search, clicks) sees one consistent rendered stream.
+    fn reweave(&mut self) {
+        let mut inserts: Vec<(usize, Line<'static>)> = Vec::new();
+        for (i, a) in self.annotations.iter().enumerate() {
+            let Some(file_idx) = self.changes.iter().position(|c| c.path == a.path) else {
+                continue;
+            };
+            let Some(rows) = rows_for_span(&self.base_line_info, file_idx, a.start, a.end) else {
+                continue;
+            };
+            inserts.push((*rows.start(), note_line(i + 1, &a.label)));
+        }
+        if inserts.is_empty() {
+            self.rendered = self.base_rendered.clone();
+            self.file_starts = self.base_file_starts.clone();
+            self.line_info = self.base_line_info.clone();
+            return;
+        }
+        // Stable by insertion row, so steps pinned to the same row keep their
+        // numbering order.
+        inserts.sort_by_key(|(row, _)| *row);
+        self.file_starts = self
+            .base_file_starts
+            .iter()
+            .map(|&start| {
+                let shift = inserts
+                    .iter()
+                    .filter(|(row, _)| *row <= start as usize)
+                    .count();
+                start.saturating_add(shift as u16)
+            })
+            .collect();
+        let mut rendered = Vec::with_capacity(self.base_rendered.len() + inserts.len());
+        let mut line_info = Vec::with_capacity(self.base_line_info.len() + inserts.len());
+        let mut pending = inserts.into_iter().peekable();
+        for (idx, line) in self.base_rendered.iter().enumerate() {
+            while let Some((_, note)) = pending.next_if(|(row, _)| *row == idx) {
+                rendered.push(note);
+                line_info.push(None);
+            }
+            rendered.push(line.clone());
+            line_info.push(self.base_line_info.get(idx).copied().flatten());
+        }
+        self.rendered = rendered;
+        self.line_info = line_info;
+    }
+
+    /// Replace the annotation set and weave it into the render. Scrolls to the
+    /// first resolvable step — "step 1 here" should land eyes there — and
+    /// reports any sites that didn't resolve so the driving agent can correct
+    /// course.
+    fn annotate(&mut self, sites: Vec<link::Site>) -> link::Response {
+        self.annotations = sites
+            .into_iter()
+            .map(|s| Annotation {
+                end: s.end.unwrap_or(s.start).max(s.start),
+                path: s.path,
+                start: s.start,
+                label: s.label,
+            })
+            .collect();
+        self.reweave();
+        if self.annotations.is_empty() {
+            return link::Response::ok();
+        }
+        if let Some(rows) = self.annotation_rows().into_iter().next() {
+            self.reveal_span(&rows);
+            self.take_diff_focus();
+        }
+        let missing: Vec<String> = self
+            .annotations
+            .iter()
+            .filter(|a| {
+                self.changes
+                    .iter()
+                    .position(|c| c.path == a.path)
+                    .and_then(|fi| rows_for_span(&self.line_info, fi, a.start, a.end))
+                    .is_none()
+            })
+            .map(|a| format!("{}:{}-{}", a.path, a.start, a.end))
+            .collect();
+        if missing.len() == self.annotations.len() {
+            link::Response::err(format!(
+                "no annotation sites in current diff: {}",
+                missing.join(", ")
+            ))
+        } else if !missing.is_empty() {
+            link::Response::ok_note(format!("not in current diff: {}", missing.join(", ")))
+        } else {
+            link::Response::ok()
+        }
+    }
+
+    /// Rendered-row ranges for the annotations, in step order, resolved
+    /// against the current (woven) render — the same re-resolution discipline
+    /// as `focus_rows`. Unresolvable sites are skipped, not placeholders.
+    fn annotation_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
+        self.annotations
+            .iter()
+            .filter_map(|a| {
+                let file_idx = self.changes.iter().position(|c| c.path == a.path)?;
+                rows_for_span(&self.line_info, file_idx, a.start, a.end)
+            })
+            .collect()
+    }
+
+    /// Jump to annotation step `i` (0-based) — the number-key navigation.
+    fn jump_to_annotation(&mut self, i: usize) {
+        let Some(a) = self.annotations.get(i).cloned() else {
+            return;
+        };
+        let Some(file_idx) = self.changes.iter().position(|c| c.path == a.path) else {
+            return;
+        };
+        if let Some(rows) = rows_for_span(&self.line_info, file_idx, a.start, a.end) {
+            self.reveal_span(&rows);
+            self.take_diff_focus();
         }
     }
 
@@ -1700,6 +1861,29 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 end,
             })
         }
+        ClientCommand::Annotate { specs } => {
+            let cwd = std::env::current_dir()?;
+            let root = link::workspace_root(&cwd)
+                .ok_or_else(|| anyhow!("not inside a jj or git repository"))?;
+            let sites = specs
+                .iter()
+                .map(|spec| {
+                    let (pathspec, label) = spec
+                        .split_once('=')
+                        .ok_or_else(|| anyhow!("missing `=label` in annotate spec: {spec}"))?;
+                    let (raw_path, start, end) = parse_pathspec(pathspec);
+                    let start =
+                        start.ok_or_else(|| anyhow!("missing `:LINE` in annotate spec: {spec}"))?;
+                    Ok(link::Site {
+                        path: normalize_path(&cwd, &root, raw_path),
+                        start,
+                        end,
+                        label: label.to_string(),
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok(link::Request::Annotate { sites })
+        }
     }
 }
 
@@ -1938,6 +2122,9 @@ fn handle_event(
                             app.clear_search();
                         } else if app.focus_span.is_some() {
                             app.focus_span = None;
+                        } else if !app.annotations.is_empty() {
+                            app.annotations.clear();
+                            app.reweave();
                         } else if app.focus == Focus::Commits {
                             app.focus = Focus::Diff;
                         } else {
@@ -2020,6 +2207,9 @@ fn handle_event(
                         app.scroll_left(1)
                     }
                     KeyCode::Char('0') if app.focus == Focus::Diff => app.h_scroll = 0,
+                    KeyCode::Char(c @ '1'..='9') => {
+                        app.jump_to_annotation(c as usize - '1' as usize);
+                    }
                     KeyCode::Char('w') => {
                         app.wrap = !app.wrap;
                         if app.wrap {
@@ -2298,6 +2488,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 },
                 _ => String::new(),
             };
+            if !app.annotations.is_empty() {
+                text = format!("{text} · 1-9 step [{}]", app.annotations.len());
+            }
             if let Some(ref query) = app.search_query {
                 let total_matches = app.search_matches.len();
                 let active_match = app.search_active_idx.map_or(0, |idx| idx + 1);
@@ -2512,6 +2705,11 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         }
         None => (0.0, theme::MAUVE),
     };
+    // Annotation spans get a constant dim-mauve bar: same hue family as focus
+    // so the tour reads as one system, dimmed so the live focus span still
+    // pops above the standing landmarks.
+    let ann_rows = app.annotation_rows();
+    let ann_bar = theme::blend(theme::MAUVE, theme::BASE, 0.45);
     let cursor = app.diff_cursor.map(|c| c as usize);
     let mut window = Vec::with_capacity(end - start);
     for (offset, line) in app.rendered[start..end].iter().enumerate() {
@@ -2531,6 +2729,8 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             apply_gutter_bar(&mut rendered, theme::TEAL);
         } else if focused {
             apply_gutter_bar(&mut rendered, focus_bar);
+        } else if ann_rows.iter().any(|r| r.contains(&line_idx)) {
+            apply_gutter_bar(&mut rendered, ann_bar);
         }
         window.push(rendered);
     }
@@ -2564,6 +2764,38 @@ fn rows_for_span(
         }
     }
     Some(first?..=last?)
+}
+
+/// Circled-digit badges for steps 1–9, the keyboard-reachable ones; later
+/// steps fall back to plain `n.`.
+const STEP_BADGES: [&str; 9] = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
+
+fn badge(n: usize) -> String {
+    STEP_BADGES
+        .get(n - 1)
+        .map(|s| (*s).to_string())
+        .unwrap_or_else(|| format!("{n}."))
+}
+
+/// Render an annotation as a note row — `╭─ ① label`, tinted like a review
+/// comment pinned above the span it describes.
+fn note_line(n: usize, label: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(" ╭─ ", Style::default().fg(theme::OVERLAY0)),
+        Span::styled(
+            badge(n),
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {label}"),
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::ITALIC),
+        ),
+    ])
+    .style(Style::default().bg(theme::SURFACE0))
 }
 
 /// Wash a row's background toward mauve at `alpha` — the focus arrival flash.

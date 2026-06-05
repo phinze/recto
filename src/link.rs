@@ -29,10 +29,25 @@ pub enum Request {
         start: Option<u32>,
         end: Option<u32>,
     },
-    /// Clear any active focus highlight.
+    /// Replace the annotation set: labeled spans rendered as numbered inline
+    /// notes ("step 1 here, step 2 there"). An empty set clears them.
+    Annotate { sites: Vec<Site> },
+    /// Clear any active focus highlight and annotations.
     Clear,
     /// Liveness check.
     Ping,
+}
+
+/// One labeled site in an [`Request::Annotate`] set. `start`/`end` are
+/// new-side line numbers like `Focus`; `end` defaults to `start`. Step
+/// numbers are implicit from order.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Site {
+    pub path: String,
+    pub start: u32,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub end: Option<u32>,
+    pub label: String,
 }
 
 /// Reply to a [`Request`]. `error` carries the reason when `ok` is false, so a
@@ -281,6 +296,12 @@ fn handle_while_in_editor(
                 Response::ok_note("recto is in an editor; focus will apply when you return")
             }
         }
+        // Annotations are a TUI rendering concern with no editor analogue;
+        // just queue them for the main loop's return.
+        Request::Annotate { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; annotations will apply when you return")
+        }
     }
 }
 
@@ -429,6 +450,24 @@ mod tests {
 
         worker.join().expect("worker");
         let _ = std::fs::remove_file(&path);
+    }
+
+    /// Pin the annotate wire shape — companion agents hand-write this JSON, so
+    /// field names and optionality are a compatibility contract.
+    #[test]
+    fn annotate_wire_format() {
+        let json = r#"{"cmd":"annotate","sites":[
+            {"path":"src/main.rs","start":3,"label":"Step 1: parse"},
+            {"path":"src/link.rs","start":10,"end":14,"label":"Step 2: send"}
+        ]}"#;
+        let req: Request = serde_json::from_str(json).expect("parse");
+        let Request::Annotate { sites } = req else {
+            panic!("expected Annotate, got {req:?}");
+        };
+        assert_eq!(sites.len(), 2);
+        assert_eq!(sites[0].end, None);
+        assert_eq!(sites[1].end, Some(14));
+        assert_eq!(sites[1].label, "Step 2: send");
     }
 
     #[test]
