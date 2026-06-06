@@ -4,7 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-ratatui = { version = "0.30", features = ["unstable-rendered-line-info"] }
+ratatui = "0.30"
 crossterm = "0.29"
 anyhow = "1"
 color-eyre = "0.6"
@@ -17,3 +17,4 @@ similar = "2"
 ignore = "0.4"
 tree-sitter = "0.26"
 tree-sitter-go = "0.25"
+textwrap = { version = "0.16.2", default-features = false, features = ["unicode-linebreak", "unicode-width"] }

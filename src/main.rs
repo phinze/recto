@@ -3,6 +3,7 @@ mod funcname;
 mod highlight;
 mod link;
 mod theme;
+mod wrap;
 
 use std::collections::HashMap;
 use std::io::{self, stdout};
@@ -27,7 +28,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph, Wrap},
+    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -817,6 +818,8 @@ impl App {
     /// to the end just fills the viewport. That index is our scroll ceiling
     /// (plus SCROLLOFF for breathing room), since `app.scroll` is a
     /// source-line offset and the render path slices `rendered[scroll..]`.
+    /// Row counts must come from the same hanging-indent math the draw path
+    /// uses, or the ceiling drifts from what's actually on screen.
     fn max_scroll_wrapped(&self) -> u16 {
         let width = self.diff_content_area.width;
         let viewport = self.diff_viewport;
@@ -826,9 +829,13 @@ impl App {
         let mut accum: u32 = 0;
         let mut start: usize = self.rendered.len();
         for idx in (0..self.rendered.len()).rev() {
-            let rows = Paragraph::new(vec![self.rendered[idx].clone()])
-                .wrap(Wrap { trim: false })
-                .line_count(width) as u32;
+            let line = &self.rendered[idx];
+            let prefix_width = if self.line_info.get(idx).copied().flatten().is_some() {
+                wrap::gutter_prefix_width(line)
+            } else {
+                0
+            };
+            let rows = wrap::row_count(line, width, prefix_width) as u32;
             accum = accum.saturating_add(rows);
             if accum >= viewport as u32 {
                 start = idx;
@@ -2677,14 +2684,6 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let scroll = app.scroll as usize;
     let total = app.rendered.len();
     let start = scroll.min(total);
-    // `app.scroll` is a source-line offset, and a wrapped source line can span
-    // many visual rows — but each contributes at least one row, so slicing
-    // `content_area.height` source lines is always enough to fill the viewport
-    // in either mode. Bounding the slice keeps the per-frame Line clones small
-    // on large diffs.
-    let end = start
-        .saturating_add(content_area.height as usize)
-        .min(total);
     let focus_rows = app.focus_rows();
     // Animation phase for the focus highlight, sampled once per frame: a brief
     // background flash when the span lands, then a slow breathing pulse on the
@@ -2711,31 +2710,60 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let ann_rows = app.annotation_rows();
     let ann_bar = theme::blend(theme::MAUVE, theme::BASE, 0.45);
     let cursor = app.diff_cursor.map(|c| c as usize);
-    let mut window = Vec::with_capacity(end - start);
-    for (offset, line) in app.rendered[start..end].iter().enumerate() {
-        let line_idx = start + offset;
-        let mut rendered = if app.search_query.is_some() {
+    // `app.scroll` is a source-line offset; the window is built in visual
+    // rows. In nowrap mode each source line is one row; in wrap mode a line
+    // expands to its hanging-indent rows, so we keep consuming source lines
+    // until the viewport is full. Either way the per-frame clones stay
+    // bounded by the viewport height.
+    let viewport_rows = content_area.height as usize;
+    let mut window: Vec<Line<'static>> = Vec::with_capacity(viewport_rows);
+    for line_idx in start..total {
+        if window.len() >= viewport_rows {
+            break;
+        }
+        let line = &app.rendered[line_idx];
+        let styled = if app.search_query.is_some() {
             app.highlight_search_matches(line_idx, line.clone())
         } else {
             line.clone()
         };
+        let rows = if app.wrap {
+            // Prefix comes from the pristine line: search highlighting above
+            // may have re-split the spans the gutter shape relies on.
+            let prefix = if app.line_info.get(line_idx).copied().flatten().is_some() {
+                wrap::gutter_prefix(line)
+            } else {
+                Vec::new()
+            };
+            wrap::wrap_line(&styled, content_area.width, &prefix)
+        } else {
+            vec![styled]
+        };
         let focused = focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx));
-        if focused && flash_alpha > 0.0 {
-            apply_flash(&mut rendered, flash_alpha);
+        let annotated = ann_rows.iter().any(|r| r.contains(&line_idx));
+        // Markers apply per visual row, so the flash wash and the bar colors
+        // run down every continuation of a wrapped line. Both bar kinds claim
+        // the same gutter column; the cursor wins outright on its line rather
+        // than stacking (which would corrupt the column).
+        for mut row in rows {
+            if window.len() >= viewport_rows {
+                break;
+            }
+            if focused && flash_alpha > 0.0 {
+                apply_flash(&mut row, flash_alpha);
+            }
+            if cursor == Some(line_idx) {
+                apply_gutter_bar(&mut row, theme::TEAL);
+            } else if focused {
+                apply_gutter_bar(&mut row, focus_bar);
+            } else if annotated {
+                apply_gutter_bar(&mut row, ann_bar);
+            }
+            window.push(row);
         }
-        // Both markers claim the same gutter column, so the cursor wins outright
-        // on its line rather than stacking (which would corrupt the column).
-        if cursor == Some(line_idx) {
-            apply_gutter_bar(&mut rendered, theme::TEAL);
-        } else if focused {
-            apply_gutter_bar(&mut rendered, focus_bar);
-        } else if ann_rows.iter().any(|r| r.contains(&line_idx)) {
-            apply_gutter_bar(&mut rendered, ann_bar);
-        }
-        window.push(rendered);
     }
     let content = if app.wrap {
-        Paragraph::new(window).wrap(Wrap { trim: false })
+        Paragraph::new(window)
     } else {
         Paragraph::new(window).scroll((0, app.h_scroll))
     };
