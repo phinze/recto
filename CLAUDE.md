@@ -134,15 +134,14 @@ caller arrives, not before — `-D warnings` enforces it.
 
 ## Shipping a Revision
 
-recto is consumed downstream by nix-config at
-`~/src/github.com/phinze/nix-config/pkgs/recto/default.nix`, which pins
-a specific commit. To ship a rev:
+recto is consumed downstream by nix-config as a flake input
+(`recto.url = "github:phinze/recto"` in its `flake.nix`), which pins a
+specific commit in `flake.lock`. The companion-session skill at
+`skills/recto/SKILL.md` ships from the same input, so binary and skill
+always land together. To ship a rev:
 
 1. Advance `main` and push: `jj bookmark move main --to @ && jj git
    push --bookmark main`. After this the rev is no longer reorganizable.
-2. Bump `rev` and `hash` in `pkgs/recto/default.nix`. Grab the new src
-   hash with `nix run nixpkgs#nix-prefetch-github -- phinze recto --rev
-   <SHA>`. `cargoHash` only changes when `Cargo.lock` changes; usually
-   leave it alone, and if it's wrong nix will print the expected value.
+2. In nix-config: `nix flake update recto`.
 3. `nh os switch` (or the host equivalent) to build and activate. If
-   that goes green, commit the nix-config bump and push.
+   that goes green, commit the nix-config lock bump and push.
