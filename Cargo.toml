@@ -18,3 +18,10 @@ ignore = "0.4"
 tree-sitter = "0.26"
 tree-sitter-go = "0.25"
 textwrap = { version = "0.16.2", default-features = false, features = ["unicode-linebreak", "unicode-width"] }
+
+# Optimize dependencies even in dev builds while keeping recto itself
+# unoptimized for fast iteration. syntect's fancy-regex highlighter is
+# pathologically slow when compiled at opt-level 0, which turned a `root()`
+# whole-repo diff into a ~9s highlight pass under `cargo run`.
+[profile.dev.package."*"]
+opt-level = 3

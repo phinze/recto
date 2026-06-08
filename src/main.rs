@@ -207,6 +207,50 @@ enum Cursor {
     Rev(usize),
 }
 
+/// One rendered line of the file pane. `Dir` is a muted group header injected
+/// when the directory changes as we walk `changes` in order; `File(i)` indexes
+/// back into `changes`. `file_state` selects in this row space, so navigation
+/// has to skip `Dir` rows and callers go through `selected_change` /
+/// `select_change` to translate between row and change indices.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum FileRow {
+    Dir(String),
+    File(usize),
+}
+
+/// Directory component of a change path, or `None` for a root-level file.
+fn parent_dir(path: &str) -> Option<&str> {
+    path.rsplit_once('/').map(|(dir, _)| dir)
+}
+
+/// Final path component, the name shown in a file row.
+fn basename(path: &str) -> &str {
+    path.rsplit_once('/').map_or(path, |(_, name)| name)
+}
+
+/// Walk changes in stream order, emitting a `Dir` header each time the parent
+/// directory changes (root-level files get none) followed by each file's row.
+fn build_file_rows(changes: &[FileChange]) -> Vec<FileRow> {
+    let mut rows = Vec::with_capacity(changes.len());
+    let mut active_dir: Option<&str> = None;
+    for (i, c) in changes.iter().enumerate() {
+        let dir = parent_dir(&c.path);
+        if dir != active_dir {
+            active_dir = dir;
+            if let Some(d) = dir {
+                rows.push(FileRow::Dir(format!("{d}/")));
+            }
+        }
+        rows.push(FileRow::File(i));
+    }
+    rows
+}
+
+/// Row index of the first selectable file row, skipping any leading header.
+fn first_file_row(rows: &[FileRow]) -> Option<usize> {
+    rows.iter().position(|r| matches!(r, FileRow::File(_)))
+}
+
 /// Top-level interaction mode.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum Mode {
@@ -273,6 +317,9 @@ struct App {
     diff_viewport: u16,
     focus: Focus,
     file_state: ListState,
+    /// File-pane rows in display order (dir headers + files). Rebuilt from
+    /// `changes` whenever the change set changes; `file_state` indexes here.
+    file_rows: Vec<FileRow>,
     files_area: Rect,
     diff_content_area: Rect,
     commits_area: Rect,
@@ -324,10 +371,9 @@ impl App {
         let loaded = load_diff(&*backend, &hl, &initial_scope)?;
         let revs = loaded.revs.clone().unwrap_or_default();
         let worker = spawn_worker(backend.clone(), hl);
+        let file_rows = build_file_rows(&loaded.changes);
         let mut file_state = ListState::default();
-        if !loaded.changes.is_empty() {
-            file_state.select(Some(0));
-        }
+        file_state.select(first_file_row(&file_rows));
         Ok(Self {
             worker,
             backend,
@@ -351,6 +397,7 @@ impl App {
             diff_viewport: 0,
             focus: Focus::Files,
             file_state,
+            file_rows,
             files_area: Rect::default(),
             diff_content_area: Rect::default(),
             commits_area: Rect::default(),
@@ -573,7 +620,7 @@ impl App {
 
         // Automatically focus the file tree selection to match this line's file
         if let Some(Some((file_idx, _))) = self.line_info.get(line_idx) {
-            self.file_state.select(Some(*file_idx));
+            self.select_change(*file_idx);
         }
     }
 
@@ -747,11 +794,11 @@ impl App {
 
     fn apply_loaded(&mut self, scope: Scope, loaded: LoadedDiff) {
         let prev_path = self
-            .file_state
-            .selected()
+            .selected_change()
             .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
 
         self.changes = loaded.changes;
+        self.file_rows = build_file_rows(&self.changes);
         self.base_rendered = loaded.rendered;
         self.base_file_starts = loaded.file_starts;
         self.base_line_info = loaded.line_info;
@@ -781,7 +828,10 @@ impl App {
         let new_idx = prev_path
             .and_then(|p| self.changes.iter().position(|c| c.path == p))
             .or_else(|| (!self.changes.is_empty()).then_some(0));
-        self.file_state.select(new_idx);
+        match new_idx {
+            Some(i) => self.select_change(i),
+            None => self.file_state.select(None),
+        }
 
         if let Some(i) = new_idx
             && let Some(&offset) = self.file_starts.get(i)
@@ -864,28 +914,57 @@ impl App {
         self.scroll = self.scroll.min(self.max_scroll());
     }
 
-    fn select_next(&mut self) {
-        if self.changes.is_empty() {
-            return;
+    /// Change index under the file-pane selection, or `None` on a header row
+    /// (or when there are no changes). Bridges row space back to `changes`.
+    fn selected_change(&self) -> Option<usize> {
+        match self.file_rows.get(self.file_state.selected()?)? {
+            FileRow::File(i) => Some(*i),
+            FileRow::Dir(_) => None,
         }
-        let last = self.changes.len() - 1;
-        let next = self.file_state.selected().map_or(0, |i| (i + 1).min(last));
-        self.file_state.select(Some(next));
+    }
+
+    /// Move the file-pane selection to the row showing `change_idx`.
+    fn select_change(&mut self, change_idx: usize) {
+        if let Some(row) = self
+            .file_rows
+            .iter()
+            .position(|r| matches!(r, FileRow::File(i) if *i == change_idx))
+        {
+            self.file_state.select(Some(row));
+        }
+    }
+
+    fn select_next(&mut self) {
+        let cur = self.file_state.selected().unwrap_or(0);
+        if let Some(row) = self
+            .file_rows
+            .iter()
+            .enumerate()
+            .skip(cur + 1)
+            .find(|(_, r)| matches!(r, FileRow::File(_)))
+            .map(|(i, _)| i)
+        {
+            self.file_state.select(Some(row));
+        }
     }
 
     fn select_prev(&mut self) {
-        if self.changes.is_empty() {
-            return;
+        let cur = self.file_state.selected().unwrap_or(0);
+        if let Some(row) = self
+            .file_rows
+            .iter()
+            .enumerate()
+            .take(cur)
+            .rev()
+            .find(|(_, r)| matches!(r, FileRow::File(_)))
+            .map(|(i, _)| i)
+        {
+            self.file_state.select(Some(row));
         }
-        let prev = self
-            .file_state
-            .selected()
-            .map_or(0, |i| i.saturating_sub(1));
-        self.file_state.select(Some(prev));
     }
 
     fn jump_to_selected(&mut self) {
-        let Some(i) = self.file_state.selected() else {
+        let Some(i) = self.selected_change() else {
             return;
         };
         if let Some(&offset) = self.file_starts.get(i) {
@@ -908,7 +987,7 @@ impl App {
     /// Renamed/Copied (the jj summary path is not a clean filename).
     fn edit_target(&self) -> Option<(String, u32)> {
         let start = match self.focus {
-            Focus::Files => *self.file_starts.get(self.file_state.selected()?)?,
+            Focus::Files => *self.file_starts.get(self.selected_change()?)?,
             // A click-placed cursor wins over the top-of-viewport fallback.
             Focus::Diff => self.diff_cursor.unwrap_or(self.scroll),
             Focus::Commits => self.scroll,
@@ -994,7 +1073,7 @@ impl App {
             self.scroll = offset.min(self.max_scroll());
             self.h_scroll = 0;
         }
-        self.file_state.select(Some(file_idx));
+        self.select_change(file_idx);
     }
 
     /// Scroll a focus span into view, anchored near the top with a little
@@ -1007,7 +1086,7 @@ impl App {
         self.scroll = top.min(self.max_scroll());
         self.h_scroll = 0;
         if let Some(Some((file_idx, _))) = self.line_info.get(*rows.start()) {
-            self.file_state.select(Some(*file_idx));
+            self.select_change(*file_idx);
         }
     }
 
@@ -1753,6 +1832,45 @@ fn stats_spans(stats: (u32, u32)) -> Vec<Span<'static>> {
     ]
 }
 
+/// One file row in the grouped file pane: a one-space indent, the colored
+/// status glyph, the basename, and `+N -M` stats pushed to the right edge.
+/// Stats are dropped when both counts are zero so pure renames stay clean.
+fn file_row_line(change: &FileChange, stats: (u32, u32), width: u16) -> ListItem<'static> {
+    let color = status_color(change.status);
+    let name = basename(&change.path).to_string();
+    let mut spans = vec![
+        Span::raw(" "),
+        Span::styled(
+            format!("{} ", change.status.glyph()),
+            Style::default().fg(color).add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(name.clone(), Style::default().fg(theme::TEXT)),
+    ];
+
+    let (add, del) = stats;
+    if add > 0 || del > 0 {
+        // " M " indent+glyph is 3 cols; pad the gap so stats hug the right edge,
+        // keeping at least one space when the name would otherwise collide.
+        let left_width = 3 + name.chars().count();
+        let stats_width = format!("+{add} -{del}").chars().count();
+        let pad = (width as usize)
+            .saturating_sub(left_width + stats_width)
+            .max(1);
+        spans.push(Span::raw(" ".repeat(pad)));
+        spans.push(Span::styled(
+            format!("+{add}"),
+            Style::default().fg(theme::GREEN),
+        ));
+        spans.push(Span::raw(" "));
+        spans.push(Span::styled(
+            format!("-{del}"),
+            Style::default().fg(theme::RED),
+        ));
+    }
+
+    ListItem::new(Line::from(spans))
+}
+
 fn sticky_line(change: &FileChange, stats: (u32, u32)) -> Line<'static> {
     let color = status_color(change.status);
     let mut spans = vec![
@@ -2295,7 +2413,8 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 let inner_y = app.files_area.y.saturating_add(1);
                 if m.row >= inner_y {
                     let row = (m.row - inner_y) as usize + app.file_state.offset();
-                    if row < app.changes.len() {
+                    // Header rows aren't selectable; clicking one is a no-op.
+                    if let Some(FileRow::File(_)) = app.file_rows.get(row) {
                         app.file_state.select(Some(row));
                         app.jump_to_selected();
                     }
@@ -2517,19 +2636,20 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
 fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.files_area = area;
+    // Pane width minus the block borders: the budget for right-aligning stats.
+    let inner_width = area.width.saturating_sub(2);
     let items: Vec<ListItem> = app
-        .changes
+        .file_rows
         .iter()
-        .enumerate()
-        .map(|(i, c)| {
-            let style = Style::default().fg(status_color(c.status));
-            let stats = app.file_stats.get(i).copied().unwrap_or((0, 0));
-            let mut spans = vec![
-                Span::styled(format!("{} ", c.status.glyph()), style),
-                Span::raw(c.path.clone()),
-            ];
-            spans.extend(stats_spans(stats));
-            ListItem::new(Line::from(spans))
+        .map(|row| match row {
+            FileRow::Dir(label) => ListItem::new(Line::from(Span::styled(
+                label.clone(),
+                Style::default().fg(theme::OVERLAY0),
+            ))),
+            FileRow::File(i) => {
+                let stats = app.file_stats.get(*i).copied().unwrap_or((0, 0));
+                file_row_line(&app.changes[*i], stats, inner_width)
+            }
         })
         .collect();
     let files_focused = app.focus == Focus::Files && matches!(app.mode, Mode::Normal);
@@ -2667,9 +2787,9 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let current = app.current_file();
     if app.focus == Focus::Diff
         && let Some(i) = current
-        && app.file_state.selected() != Some(i)
+        && app.selected_change() != Some(i)
     {
-        app.file_state.select(Some(i));
+        app.select_change(i);
     }
 
     let sticky_text = current
@@ -2982,6 +3102,46 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn span_rows_none_when_outside_hunk() {
         // Lines 50-60 of file 0 aren't in the diff at all.
         assert_eq!(rows_for_span(&sample_line_info(), 0, 50, 60), None);
+    }
+
+    fn change(path: &str) -> FileChange {
+        FileChange {
+            path: path.to_string(),
+            status: FileStatus::Modified,
+        }
+    }
+
+    #[test]
+    fn file_rows_group_by_directory() {
+        let changes = [
+            change("README.md"),
+            change("src/main.rs"),
+            change("src/backend.rs"),
+            change("skills/recto/SKILL.md"),
+        ];
+        // Root file: no header. Dir headers appear once per run; the first file
+        // row is the root file, so navigation starts there.
+        assert_eq!(
+            build_file_rows(&changes),
+            vec![
+                FileRow::File(0),
+                FileRow::Dir("src/".into()),
+                FileRow::File(1),
+                FileRow::File(2),
+                FileRow::Dir("skills/recto/".into()),
+                FileRow::File(3),
+            ]
+        );
+        assert_eq!(first_file_row(&build_file_rows(&changes)), Some(0));
+    }
+
+    #[test]
+    fn file_rows_header_first_when_no_root_file() {
+        let changes = [change("src/main.rs")];
+        let rows = build_file_rows(&changes);
+        assert_eq!(rows, vec![FileRow::Dir("src/".into()), FileRow::File(0)]);
+        // First selectable row skips the leading header.
+        assert_eq!(first_file_row(&rows), Some(1));
     }
 
     #[test]
