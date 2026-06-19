@@ -76,6 +76,9 @@ pub struct FileChange {
 }
 
 pub trait Backend: Send + Sync {
+    /// Which VCS this backend speaks: `"jj"` or `"git"`. Reported in the
+    /// status payload so a companion session knows the model it's driving.
+    fn kind(&self) -> &'static str;
     /// Label for a base in the backend's own vocabulary — the exact string
     /// you could paste into `jj diff --from` or `git diff`. This is what the
     /// header shows and what `--base` is matched against.
@@ -148,6 +151,10 @@ impl JjBackend {
 }
 
 impl Backend for JjBackend {
+    fn kind(&self) -> &'static str {
+        "jj"
+    }
+
     fn base_label(&self, base: &Base) -> String {
         Self::revset(base)
     }
@@ -283,6 +290,10 @@ impl GitBackend {
 }
 
 impl Backend for GitBackend {
+    fn kind(&self) -> &'static str {
+        "git"
+    }
+
     fn base_label(&self, base: &Base) -> String {
         Self::diff_arg(base)
     }

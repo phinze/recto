@@ -53,7 +53,8 @@ pub struct Site {
 /// Reply to a [`Request`]. `error` carries the reason when `ok` is false, so a
 /// driving agent can learn (e.g.) that a target wasn't in the current diff.
 /// `note` carries an informational aside on success — e.g. that recto was in an
-/// editor and drove neovim directly rather than scrolling the TUI.
+/// editor and drove neovim directly rather than scrolling the TUI. `status` is
+/// the machine-readable snapshot a [`Request::Ping`] asks for; absent otherwise.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Response {
     pub ok: bool,
@@ -61,6 +62,34 @@ pub struct Response {
     pub error: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub note: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<Status>,
+}
+
+/// What a [`Request::Ping`] reports back: enough of recto's identity and current
+/// view for a companion session to know what it's driving and what a `focus`
+/// would land on, without firing a throwaway focus to find out. `files` is the
+/// changed-path list in the diff recto currently shows.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Status {
+    /// recto's version (`CARGO_PKG_VERSION`).
+    pub version: String,
+    /// The running recto's pid.
+    pub pid: u32,
+    /// Which VCS the backend speaks: `"jj"` or `"git"`.
+    pub backend: String,
+    /// Absolute workspace root recto is reviewing.
+    pub workspace_root: String,
+    /// The base label shown in the header (e.g. `@-`, `trunk()`, `HEAD`).
+    pub base: String,
+    /// `"range"` for the whole base diff, or `"rev"` when narrowed to one rev.
+    pub scope: String,
+    /// Changed paths in the current diff — what `focus`/`annotate` can resolve.
+    pub files: Vec<String>,
+    /// Whether a companion focus highlight is currently active.
+    pub focus: bool,
+    /// Number of active tour annotations.
+    pub annotations: usize,
 }
 
 impl Response {
@@ -69,6 +98,7 @@ impl Response {
             ok: true,
             error: None,
             note: None,
+            status: None,
         }
     }
 
@@ -77,6 +107,16 @@ impl Response {
             ok: true,
             error: None,
             note: Some(msg.into()),
+            status: None,
+        }
+    }
+
+    pub fn ok_status(status: Status) -> Self {
+        Self {
+            ok: true,
+            error: None,
+            note: None,
+            status: Some(status),
         }
     }
 
@@ -85,6 +125,7 @@ impl Response {
             ok: false,
             error: Some(msg.into()),
             note: None,
+            status: None,
         }
     }
 }
@@ -114,13 +155,18 @@ pub struct NvimHandle {
 pub struct EditorLink {
     active: AtomicBool,
     nvim: Mutex<Option<NvimHandle>>,
+    /// Status snapshot captured at editor entry, so the listener thread can
+    /// answer a `ping` while the main loop is parked. The diff can't change
+    /// while the loop is blocked in the editor, so the snapshot stays accurate.
+    status: Mutex<Option<Status>>,
 }
 
 impl EditorLink {
     /// Mark recto as entering an editor handoff, recording the neovim handle if
-    /// the editor is drivable.
-    pub fn enter(&self, nvim: Option<NvimHandle>) {
+    /// the editor is drivable and a status snapshot to serve while parked.
+    pub fn enter(&self, nvim: Option<NvimHandle>, status: Status) {
         *self.nvim.lock().unwrap() = nvim;
+        *self.status.lock().unwrap() = Some(status);
         self.active.store(true, Ordering::SeqCst);
     }
 
@@ -128,6 +174,7 @@ impl EditorLink {
     pub fn leave(&self) {
         self.active.store(false, Ordering::SeqCst);
         *self.nvim.lock().unwrap() = None;
+        *self.status.lock().unwrap() = None;
     }
 
     fn is_active(&self) -> bool {
@@ -276,7 +323,14 @@ fn handle_while_in_editor(
 ) -> Response {
     let nvim = editor.nvim.lock().unwrap();
     match request {
-        Request::Ping => Response::ok_note("recto is in an editor"),
+        Request::Ping => {
+            let mut resp = match editor.status.lock().unwrap().clone() {
+                Some(status) => Response::ok_status(status),
+                None => Response::ok(),
+            };
+            resp.note = Some("recto is in an editor".into());
+            resp
+        }
         Request::Clear => {
             if let Some(h) = nvim.as_ref() {
                 drive_nvim_clear(h);
@@ -468,6 +522,72 @@ mod tests {
         assert_eq!(sites[0].end, None);
         assert_eq!(sites[1].end, Some(14));
         assert_eq!(sites[1].label, "Step 2: send");
+    }
+
+    /// Pin the ping/status wire shape: companion agents parse this JSON, so the
+    /// field names are a contract. Also guards backward compatibility — a plain
+    /// `ok()` must not emit a `status` key, so older clients see the old shape.
+    #[test]
+    fn status_wire_format() {
+        let resp = Response::ok_status(Status {
+            version: "0.1.0".into(),
+            pid: 4321,
+            backend: "jj".into(),
+            workspace_root: "/home/me/repo".into(),
+            base: "@-".into(),
+            scope: "range".into(),
+            files: vec!["src/main.rs".into(), "src/link.rs".into()],
+            focus: false,
+            annotations: 0,
+        });
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: Response = serde_json::from_str(&json).expect("round trip");
+        let status = back.status.expect("status present");
+        assert_eq!(status.backend, "jj");
+        assert_eq!(status.base, "@-");
+        assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
+
+        // A bare ok() stays status-free on the wire for older clients.
+        assert!(
+            !serde_json::to_string(&Response::ok())
+                .expect("serialize ok")
+                .contains("status")
+        );
+    }
+
+    /// While recto is parked in an editor, a `ping` is answered on the listener
+    /// thread from the snapshot captured at editor entry — status on the wire,
+    /// plus the "in an editor" note. Proves the fast-path doesn't go silent.
+    #[test]
+    fn ping_in_editor_serves_snapshot() {
+        let editor = EditorLink::default();
+        editor.enter(
+            None,
+            Status {
+                version: "0.1.0".into(),
+                pid: 7,
+                backend: "git".into(),
+                workspace_root: "/tmp/repo".into(),
+                base: "HEAD".into(),
+                scope: "range".into(),
+                files: vec!["a.rs".into()],
+                focus: false,
+                annotations: 0,
+            },
+        );
+        let (tx, _rx) = mpsc::channel::<Incoming>();
+        let resp = handle_while_in_editor(&Request::Ping, &tx, &editor);
+        assert!(resp.ok);
+        assert_eq!(resp.note.as_deref(), Some("recto is in an editor"));
+        let status = resp.status.expect("status present while in editor");
+        assert_eq!(status.backend, "git");
+        assert_eq!(status.files, vec!["a.rs"]);
+
+        // After leaving, the snapshot is dropped; a ping then carries just the note.
+        editor.leave();
+        let resp = handle_while_in_editor(&Request::Ping, &tx, &editor);
+        assert!(resp.ok);
+        assert!(resp.status.is_none());
     }
 
     #[test]

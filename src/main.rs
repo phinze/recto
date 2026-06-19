@@ -1007,10 +1007,36 @@ impl App {
         Some((change.path.clone(), line.max(1)))
     }
 
+    /// Snapshot for a companion `ping`: recto's identity plus what it's
+    /// currently showing, so an agent knows what `focus`/`annotate` can resolve
+    /// without firing a throwaway request to find out.
+    fn status(&self) -> link::Status {
+        let scope = match self.cursor {
+            Cursor::All => "range",
+            Cursor::Rev(_) => "rev",
+        };
+        let workspace_root = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| link::workspace_root(&cwd))
+            .map(|r| r.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        link::Status {
+            version: env!("CARGO_PKG_VERSION").to_string(),
+            pid: std::process::id(),
+            backend: self.backend.kind().to_string(),
+            workspace_root,
+            base: self.backend.base_label(self.base()),
+            scope: scope.to_string(),
+            files: self.changes.iter().map(|c| c.path.clone()).collect(),
+            focus: self.focus_span.is_some(),
+            annotations: self.annotations.len(),
+        }
+    }
+
     /// Handle a command from a companion session.
     fn handle_request(&mut self, request: link::Request) -> link::Response {
         match request {
-            link::Request::Ping => link::Response::ok(),
+            link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
             link::Request::Annotate { sites } => self.annotate(sites),
             link::Request::Clear => {
@@ -1950,6 +1976,18 @@ fn run_client(command: ClientCommand) -> i32 {
     };
     match link::send(&socket, &request) {
         Ok(resp) if resp.ok => {
+            // Status (from `ping`) is the machine-readable payload: emit it as
+            // JSON on stdout, keeping human notes on stderr so a script can read
+            // one without the other.
+            if let Some(status) = &resp.status {
+                match serde_json::to_string_pretty(status) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => {
+                        eprintln!("recto: could not encode status: {e}");
+                        return 2;
+                    }
+                }
+            }
             if let Some(note) = resp.note {
                 eprintln!("recto: {note}");
             }
@@ -2075,6 +2113,7 @@ fn run_editor(
     path: &str,
     line: u32,
     editor_link: &link::EditorLink,
+    status: link::Status,
 ) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let mut parts = editor.split_whitespace();
@@ -2093,10 +2132,13 @@ fn run_editor(
     };
 
     restore_terminal()?;
-    editor_link.enter(nvim_addr.as_ref().map(|addr| link::NvimHandle {
-        prog: prog.to_string(),
-        addr: addr.clone(),
-    }));
+    editor_link.enter(
+        nvim_addr.as_ref().map(|addr| link::NvimHandle {
+            prog: prog.to_string(),
+            addr: addr.clone(),
+        }),
+        status,
+    );
 
     let mut cmd = Command::new(prog);
     cmd.args(&extra_args);
@@ -2343,7 +2385,8 @@ fn handle_event(
                     }
                     KeyCode::Char('e') => {
                         if let Some((path, line)) = app.edit_target() {
-                            let _ = run_editor(terminal, &path, line, editor_link);
+                            let status = app.status();
+                            let _ = run_editor(terminal, &path, line, editor_link, status);
                             // We're foreground again on return; some terminals
                             // don't emit a fresh FocusGained after the handoff.
                             app.terminal_focused = true;

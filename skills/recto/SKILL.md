@@ -70,5 +70,31 @@ It reports rather than chases.
 - **exit 2** — no recto is listening for this workspace (or you're not
   in a repo). Don't keep trying; just describe the change in text.
 
+## Reading the ping
+
 Always `recto ping` first if you're unsure recto is open. A clean ping
-means the focus calls will land.
+(exit 0) means the focus calls will land. But ping is more than a
+heartbeat: on success it prints a JSON status object on stdout (human
+notes and errors stay on stderr, so you can read one without the other).
+It looks like:
+
+    {
+      "version": "0.1.0",
+      "pid": 3107686,
+      "backend": "jj",
+      "workspace_root": "/home/me/src/recto",
+      "base": "@-",
+      "scope": "range",
+      "files": ["src/backend.rs", "src/link.rs", "src/main.rs"],
+      "focus": false,
+      "annotations": 0
+    }
+
+The `files` array is the changed-path list in the diff recto currently
+shows, so you can check up front whether a path you're about to `focus`
+or `annotate` is in scope, instead of firing a throwaway call and
+reading the exit code. If your target isn't in `files`, it's almost
+always because recto is on a different `base` than you expect: tell the
+user to cycle the base with `b`, don't retry blindly. `scope` is
+`"range"` for the whole base diff or `"rev"` when narrowed to a single
+revision.
