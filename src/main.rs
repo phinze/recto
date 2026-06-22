@@ -28,7 +28,7 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
@@ -339,6 +339,9 @@ struct App {
     diff_cursor: Option<u16>,
     pub show_files: bool,
     pub show_commits: bool,
+    /// Whether the keybinding help overlay is up. Toggled by `?`; any key
+    /// dismisses it.
+    show_help: bool,
     /// Whether our terminal/tmux pane currently has focus. Driven by
     /// focus-change reports; stays `true` on terminals that don't send them.
     terminal_focused: bool,
@@ -410,6 +413,7 @@ impl App {
             diff_cursor: None,
             show_files: true,
             show_commits: true,
+            show_help: false,
             terminal_focused: true,
         })
     }
@@ -2283,7 +2287,13 @@ fn handle_event(
                     }
                     _ => {}
                 },
+                // Help overlay is up: any key dismisses it and is otherwise
+                // swallowed, so the binding it names doesn't also fire.
+                Mode::Normal if app.show_help => {
+                    app.show_help = false;
+                }
                 Mode::Normal => match key.code {
+                    KeyCode::Char('?') => app.show_help = true,
                     KeyCode::Char('q') | KeyCode::Esc => {
                         if app.search_query.is_some() {
                             app.clear_search();
@@ -2640,19 +2650,13 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             let mut text = match &app.mode {
                 Mode::Normal => match app.focus {
                     Focus::Commits => {
-                        format!(
-                            "q quit · j k select · esc focus diff · b base · c/C revs · f/F files · {wrap_hint}"
-                        )
+                        format!("q quit · j k select · esc focus diff · {wrap_hint} · ? help")
                     }
                     Focus::Files => {
-                        format!(
-                            "q quit · tab focus · b base · ] [ rev · c/C revs · f/F files · {wrap_hint}"
-                        )
+                        format!("q quit · tab focus · b base · {wrap_hint} · ? help")
                     }
                     Focus::Diff => {
-                        format!(
-                            "q quit · tab focus · b base · ] [ rev · c/C revs · f/F files · {wrap_hint} · e edit"
-                        )
+                        format!("q quit · tab focus · b base · {wrap_hint} · e edit · ? help")
                     }
                 },
                 _ => String::new(),
@@ -2675,6 +2679,122 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if let Mode::SearchInput { query } = &app.mode {
         frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
     }
+
+    if app.show_help {
+        draw_help(frame, frame.area());
+    }
+}
+
+/// One row in the help overlay: either a section heading (`key` empty) or a
+/// `keys → description` binding line.
+struct HelpRow {
+    keys: &'static str,
+    desc: &'static str,
+}
+
+const fn head(desc: &'static str) -> HelpRow {
+    HelpRow { keys: "", desc }
+}
+
+const fn bind(keys: &'static str, desc: &'static str) -> HelpRow {
+    HelpRow { keys, desc }
+}
+
+const HELP_ROWS: &[HelpRow] = &[
+    head("Navigation"),
+    bind("j k  ↓ ↑", "scroll diff / move selection"),
+    bind("h l  ← →", "scroll diff horizontally"),
+    bind("0", "reset horizontal scroll"),
+    bind("enter", "open selected file's diff"),
+    bind("w", "toggle line wrap"),
+    head("Focus"),
+    bind("tab", "cycle panes"),
+    bind("H L", "focus files / diff"),
+    bind("J K", "focus commits / diff"),
+    bind("f F", "focus / toggle files pane"),
+    bind("c C", "focus / toggle commits pane"),
+    head("Revisions"),
+    bind("b", "cycle base"),
+    bind("] [", "next / prev revision"),
+    head("Search & tour"),
+    bind("/", "search"),
+    bind("n N", "next / prev match"),
+    bind("1-9", "jump to tour step"),
+    head("Other"),
+    bind("e", "edit file at line in $EDITOR"),
+    bind("?", "toggle this help"),
+    bind("q  esc", "quit / dismiss"),
+];
+
+/// Centered keybinding reference. Drawn over everything when `show_help` is on;
+/// the source of truth the footer used to try (and fail) to fit inline.
+fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
+    // Widest key column across all bindings, so descriptions align.
+    let key_w = HELP_ROWS
+        .iter()
+        .map(|r| r.keys.chars().count())
+        .max()
+        .unwrap_or(0) as u16;
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(HELP_ROWS.len());
+    for row in HELP_ROWS {
+        if row.keys.is_empty() {
+            lines.push(Line::from(Span::styled(
+                row.desc,
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        } else {
+            let pad = " ".repeat((key_w as usize).saturating_sub(row.keys.chars().count()));
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{}{pad}", row.keys),
+                    Style::default()
+                        .fg(theme::TEAL)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled("  ", Style::default()),
+                Span::styled(row.desc, Style::default().fg(theme::TEXT)),
+            ]));
+        }
+    }
+
+    // 2 borders + 2 padding each axis. Key column + gap(2) + longest desc.
+    let inner_w = key_w
+        + 2
+        + HELP_ROWS
+            .iter()
+            .map(|r| r.desc.chars().count())
+            .max()
+            .unwrap_or(0) as u16;
+    let width = (inner_w + 4).min(area.width);
+    let height = (lines.len() as u16 + 4).min(area.height);
+    let x = area.x + (area.width.saturating_sub(width)) / 2;
+    let y = area.y + (area.height.saturating_sub(height)) / 2;
+    let popup = Rect {
+        x,
+        y,
+        width,
+        height,
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::MAUVE))
+        .title(" keybindings ")
+        .title_style(
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        )
+        .style(Style::default().bg(theme::BASE));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(block.padding(ratatui::widgets::Padding::horizontal(1))),
+        popup,
+    );
 }
 
 fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
