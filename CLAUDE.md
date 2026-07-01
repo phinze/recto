@@ -134,7 +134,9 @@ caller arrives, not before — `-D warnings` enforces it.
 
 ## Shipping a Revision
 
-recto is consumed downstream by nix-config as a flake input
+This is a personal, single-author repo: work lands straight on `main`, no
+PR ceremony, `pr-time` is overkill. Shipping is a touch heavier than rig
+only because recto is consumed downstream by nix-config as a flake input
 (`recto.url = "github:phinze/recto"` in its `flake.nix`), which pins a
 specific commit in `flake.lock`. The companion-session skill at
 `skills/recto/SKILL.md` ships from the same input, so binary and skill
