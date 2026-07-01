@@ -71,24 +71,34 @@ const FOCUS_PULSE_PERIOD: Duration = Duration::from_millis(2200);
 const FOCUS_PULSE_DEPTH: f32 = 0.55;
 const TAB_WIDTH: usize = 4;
 
-struct Loading {
+/// What the worker is asked to render: a scope plus the whitespace toggle.
+/// Carried through the channel (not kept as separate app state) so a toggle
+/// that leaves the scope unchanged still supersedes an in-flight load — the
+/// staleness check in `poll_load` compares the whole request.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DiffRequest {
     scope: Scope,
+    ignore_ws: bool,
+}
+
+struct Loading {
+    request: DiffRequest,
     label: String,
     started: Instant,
 }
 
 struct Worker {
-    request_tx: mpsc::Sender<Scope>,
-    response_rx: mpsc::Receiver<(Scope, Result<LoadedDiff>)>,
+    request_tx: mpsc::Sender<DiffRequest>,
+    response_rx: mpsc::Receiver<(DiffRequest, Result<LoadedDiff>)>,
 }
 
 fn spawn_worker(backend: Arc<dyn Backend>, hl: Highlighter) -> Worker {
-    let (request_tx, request_rx) = mpsc::channel::<Scope>();
-    let (response_tx, response_rx) = mpsc::channel::<(Scope, Result<LoadedDiff>)>();
+    let (request_tx, request_rx) = mpsc::channel::<DiffRequest>();
+    let (response_tx, response_rx) = mpsc::channel::<(DiffRequest, Result<LoadedDiff>)>();
     std::thread::spawn(move || {
-        while let Ok(scope) = request_rx.recv() {
-            let result = load_diff(&*backend, &hl, &scope);
-            if response_tx.send((scope, result)).is_err() {
+        while let Ok(req) = request_rx.recv() {
+            let result = load_diff(&*backend, &hl, &req);
+            if response_tx.send((req, result)).is_err() {
                 break;
             }
         }
@@ -99,9 +109,10 @@ fn spawn_worker(backend: Arc<dyn Backend>, hl: Highlighter) -> Worker {
     }
 }
 
-fn load_diff(backend: &dyn Backend, hl: &Highlighter, scope: &Scope) -> Result<LoadedDiff> {
-    let changes = backend.list_changes(scope)?;
-    let diff = backend.unified_diff(scope)?;
+fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Result<LoadedDiff> {
+    let scope = &req.scope;
+    let changes = backend.list_changes(scope, req.ignore_ws)?;
+    let diff = backend.unified_diff(scope, req.ignore_ws)?;
     let revs = match scope {
         Scope::Range(base) => Some(backend.list_revs(base)?),
         Scope::Rev(_) => None,
@@ -339,6 +350,9 @@ struct App {
     diff_cursor: Option<u16>,
     pub show_files: bool,
     pub show_commits: bool,
+    /// GitHub-style "ignore whitespace" toggle. When on, diffs are computed
+    /// with `-w` (`--ignore-all-space`), collapsing reindentation noise.
+    ignore_ws: bool,
     /// Whether the keybinding help overlay is up. Toggled by `?`; any key
     /// dismisses it.
     show_help: bool,
@@ -370,8 +384,11 @@ impl App {
         } else {
             0
         };
-        let initial_scope = Scope::Range(bases[base_idx].clone());
-        let loaded = load_diff(&*backend, &hl, &initial_scope)?;
+        let initial_req = DiffRequest {
+            scope: Scope::Range(bases[base_idx].clone()),
+            ignore_ws: false,
+        };
+        let loaded = load_diff(&*backend, &hl, &initial_req)?;
         let revs = loaded.revs.clone().unwrap_or_default();
         let worker = spawn_worker(backend.clone(), hl);
         let file_rows = build_file_rows(&loaded.changes);
@@ -413,6 +430,7 @@ impl App {
             diff_cursor: None,
             show_files: true,
             show_commits: true,
+            ignore_ws: false,
             show_help: false,
             terminal_focused: true,
         })
@@ -460,7 +478,7 @@ impl App {
         let current = self
             .loading
             .as_ref()
-            .and_then(|l| match &l.scope {
+            .and_then(|l| match &l.request.scope {
                 Scope::Range(b) => self.bases.iter().position(|x| x == b),
                 Scope::Rev(_) => None,
             })
@@ -468,12 +486,16 @@ impl App {
         let next_idx = (current + 1) % self.bases.len();
         let scope = Scope::Range(self.bases[next_idx].clone());
         let label = self.scope_label(&scope);
-        let _ = self.worker.request_tx.send(scope.clone());
+        let request = DiffRequest {
+            scope,
+            ignore_ws: self.ignore_ws,
+        };
+        let _ = self.worker.request_tx.send(request.clone());
         // Cursor follows the new range — old rev indices won't map to the
         // freshly-loaded revs, so the only safe landing is the overview.
         self.cursor = Cursor::All;
         self.loading = Some(Loading {
-            scope,
+            request,
             label,
             started: Instant::now(),
         });
@@ -758,9 +780,13 @@ impl App {
     fn request_current_scope(&mut self) {
         let scope = self.scope();
         let label = self.scope_label(&scope);
-        let _ = self.worker.request_tx.send(scope.clone());
-        self.loading = Some(Loading {
+        let request = DiffRequest {
             scope,
+            ignore_ws: self.ignore_ws,
+        };
+        let _ = self.worker.request_tx.send(request.clone());
+        self.loading = Some(Loading {
+            request,
             label,
             started: Instant::now(),
         });
@@ -779,15 +805,15 @@ impl App {
     /// Drain any worker responses. Apply only the one matching the in-flight
     /// target; stale responses (superseded by a newer request) are discarded.
     fn poll_load(&mut self) {
-        while let Ok((scope, result)) = self.worker.response_rx.try_recv() {
+        while let Ok((req, result)) = self.worker.response_rx.try_recv() {
             let Some(loading) = self.loading.as_ref() else {
                 continue;
             };
-            if scope != loading.scope {
+            if req != loading.request {
                 continue;
             }
             match result {
-                Ok(loaded) => self.apply_loaded(scope, loaded),
+                Ok(loaded) => self.apply_loaded(req.scope, loaded),
                 Err(_) => {
                     // TODO: surface error somewhere. For now: silently clear.
                     self.loading = None;
@@ -2393,6 +2419,10 @@ fn handle_event(
                             app.h_scroll = 0;
                         }
                     }
+                    KeyCode::Char('W') => {
+                        app.ignore_ws = !app.ignore_ws;
+                        app.request_current_scope();
+                    }
                     KeyCode::Char('e') => {
                         if let Some((path, line)) = app.edit_target() {
                             let status = app.status();
@@ -2573,6 +2603,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             .fg(theme::MAUVE)
             .add_modifier(Modifier::BOLD),
     )];
+    if app.ignore_ws {
+        header_spans.push(Span::styled(
+            " · ignoring whitespace".to_string(),
+            Style::default().fg(theme::MAUVE),
+        ));
+    }
     if let Some(loading) = &app.loading {
         let frame_idx = (loading.started.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
             % SPINNER_FRAMES.len();
@@ -2647,16 +2683,25 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         }
         _ => {
             let wrap_hint = if app.wrap { "w unwrap" } else { "w wrap" };
+            let ws_hint = if app.ignore_ws {
+                "W show ws"
+            } else {
+                "W ignore ws"
+            };
             let mut text = match &app.mode {
                 Mode::Normal => match app.focus {
                     Focus::Commits => {
-                        format!("q quit · j k select · esc focus diff · {wrap_hint} · ? help")
+                        format!(
+                            "q quit · j k select · esc focus diff · {wrap_hint} · {ws_hint} · ? help"
+                        )
                     }
                     Focus::Files => {
-                        format!("q quit · tab focus · b base · {wrap_hint} · ? help")
+                        format!("q quit · tab focus · b base · {wrap_hint} · {ws_hint} · ? help")
                     }
                     Focus::Diff => {
-                        format!("q quit · tab focus · b base · {wrap_hint} · e edit · ? help")
+                        format!(
+                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · e edit · ? help"
+                        )
                     }
                 },
                 _ => String::new(),
@@ -2707,6 +2752,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("0", "reset horizontal scroll"),
     bind("enter", "open selected file's diff"),
     bind("w", "toggle line wrap"),
+    bind("W", "toggle ignore whitespace"),
     head("Focus"),
     bind("tab", "cycle panes"),
     bind("H L", "focus files / diff"),

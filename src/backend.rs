@@ -83,8 +83,11 @@ pub trait Backend: Send + Sync {
     /// you could paste into `jj diff --from` or `git diff`. This is what the
     /// header shows and what `--base` is matched against.
     fn base_label(&self, base: &Base) -> String;
-    fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>>;
-    fn unified_diff(&self, scope: &Scope) -> Result<String>;
+    /// `ignore_ws` maps to `-w` (`--ignore-all-space`), matching GitHub's
+    /// "ignore whitespace" toggle. Passed to the summary command too, so a
+    /// whitespace-only file drops out of the tree and the diff together.
+    fn list_changes(&self, scope: &Scope, ignore_ws: bool) -> Result<Vec<FileChange>>;
+    fn unified_diff(&self, scope: &Scope, ignore_ws: bool) -> Result<String>;
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>>;
     fn default_bases(&self) -> Vec<Base>;
     /// Raw bytes of `path` as it exists at `rev`. Used by the renderer to
@@ -159,25 +162,45 @@ impl Backend for JjBackend {
         Self::revset(base)
     }
 
-    fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>> {
-        let out = match scope {
+    fn list_changes(&self, scope: &Scope, ignore_ws: bool) -> Result<Vec<FileChange>> {
+        let mut args = vec!["diff", "--summary"];
+        if ignore_ws {
+            args.push("-w");
+        }
+        let rev;
+        match scope {
             Scope::Range(base) => {
-                let rev = Self::revset(base);
-                self.run(&["diff", "--summary", "--from", &rev])?
+                rev = Self::revset(base);
+                args.push("--from");
+                args.push(&rev);
             }
-            Scope::Rev(id) => self.run(&["diff", "--summary", "-r", id])?,
-        };
+            Scope::Rev(id) => {
+                args.push("-r");
+                args.push(id);
+            }
+        }
+        let out = self.run(&args)?;
         Ok(out.lines().filter_map(parse_summary_line).collect())
     }
 
-    fn unified_diff(&self, scope: &Scope) -> Result<String> {
+    fn unified_diff(&self, scope: &Scope, ignore_ws: bool) -> Result<String> {
+        let mut args = vec!["diff", "--git"];
+        if ignore_ws {
+            args.push("-w");
+        }
+        let rev;
         match scope {
             Scope::Range(base) => {
-                let rev = Self::revset(base);
-                self.run(&["diff", "--git", "--from", &rev])
+                rev = Self::revset(base);
+                args.push("--from");
+                args.push(&rev);
             }
-            Scope::Rev(id) => self.run(&["diff", "--git", "-r", id]),
+            Scope::Rev(id) => {
+                args.push("-r");
+                args.push(id);
+            }
         }
+        self.run(&args)
     }
 
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
@@ -298,25 +321,53 @@ impl Backend for GitBackend {
         Self::diff_arg(base)
     }
 
-    fn list_changes(&self, scope: &Scope) -> Result<Vec<FileChange>> {
-        let out = match scope {
+    fn list_changes(&self, scope: &Scope, ignore_ws: bool) -> Result<Vec<FileChange>> {
+        let arg;
+        let cmd = match scope {
             Scope::Range(base) => {
-                let arg = Self::diff_arg(base);
-                self.run(&["diff", "--name-status", &arg])?
+                arg = Self::diff_arg(base);
+                let mut c = vec!["diff", "--name-status"];
+                if ignore_ws {
+                    c.push("-w");
+                }
+                c.push(&arg);
+                c
             }
-            Scope::Rev(sha) => self.run(&["show", "--name-status", "--format=", sha])?,
+            Scope::Rev(sha) => {
+                let mut c = vec!["show", "--name-status", "--format="];
+                if ignore_ws {
+                    c.push("-w");
+                }
+                c.push(sha);
+                c
+            }
         };
+        let out = self.run(&cmd)?;
         Ok(out.lines().filter_map(parse_git_name_status).collect())
     }
 
-    fn unified_diff(&self, scope: &Scope) -> Result<String> {
-        match scope {
+    fn unified_diff(&self, scope: &Scope, ignore_ws: bool) -> Result<String> {
+        let arg;
+        let cmd = match scope {
             Scope::Range(base) => {
-                let arg = Self::diff_arg(base);
-                self.run(&["diff", &arg])
+                arg = Self::diff_arg(base);
+                let mut c = vec!["diff"];
+                if ignore_ws {
+                    c.push("-w");
+                }
+                c.push(&arg);
+                c
             }
-            Scope::Rev(sha) => self.run(&["show", "--format=", sha]),
-        }
+            Scope::Rev(sha) => {
+                let mut c = vec!["show", "--format="];
+                if ignore_ws {
+                    c.push("-w");
+                }
+                c.push(sha);
+                c
+            }
+        };
+        self.run(&cmd)
     }
 
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
