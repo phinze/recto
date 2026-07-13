@@ -31,14 +31,33 @@ post-change file, the ones you'd see in your editor after the edit.
 Annotate SPECs are `PATH:LINE=label` or `PATH:START-END=label`. Argument
 order sets the step numbers, and each call replaces the whole set.
 
+## Choose the active surface
+
+Start with `recto ping`. Its `surface` and `capabilities` fields are the
+command contract for the view the user is actually looking at:
+
+- `surface: "recto"`: `focus` and `annotate` land immediately, but only on
+  spans rendered in the current diff. Use `files` to check candidate paths.
+- `surface: "neovim"`: `focus` lands immediately and may target any file in
+  the workspace, whether or not it appears in `files`. `annotate` is deferred
+  until the user returns to recto and remains limited to the current diff.
+- `surface: "editor"`: recto cannot drive this editor. Both commands are
+  deferred until the user returns and are limited to the current diff.
+
+Choose the surface from the requested kind of tour. A request to explain how a
+subsystem works is a code tour, so prefer live neovim focus when available. A
+request to review the current change is a diff tour, so use recto annotations.
+Do not ask the user to change the diff base merely to show current source that
+neovim can already open.
+
 ## How to use it in a tour
 
-For a single-threaded walkthrough, describe the change in prose and
-`focus` each span as you reach it. The highlight is sticky: it stays put
-until you focus something else or `recto clear`, so each `focus` call
-replaces the last. Re-focusing the same span re-fires its attention
-flash, so it's never a no-op. End a tour with `recto clear` so you don't
-leave a stray bar on screen.
+For a single-threaded walkthrough, describe the code in prose and `focus` each
+span as you reach it. This works in both recto and a live neovim, subject to the
+scope reported by `capabilities.focus`. The highlight is sticky: it stays put
+until you focus something else or `recto clear`, so each `focus` call replaces
+the last. Re-focusing the same span re-fires its attention flash, so it is never
+a no-op. End a tour with `recto clear` so you do not leave a stray highlight.
 
 For a multi-site tour — "step 1 here, step 2 there" — lay all the steps
 down first:
@@ -56,8 +75,9 @@ pressing Esc) removes the whole set.
 
 ## Reading the exit code
 
-recto is passive: it will not switch the diff base to find your target.
-It reports rather than chases.
+On the recto surface, recto is passive: it will not switch the diff base to
+find your target. It reports rather than chases. Live neovim focus is the
+exception: its scope is the workspace, not the current diff.
 
 - **exit 0** — landed. For `annotate`, a note on stderr may list sites
   that didn't resolve; the rest are on screen.
@@ -86,15 +106,17 @@ It looks like:
       "base": "@-",
       "scope": "range",
       "files": ["src/backend.rs", "src/link.rs", "src/main.rs"],
+      "surface": "recto",
+      "capabilities": {
+        "focus": {"delivery": "live", "scope": "current_diff"},
+        "annotate": {"delivery": "live", "scope": "current_diff"}
+      },
       "focus": false,
       "annotations": 0
     }
 
-The `files` array is the changed-path list in the diff recto currently
-shows, so you can check up front whether a path you're about to `focus`
-or `annotate` is in scope, instead of firing a throwaway call and
-reading the exit code. If your target isn't in `files`, it's almost
-always because recto is on a different `base` than you expect: tell the
-user to cycle the base with `b`, don't retry blindly. `scope` is
-`"range"` for the whole base diff or `"rev"` when narrowed to a single
-revision.
+The `files` array is always the changed-path list in the diff recto currently
+shows. It bounds commands only when their capability scope is `current_diff`.
+When focus scope is `workspace`, a path absent from `files` is still a valid
+focus target. `scope` is `"range"` for the whole base diff or `"rev"` when
+narrowed to a single revision.

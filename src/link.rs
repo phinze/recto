@@ -66,10 +66,10 @@ pub struct Response {
     pub status: Option<Status>,
 }
 
-/// What a [`Request::Ping`] reports back: enough of recto's identity and current
-/// view for a companion session to know what it's driving and what a `focus`
-/// would land on, without firing a throwaway focus to find out. `files` is the
-/// changed-path list in the diff recto currently shows.
+/// What a [`Request::Ping`] reports back: recto's identity, current diff, and
+/// the active presentation surface's command capabilities. `files` remains the
+/// changed-path list for compatibility; `capabilities` says whether that list
+/// actually bounds a command on the current surface.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Status {
     /// recto's version (`CARGO_PKG_VERSION`).
@@ -84,12 +84,99 @@ pub struct Status {
     pub base: String,
     /// `"range"` for the whole base diff, or `"rev"` when narrowed to one rev.
     pub scope: String,
-    /// Changed paths in the current diff — what `focus`/`annotate` can resolve.
+    /// Changed paths in the current diff. On the recto surface these bound both
+    /// commands; a live neovim can focus any workspace path instead.
     pub files: Vec<String>,
+    /// Where commands will present themselves right now.
+    #[serde(default)]
+    pub surface: Surface,
+    /// How `focus` and `annotate` behave on that surface.
+    #[serde(default)]
+    pub capabilities: Capabilities,
     /// Whether a companion focus highlight is currently active.
     pub focus: bool,
     /// Number of active tour annotations.
     pub annotations: usize,
+}
+
+#[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Surface {
+    #[default]
+    Recto,
+    Neovim,
+    Editor,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Capabilities {
+    pub focus: Capability,
+    pub annotate: Capability,
+}
+
+impl Capabilities {
+    pub fn recto() -> Self {
+        Self {
+            focus: Capability::live(TargetScope::CurrentDiff),
+            annotate: Capability::live(TargetScope::CurrentDiff),
+        }
+    }
+
+    fn neovim() -> Self {
+        Self {
+            focus: Capability::live(TargetScope::Workspace),
+            annotate: Capability::deferred(TargetScope::CurrentDiff),
+        }
+    }
+
+    fn editor() -> Self {
+        Self {
+            focus: Capability::deferred(TargetScope::CurrentDiff),
+            annotate: Capability::deferred(TargetScope::CurrentDiff),
+        }
+    }
+}
+
+impl Default for Capabilities {
+    fn default() -> Self {
+        Self::recto()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+pub struct Capability {
+    pub delivery: Delivery,
+    pub scope: TargetScope,
+}
+
+impl Capability {
+    fn live(scope: TargetScope) -> Self {
+        Self {
+            delivery: Delivery::Live,
+            scope,
+        }
+    }
+
+    fn deferred(scope: TargetScope) -> Self {
+        Self {
+            delivery: Delivery::Deferred,
+            scope,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Delivery {
+    Live,
+    Deferred,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum TargetScope {
+    CurrentDiff,
+    Workspace,
 }
 
 impl Response {
@@ -164,7 +251,14 @@ pub struct EditorLink {
 impl EditorLink {
     /// Mark recto as entering an editor handoff, recording the neovim handle if
     /// the editor is drivable and a status snapshot to serve while parked.
-    pub fn enter(&self, nvim: Option<NvimHandle>, status: Status) {
+    pub fn enter(&self, nvim: Option<NvimHandle>, mut status: Status) {
+        if nvim.is_some() {
+            status.surface = Surface::Neovim;
+            status.capabilities = Capabilities::neovim();
+        } else {
+            status.surface = Surface::Editor;
+            status.capabilities = Capabilities::editor();
+        }
         *self.nvim.lock().unwrap() = nvim;
         *self.status.lock().unwrap() = Some(status);
         self.active.store(true, Ordering::SeqCst);
@@ -328,7 +422,11 @@ fn handle_while_in_editor(
                 Some(status) => Response::ok_status(status),
                 None => Response::ok(),
             };
-            resp.note = Some("recto is in an editor".into());
+            resp.note = Some(if nvim.is_some() {
+                "recto is in neovim".into()
+            } else {
+                "recto is in an editor".into()
+            });
             resp
         }
         Request::Clear => {
@@ -537,6 +635,8 @@ mod tests {
             base: "@-".into(),
             scope: "range".into(),
             files: vec!["src/main.rs".into(), "src/link.rs".into()],
+            surface: Surface::Recto,
+            capabilities: Capabilities::recto(),
             focus: false,
             annotations: 0,
         });
@@ -546,6 +646,28 @@ mod tests {
         assert_eq!(status.backend, "jj");
         assert_eq!(status.base, "@-");
         assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
+        assert_eq!(status.surface, Surface::Recto);
+        assert_eq!(
+            status.capabilities.focus,
+            Capability::live(TargetScope::CurrentDiff)
+        );
+
+        // A newer client may talk to a recto process left running across an
+        // upgrade. Missing capability fields mean the old, diff-bound surface.
+        let old_status = r#"{
+            "version":"0.1.0",
+            "pid":4321,
+            "backend":"jj",
+            "workspace_root":"/home/me/repo",
+            "base":"@-",
+            "scope":"range",
+            "files":["src/main.rs"],
+            "focus":false,
+            "annotations":0
+        }"#;
+        let old: Status = serde_json::from_str(old_status).expect("old status parses");
+        assert_eq!(old.surface, Surface::Recto);
+        assert_eq!(old.capabilities, Capabilities::recto());
 
         // A bare ok() stays status-free on the wire for older clients.
         assert!(
@@ -571,6 +693,8 @@ mod tests {
                 base: "HEAD".into(),
                 scope: "range".into(),
                 files: vec!["a.rs".into()],
+                surface: Surface::Recto,
+                capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
             },
@@ -582,12 +706,55 @@ mod tests {
         let status = resp.status.expect("status present while in editor");
         assert_eq!(status.backend, "git");
         assert_eq!(status.files, vec!["a.rs"]);
+        assert_eq!(status.surface, Surface::Editor);
+        assert_eq!(
+            status.capabilities.focus,
+            Capability::deferred(TargetScope::CurrentDiff)
+        );
 
         // After leaving, the snapshot is dropped; a ping then carries just the note.
         editor.leave();
         let resp = handle_while_in_editor(&Request::Ping, &tx, &editor);
         assert!(resp.ok);
         assert!(resp.status.is_none());
+    }
+
+    #[test]
+    fn ping_in_neovim_reports_workspace_focus() {
+        let editor = EditorLink::default();
+        editor.enter(
+            Some(NvimHandle {
+                prog: "nvim".into(),
+                addr: PathBuf::from("/tmp/recto-test-nvim.sock"),
+            }),
+            Status {
+                version: "0.1.0".into(),
+                pid: 7,
+                backend: "jj".into(),
+                workspace_root: "/tmp/repo".into(),
+                base: "@-".into(),
+                scope: "range".into(),
+                files: vec!["changed.rs".into()],
+                surface: Surface::Recto,
+                capabilities: Capabilities::recto(),
+                focus: false,
+                annotations: 0,
+            },
+        );
+        let (tx, _rx) = mpsc::channel::<Incoming>();
+        let resp = handle_while_in_editor(&Request::Ping, &tx, &editor);
+        assert!(resp.ok);
+        assert_eq!(resp.note.as_deref(), Some("recto is in neovim"));
+        let status = resp.status.expect("status present while in neovim");
+        assert_eq!(status.surface, Surface::Neovim);
+        assert_eq!(
+            status.capabilities.focus,
+            Capability::live(TargetScope::Workspace)
+        );
+        assert_eq!(
+            status.capabilities.annotate,
+            Capability::deferred(TargetScope::CurrentDiff)
+        );
     }
 
     #[test]

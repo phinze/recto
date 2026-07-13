@@ -1058,6 +1058,8 @@ impl App {
             base: self.backend.base_label(self.base()),
             scope: scope.to_string(),
             files: self.changes.iter().map(|c| c.path.clone()).collect(),
+            surface: link::Surface::Recto,
+            capabilities: link::Capabilities::recto(),
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
         }
