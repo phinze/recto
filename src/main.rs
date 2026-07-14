@@ -795,16 +795,18 @@ impl App {
     /// Request a fresh load of the current scope (file watcher). No-op while
     /// a load is already in flight — the in-flight one will reflect whatever's
     /// on disk by the time it completes.
-    fn request_reload(&mut self) {
+    fn request_reload(&mut self) -> bool {
         if self.loading.is_some() {
-            return;
+            return false;
         }
         self.request_current_scope();
+        true
     }
 
     /// Drain any worker responses. Apply only the one matching the in-flight
     /// target; stale responses (superseded by a newer request) are discarded.
-    fn poll_load(&mut self) {
+    fn poll_load(&mut self) -> bool {
+        let mut changed = false;
         while let Ok((req, result)) = self.worker.response_rx.try_recv() {
             let Some(loading) = self.loading.as_ref() else {
                 continue;
@@ -812,6 +814,7 @@ impl App {
             if req != loading.request {
                 continue;
             }
+            changed = true;
             match result {
                 Ok(loaded) => self.apply_loaded(req.scope, loaded),
                 Err(_) => {
@@ -820,6 +823,14 @@ impl App {
                 }
             }
         }
+        changed
+    }
+
+    /// Whether time alone can change the next frame. Static screens redraw
+    /// only in response to state changes; loaders and focus pulses keep their
+    /// existing animation cadence.
+    fn is_animating(&self) -> bool {
+        self.loading.is_some() || self.focus_span.is_some()
     }
 
     fn apply_loaded(&mut self, scope: Scope, loaded: LoadedDiff) {
@@ -2232,16 +2243,16 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         .ok();
 
     let mut pending_reload: Option<Instant> = None;
+    let mut needs_redraw = true;
 
     loop {
-        terminal.draw(|f| draw(f, app))?;
-
-        app.poll_load();
+        needs_redraw |= app.poll_load();
 
         if let Some(link_rx) = &link_rx {
             while let Ok(incoming) = link_rx.try_recv() {
                 let resp = app.handle_request(incoming.request);
                 let _ = incoming.respond.send(resp);
+                needs_redraw = true;
             }
         }
 
@@ -2251,8 +2262,17 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         if let Some(t) = pending_reload
             && t.elapsed() >= RELOAD_DEBOUNCE
         {
-            app.request_reload();
+            needs_redraw |= app.request_reload();
             pending_reload = None;
+        }
+
+        if needs_redraw || app.is_animating() {
+            let selected_before = app.file_state.selected();
+            terminal.draw(|f| draw(f, app))?;
+            // `draw_diff` keeps the file selection synchronized with the
+            // current scroll position, after the file pane has already been
+            // rendered. Give that selection change one follow-up frame.
+            needs_redraw = selected_before != app.file_state.selected();
         }
 
         if event::poll(POLL_INTERVAL)? {
@@ -2262,6 +2282,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             ) {
                 break;
             }
+            needs_redraw = true;
             // Coalesce bursts (key autorepeat, mouse-scroll) into one redraw
             // by draining everything already queued before drawing again.
             while event::poll(Duration::ZERO)? {
@@ -2271,6 +2292,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 ) {
                     return Ok(());
                 }
+                needs_redraw = true;
             }
         }
     }
