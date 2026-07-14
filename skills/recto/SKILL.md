@@ -1,6 +1,6 @@
 ---
 name: recto
-description: Drive a running recto diff viewer from a companion session — scroll to and highlight a file or line span, or lay down a numbered multi-site tour. Load whenever you are explaining, reviewing, or walking through code changes in a workspace where recto might be open, or when asked to "show me where", "point at", or "tour" a diff. Lets you direct the user's eyes to the exact lines you're describing instead of just naming them.
+description: Drive a running recto diff viewer from a companion session — scroll to and highlight a file or line span, or lay down a numbered multi-site tour whose narration advances only when the user says to continue. Load whenever you are explaining, reviewing, or walking through code changes in a workspace where recto might be open, or when asked to "show me where", "point at", or "tour" a diff. Lets you direct the user's eyes to the exact lines you're describing instead of just naming them.
 ---
 
 # recto
@@ -50,14 +50,39 @@ request to review the current change is a diff tour, so use recto annotations.
 Do not ask the user to change the diff base merely to show current source that
 neovim can already open.
 
+## Pace tours one span at a time
+
+Treat every interactive tour as user-paced. Make showing a span and explaining
+it one complete assistant turn:
+
+1. `focus` exactly one span.
+2. Explain only that span and its immediate role.
+3. End the response and wait for the user to say `next`, ask a question, or
+   otherwise explicitly continue.
+
+Never issue a second `focus` call in the same turn, including in a batch of tool
+calls. Keep the highlight in place while answering a question about the current
+span. Treat silence as a stop, not permission to advance. Treat a request such
+as "walk me through this" as authorization to start at the first span, not to
+run the whole tour without stopping. Skip these pauses only when the user
+explicitly asks for an uninterrupted or all-at-once walkthrough.
+
+Treat `annotate` as the exception to the one-span command limit because it lays
+down a standing map rather than moving the active pointer. Annotate all tour
+sites up front if useful, but explain only step 1 and then wait. On each later
+turn, `focus` the one step being discussed and stop again. Do not clear the
+final highlight until the user acknowledges that the tour is done or asks to
+leave the tour.
+
 ## How to use it in a tour
 
-For a single-threaded walkthrough, describe the code in prose and `focus` each
-span as you reach it. This works in both recto and a live neovim, subject to the
-scope reported by `capabilities.focus`. The highlight is sticky: it stays put
-until you focus something else or `recto clear`, so each `focus` call replaces
-the last. Re-focusing the same span re-fires its attention flash, so it is never
-a no-op. End a tour with `recto clear` so you do not leave a stray highlight.
+For a single-threaded walkthrough, `focus` the current span, describe it, and
+yield the turn before advancing. This works in both recto and a live neovim,
+subject to the scope reported by `capabilities.focus`. The highlight is sticky:
+it stays put while the user reads or asks questions, until a later turn focuses
+something else or calls `recto clear`. Re-focusing the same span re-fires its
+attention flash, so it is never a no-op. Once the user is finished with the
+tour, use `recto clear` so you do not leave a stray highlight.
 
 For a multi-site tour — "step 1 here, step 2 there" — lay all the steps
 down first:
