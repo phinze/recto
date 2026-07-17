@@ -15,6 +15,27 @@ workspace root, so `recto focus …` run from anywhere inside the repo
 reaches the recto reviewing it. No env var, no socket path to thread
 through.
 
+## Inside a multi-repo Rig
+
+A Rig keeps one persistent recto per repo and shows the currently relevant one
+beside its task-level agent. When `RIG_BASEDIR` is set, route every command
+through Rig and name the repo subdirectory from the generated rig instructions:
+
+    rig recto cloud ping
+    rig recto cloud focus src/app.rs:42-58
+    rig recto brand annotate 'docs/index.md:10=Update the headline'
+    rig recto cloud clear
+
+`rig recto <repo>` promotes that repo's existing viewer into the main window;
+any remaining arguments are forwarded to recto from the correct workspace.
+The command is idempotent when that repo is already visible and preserves
+recto's exit codes. Use this form even when you think the right viewer is
+already active, so the user's visible surface and the command target cannot
+drift apart. Do not run tmux pane commands yourself, and do not use `recto -R`
+as a substitute: Rig owns the carousel and must know which viewer to surface.
+
+Outside a Rig, use the ordinary `recto …` commands below.
+
 ## Commands
 
     recto focus PATH:START-END   # highlight lines START..END
