@@ -20,7 +20,9 @@ use crossterm::{
         Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind,
     },
     execute,
-    terminal::{EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode},
+    terminal::{
+        EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
+    },
 };
 use ratatui::{
     Terminal,
@@ -2194,14 +2196,31 @@ fn normalize_path(cwd: &Path, root: &Path, raw: &str) -> String {
 }
 
 fn init_terminal() -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    enter_terminal()?;
+    Ok(Terminal::new(CrosstermBackend::new(stdout()))?)
+}
+
+fn enter_terminal() -> Result<()> {
     enable_raw_mode()?;
     execute!(
         stdout(),
+        SetTitle(terminal_title()),
         EnterAlternateScreen,
         EnableMouseCapture,
         EnableFocusChange
     )?;
-    Ok(Terminal::new(CrosstermBackend::new(stdout()))?)
+    Ok(())
+}
+
+fn terminal_title() -> String {
+    let root = std::env::current_dir()
+        .ok()
+        .and_then(|cwd| link::workspace_root(&cwd).or(Some(cwd)));
+    root.as_deref()
+        .and_then(Path::file_name)
+        .and_then(|name| name.to_str())
+        .map(|name| format!("recto: {name}"))
+        .unwrap_or_else(|| "recto".into())
 }
 
 fn restore_terminal() -> Result<()> {
@@ -2259,13 +2278,7 @@ fn run_editor(
         let _ = std::fs::remove_file(addr);
     }
 
-    enable_raw_mode()?;
-    execute!(
-        stdout(),
-        EnterAlternateScreen,
-        EnableMouseCapture,
-        EnableFocusChange
-    )?;
+    enter_terminal()?;
     terminal.clear()?;
     Ok(())
 }
