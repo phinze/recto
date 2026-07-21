@@ -315,6 +315,61 @@ struct Annotation {
     label: String,
 }
 
+/// Cached mapping between rendered source lines and the visual rows they
+/// occupy after wrapping. `starts[i]` is the first visual row of source line
+/// `i`; the final sentinel is the total visual-row count.
+#[derive(Default)]
+struct DisplayRowIndex {
+    width: u16,
+    starts: Vec<usize>,
+}
+
+impl DisplayRowIndex {
+    fn build(rendered: &[Line<'static>], line_info: &[LineInfo], width: u16) -> Self {
+        let mut starts = Vec::with_capacity(rendered.len() + 1);
+        starts.push(0usize);
+        for (idx, line) in rendered.iter().enumerate() {
+            let prefix_width = if line_info.get(idx).copied().flatten().is_some() {
+                wrap::gutter_prefix_width(line)
+            } else {
+                0
+            };
+            let rows = if width == 0 {
+                1
+            } else {
+                wrap::row_count(line, width, prefix_width)
+            };
+            starts.push(starts.last().copied().unwrap_or(0).saturating_add(rows));
+        }
+        Self { width, starts }
+    }
+
+    fn total_rows(&self) -> usize {
+        self.starts.last().copied().unwrap_or(0)
+    }
+
+    fn row_of_line(&self, line: usize) -> usize {
+        self.starts
+            .get(line)
+            .copied()
+            .unwrap_or_else(|| self.total_rows())
+    }
+
+    fn line_at_row(&self, row: usize) -> Option<(usize, usize)> {
+        let total = self.total_rows();
+        if total == 0 {
+            return None;
+        }
+        let row = row.min(total - 1);
+        let line = self
+            .starts
+            .partition_point(|&start| start <= row)
+            .saturating_sub(1)
+            .min(self.starts.len().saturating_sub(2));
+        Some((line, row - self.starts[line]))
+    }
+}
+
 struct App {
     worker: Worker,
     /// Shared with the worker; the app side only uses it for labels.
@@ -336,9 +391,12 @@ struct App {
     file_starts: Vec<u16>,
     line_info: Vec<LineInfo>,
     file_stats: Vec<(u32, u32)>,
-    scroll: u16,
+    /// Top of the diff viewport in visual-row coordinates. In wrap mode the
+    /// display-row index maps this back to a source line and continuation row.
+    scroll: usize,
     h_scroll: u16,
     wrap: bool,
+    display_rows: DisplayRowIndex,
     diff_viewport: u16,
     focus: Focus,
     file_state: ListState,
@@ -361,7 +419,7 @@ struct App {
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
     /// here, `e` goes here" marker. Cleared on reload since the index is
     /// position-based, not path-resolved.
-    diff_cursor: Option<u16>,
+    diff_cursor: Option<usize>,
     /// Resolved visibility for each side pane. Derived from `files_vis` /
     /// `commits_vis` plus the current change counts via `resolve_panes`; the
     /// draw and key-handling paths read these bools directly.
@@ -413,6 +471,7 @@ impl App {
         let revs = loaded.revs.clone().unwrap_or_default();
         let worker = spawn_worker(backend.clone(), hl);
         let file_rows = build_file_rows(&loaded.changes);
+        let display_rows = DisplayRowIndex::build(&loaded.rendered, &loaded.line_info, 0);
         let mut file_state = ListState::default();
         file_state.select(first_file_row(&file_rows));
         let mut app = Self {
@@ -435,6 +494,7 @@ impl App {
             scroll: 0,
             h_scroll: 0,
             wrap: false,
+            display_rows,
             diff_viewport: 0,
             // Overwritten below once resolve_panes settles which panes are up.
             focus: Focus::Diff,
@@ -677,7 +737,7 @@ impl App {
         // Focus the first match on or after the current scroll line,
         // fallback to the first match if none are further down.
         if !self.search_matches.is_empty() {
-            let current_scroll = self.scroll as usize;
+            let current_scroll = self.source_line_at_row(self.scroll).unwrap_or(0);
             let mut best_idx = 0;
             for (idx, m) in self.search_matches.iter().enumerate() {
                 if m.line_idx >= current_scroll {
@@ -703,7 +763,9 @@ impl App {
     /// Centers the viewport around the specified line index, syncing the focused file in the tree.
     fn scroll_to_line(&mut self, line_idx: usize) {
         let viewport = self.diff_viewport as usize;
-        self.scroll = line_idx.saturating_sub(viewport / 2) as u16;
+        self.scroll = self
+            .display_row_of_line(line_idx)
+            .saturating_sub(viewport / 2);
         self.clamp_scroll();
 
         // Automatically focus the file tree selection to match this line's file
@@ -943,7 +1005,9 @@ impl App {
         if let Some(i) = new_idx
             && let Some(&offset) = self.file_starts.get(i)
         {
-            self.scroll = offset.min(self.max_scroll());
+            self.scroll = self
+                .display_row_of_line(offset as usize)
+                .min(self.max_scroll());
         } else {
             self.scroll = 0;
         }
@@ -954,67 +1018,86 @@ impl App {
         }
     }
 
-    fn rendered_lines(&self) -> u16 {
-        self.rendered.len().min(u16::MAX as usize) as u16
+    fn rebuild_display_rows(&mut self) {
+        self.display_rows = DisplayRowIndex::build(
+            &self.rendered,
+            &self.line_info,
+            self.diff_content_area.width,
+        );
     }
 
-    fn max_scroll(&self) -> u16 {
-        if self.wrap {
-            return self.max_scroll_wrapped();
+    fn ensure_display_rows(&mut self, width: u16) {
+        if self.display_rows.width != width
+            || self.display_rows.starts.len() != self.rendered.len() + 1
+        {
+            let top = if self.wrap {
+                self.display_rows.line_at_row(self.scroll)
+            } else {
+                None
+            };
+            self.display_rows = DisplayRowIndex::build(&self.rendered, &self.line_info, width);
+            if let Some((line, offset)) = top {
+                let start = self.display_rows.row_of_line(line);
+                let end = self.display_rows.row_of_line(line.saturating_add(1));
+                self.scroll =
+                    start.saturating_add(offset.min(end.saturating_sub(start.saturating_add(1))));
+            }
         }
-        let overflow = self.rendered_lines().saturating_sub(self.diff_viewport);
+    }
+
+    fn display_row_of_line(&self, line: usize) -> usize {
+        if self.wrap {
+            self.display_rows.row_of_line(line)
+        } else {
+            line.min(self.rendered.len())
+        }
+    }
+
+    fn source_line_at_row(&self, row: usize) -> Option<usize> {
+        if self.wrap {
+            self.display_rows.line_at_row(row).map(|(line, _)| line)
+        } else {
+            (row < self.rendered.len()).then_some(row)
+        }
+    }
+
+    fn display_position(&self, row: usize) -> Option<(usize, usize)> {
+        if self.wrap {
+            self.display_rows.line_at_row(row)
+        } else {
+            (row < self.rendered.len()).then_some((row, 0))
+        }
+    }
+
+    fn total_display_rows(&self) -> usize {
+        if self.wrap {
+            self.display_rows.total_rows()
+        } else {
+            self.rendered.len()
+        }
+    }
+
+    fn max_scroll(&self) -> usize {
+        let total = self.total_display_rows();
+        let overflow = total.saturating_sub(self.diff_viewport as usize);
         if overflow == 0 {
             0
         } else {
-            overflow.saturating_add(SCROLLOFF)
+            overflow
+                .saturating_add(SCROLLOFF as usize)
+                .min(total.saturating_sub(1))
         }
     }
 
-    /// Walk backwards through `rendered`, summing each line's wrapped row
-    /// count, until we reach a source-line index where everything from there
-    /// to the end just fills the viewport. That index is our scroll ceiling
-    /// (plus SCROLLOFF for breathing room), since `app.scroll` is a
-    /// source-line offset and the render path slices `rendered[scroll..]`.
-    /// Row counts must come from the same hanging-indent math the draw path
-    /// uses, or the ceiling drifts from what's actually on screen.
-    fn max_scroll_wrapped(&self) -> u16 {
-        let width = self.diff_content_area.width;
-        let viewport = self.diff_viewport;
-        if width == 0 || viewport == 0 || self.rendered.is_empty() {
-            return 0;
-        }
-        let mut accum: u32 = 0;
-        let mut start: usize = self.rendered.len();
-        for idx in (0..self.rendered.len()).rev() {
-            let line = &self.rendered[idx];
-            let prefix_width = if self.line_info.get(idx).copied().flatten().is_some() {
-                wrap::gutter_prefix_width(line)
-            } else {
-                0
-            };
-            let rows = wrap::row_count(line, width, prefix_width) as u32;
-            accum = accum.saturating_add(rows);
-            if accum >= viewport as u32 {
-                start = idx;
-                break;
-            }
-        }
-        if accum < viewport as u32 {
-            return 0;
-        }
-        (start as u16).saturating_add(SCROLLOFF)
-    }
-
-    /// Both directions deliberately skip the max-scroll clamp: in wrap mode
-    /// `max_scroll` is non-trivial, and a mouse-wheel burst can queue dozens
-    /// of events between redraws. Draw clamps once via `clamp_scroll`, which
-    /// covers correctness for display and for any reads that follow.
     fn scroll_down(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_add(n);
+        self.scroll = self
+            .scroll
+            .saturating_add(n as usize)
+            .min(self.max_scroll());
     }
 
     fn scroll_up(&mut self, n: u16) {
-        self.scroll = self.scroll.saturating_sub(n);
+        self.scroll = self.scroll.saturating_sub(n as usize);
     }
 
     fn clamp_scroll(&mut self) {
@@ -1075,7 +1158,9 @@ impl App {
             return;
         };
         if let Some(&offset) = self.file_starts.get(i) {
-            self.scroll = offset.min(self.max_scroll());
+            self.scroll = self
+                .display_row_of_line(offset as usize)
+                .min(self.max_scroll());
             self.h_scroll = 0;
         }
     }
@@ -1094,15 +1179,17 @@ impl App {
     /// Renamed/Copied (the jj summary path is not a clean filename).
     fn edit_target(&self) -> Option<(String, u32)> {
         let start = match self.focus {
-            Focus::Files => *self.file_starts.get(self.selected_change()?)?,
+            Focus::Files => *self.file_starts.get(self.selected_change()?)? as usize,
             // A click-placed cursor wins over the top-of-viewport fallback.
-            Focus::Diff => self.diff_cursor.unwrap_or(self.scroll),
-            Focus::Commits => self.scroll,
+            Focus::Diff => self
+                .diff_cursor
+                .or_else(|| self.source_line_at_row(self.scroll))?,
+            Focus::Commits => self.source_line_at_row(self.scroll)?,
         };
         let (fidx, line) = self
             .line_info
             .iter()
-            .skip(start as usize)
+            .skip(start)
             .find_map(|info| info.as_ref().copied())?;
         let change = self.changes.get(fidx)?;
         if matches!(
@@ -1205,7 +1292,9 @@ impl App {
 
     fn scroll_to_file(&mut self, file_idx: usize) {
         if let Some(&offset) = self.file_starts.get(file_idx) {
-            self.scroll = offset.min(self.max_scroll());
+            self.scroll = self
+                .display_row_of_line(offset as usize)
+                .min(self.max_scroll());
             self.h_scroll = 0;
         }
         self.select_change(file_idx);
@@ -1217,7 +1306,9 @@ impl App {
     /// top-down. Already-visible spans still re-anchor — a focus jump is an
     /// explicit "look here", so consistent placement beats minimal movement.
     fn reveal_span(&mut self, rows: &std::ops::RangeInclusive<usize>) {
-        let top = (*rows.start() as u16).saturating_sub(SCROLLOFF);
+        let top = self
+            .display_row_of_line(*rows.start())
+            .saturating_sub(SCROLLOFF as usize);
         self.scroll = top.min(self.max_scroll());
         self.h_scroll = 0;
         if let Some(Some((file_idx, _))) = self.line_info.get(*rows.start()) {
@@ -1263,6 +1354,7 @@ impl App {
             self.rendered = self.base_rendered.clone();
             self.file_starts = self.base_file_starts.clone();
             self.line_info = self.base_line_info.clone();
+            self.rebuild_display_rows();
             return;
         }
         // Stable by insertion row, so steps pinned to the same row keep their
@@ -1292,6 +1384,7 @@ impl App {
         }
         self.rendered = rendered;
         self.line_info = line_info;
+        self.rebuild_display_rows();
     }
 
     /// Replace the annotation set and weave it into the render. Scrolls to the
@@ -1369,12 +1462,22 @@ impl App {
 
     /// Index into `changes` of the file owning the current scroll position.
     fn current_file(&self) -> Option<usize> {
+        let source_line = self.source_line_at_row(self.scroll)?;
         self.file_starts
             .iter()
             .enumerate()
             .rev()
-            .find(|&(_, &start)| start <= self.scroll)
+            .find(|&(_, &start)| start as usize <= source_line)
             .map(|(i, _)| i)
+    }
+
+    fn toggle_wrap(&mut self) {
+        let top_line = self.source_line_at_row(self.scroll).unwrap_or(0);
+        self.wrap = !self.wrap;
+        if self.wrap {
+            self.h_scroll = 0;
+        }
+        self.scroll = self.display_row_of_line(top_line).min(self.max_scroll());
     }
 }
 
@@ -2513,10 +2616,7 @@ fn handle_event(
                         app.jump_to_annotation(c as usize - '1' as usize);
                     }
                     KeyCode::Char('w') => {
-                        app.wrap = !app.wrap;
-                        if app.wrap {
-                            app.h_scroll = 0;
-                        }
+                        app.toggle_wrap();
                     }
                     KeyCode::Char('W') => {
                         app.ignore_ws = !app.ignore_ws;
@@ -2603,17 +2703,11 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 }
             } else if in_diff {
                 app.focus = Focus::Diff;
-                // Drop an edit cursor on the clicked source line. `diff_content_area`
-                // already excludes the border and sticky header, and `in_diff`
-                // guarantees the row is inside it, so the offset maps straight to a
-                // rendered row. Wrap mode breaks the 1:1 row→line mapping, so we
-                // skip the cursor there and leave it a plain focus click.
-                if !app.wrap {
-                    let row = m.row - app.diff_content_area.y;
-                    let src = app.scroll.saturating_add(row);
-                    if (src as usize) < app.rendered.len() {
-                        app.diff_cursor = Some(src);
-                    }
+                // Resolve the clicked visual row through the same index used by
+                // drawing, so continuation rows select their owning source line.
+                let row = (m.row - app.diff_content_area.y) as usize;
+                if let Some(src) = app.source_line_at_row(app.scroll.saturating_add(row)) {
+                    app.diff_cursor = Some(src);
                 }
             } else if in_commits {
                 app.focus = Focus::Commits;
@@ -3090,6 +3184,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let content_area = split[1];
     app.diff_viewport = content_area.height;
     app.diff_content_area = content_area;
+    app.ensure_display_rows(content_area.width);
     app.clamp_scroll();
 
     let current = app.current_file();
@@ -3109,9 +3204,10 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let sticky = Paragraph::new(sticky_text).style(Style::default().bg(theme::SURFACE0));
     frame.render_widget(sticky, sticky_area);
 
-    let scroll = app.scroll as usize;
     let total = app.rendered.len();
-    let start = scroll.min(total);
+    let Some((start, first_row_offset)) = app.display_position(app.scroll) else {
+        return;
+    };
     let focus_rows = app.focus_rows();
     // Animation phase for the focus highlight, sampled once per frame: a brief
     // background flash when the span lands, then a slow breathing pulse on the
@@ -3137,12 +3233,10 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // pops above the standing landmarks.
     let ann_rows = app.annotation_rows();
     let ann_bar = theme::blend(theme::MAUVE, theme::BASE, 0.45);
-    let cursor = app.diff_cursor.map(|c| c as usize);
-    // `app.scroll` is a source-line offset; the window is built in visual
-    // rows. In nowrap mode each source line is one row; in wrap mode a line
-    // expands to its hanging-indent rows, so we keep consuming source lines
-    // until the viewport is full. Either way the per-frame clones stay
-    // bounded by the viewport height.
+    let cursor = app.diff_cursor;
+    // Begin at the indexed source line and skip any continuation rows above
+    // the visual scroll offset. Per-frame wrapping stays bounded by the
+    // viewport rather than walking from the start of the diff.
     let viewport_rows = content_area.height as usize;
     let mut window: Vec<Line<'static>> = Vec::with_capacity(viewport_rows);
     for line_idx in start..total {
@@ -3173,7 +3267,12 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         // run down every continuation of a wrapped line. Both bar kinds claim
         // the same gutter column; the cursor wins outright on its line rather
         // than stacking (which would corrupt the column).
-        for mut row in rows {
+        let skip = if line_idx == start {
+            first_row_offset
+        } else {
+            0
+        };
+        for mut row in rows.into_iter().skip(skip) {
             if window.len() >= viewport_rows {
                 break;
             }
@@ -3380,6 +3479,34 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn pathspec_colon_in_path_without_range() {
         // A trailing colon segment that isn't a number is part of the path.
         assert_eq!(parse_pathspec("weird:name"), ("weird:name", None, None));
+    }
+
+    #[test]
+    fn display_row_index_maps_both_directions() {
+        let lines = vec![
+            Line::from("one"),
+            Line::from("alpha beta gamma"),
+            Line::from("last"),
+        ];
+        let index = DisplayRowIndex::build(&lines, &[None, None, None], 5);
+
+        assert_eq!(index.starts, vec![0, 1, 4, 5]);
+        assert_eq!(index.total_rows(), 5);
+        assert_eq!(index.row_of_line(1), 1);
+        assert_eq!(index.line_at_row(0), Some((0, 0)));
+        assert_eq!(index.line_at_row(1), Some((1, 0)));
+        assert_eq!(index.line_at_row(3), Some((1, 2)));
+        assert_eq!(index.line_at_row(4), Some((2, 0)));
+    }
+
+    #[test]
+    fn display_row_index_clamps_past_the_end() {
+        let lines = vec![Line::from("one"), Line::from("two")];
+        let index = DisplayRowIndex::build(&lines, &[None, None], 80);
+
+        assert_eq!(index.row_of_line(99), 2);
+        assert_eq!(index.line_at_row(99), Some((1, 0)));
+        assert_eq!(DisplayRowIndex::default().line_at_row(0), None);
     }
 
     // file 0: header (None), lines 10,11,12 ; file 1: header (None), line 5
