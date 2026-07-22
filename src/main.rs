@@ -210,6 +210,18 @@ impl Focus {
     }
 }
 
+/// Visibility policy for a side pane (files / commits). `Auto` derives
+/// visibility from the change set — the pane pops in only when there's more
+/// than one file / commit to show. `Shown`/`Hidden` are explicit user
+/// overrides set by the toggle keys; once set, they survive reloads so the
+/// heuristic never re-opens a pane the user just dismissed (or vice versa).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PaneVis {
+    Auto,
+    Shown,
+    Hidden,
+}
+
 /// Where the rev cursor is sitting. `All` means "show the full range diff
 /// for the current base"; `Rev(i)` narrows to a single rev in `revs`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -348,8 +360,15 @@ struct App {
     /// here, `e` goes here" marker. Cleared on reload since the index is
     /// position-based, not path-resolved.
     diff_cursor: Option<u16>,
+    /// Resolved visibility for each side pane. Derived from `files_vis` /
+    /// `commits_vis` plus the current change counts via `resolve_panes`; the
+    /// draw and key-handling paths read these bools directly.
     pub show_files: bool,
     pub show_commits: bool,
+    /// Visibility policy behind `show_files` / `show_commits`. `Auto` until the
+    /// user hits a toggle key, then pinned to their choice.
+    files_vis: PaneVis,
+    commits_vis: PaneVis,
     /// GitHub-style "ignore whitespace" toggle. When on, diffs are computed
     /// with `-w` (`--ignore-all-space`), collapsing reindentation noise.
     ignore_ws: bool,
@@ -394,7 +413,7 @@ impl App {
         let file_rows = build_file_rows(&loaded.changes);
         let mut file_state = ListState::default();
         file_state.select(first_file_row(&file_rows));
-        Ok(Self {
+        let mut app = Self {
             worker,
             backend,
             bases,
@@ -415,7 +434,8 @@ impl App {
             h_scroll: 0,
             wrap: false,
             diff_viewport: 0,
-            focus: Focus::Files,
+            // Overwritten below once resolve_panes settles which panes are up.
+            focus: Focus::Diff,
             file_state,
             file_rows,
             files_area: Rect::default(),
@@ -428,23 +448,61 @@ impl App {
             focus_span: None,
             annotations: Vec::new(),
             diff_cursor: None,
-            show_files: true,
-            show_commits: true,
+            show_files: false,
+            show_commits: false,
+            files_vis: PaneVis::Auto,
+            commits_vis: PaneVis::Auto,
             ignore_ws: false,
             show_help: false,
             terminal_focused: true,
-        })
+        };
+        app.resolve_panes();
+        // Land focus on the diff unless the files pane opened on its own.
+        app.focus = if app.show_files {
+            Focus::Files
+        } else {
+            Focus::Diff
+        };
+        Ok(app)
     }
 
     fn base(&self) -> &Base {
         &self.bases[self.base_idx]
     }
 
-    fn toggle_files(&mut self) {
-        self.show_files = !self.show_files;
+    /// Recompute `show_files` / `show_commits` from the visibility policy and
+    /// the current change counts, then rescue focus off any pane that just
+    /// vanished. Called on every load and reload so `Auto` panes track the
+    /// live change set while explicit overrides stay pinned.
+    fn resolve_panes(&mut self) {
+        self.show_files = match self.files_vis {
+            PaneVis::Auto => self.changes.len() > 1,
+            PaneVis::Shown => true,
+            PaneVis::Hidden => false,
+        };
+        // `revs` is a ~20-entry history slice for the picker, not the diff's
+        // rev set — only the in-range ones count toward "more than one commit".
+        let range_revs = self.revs.iter().filter(|r| r.is_in_range).count();
+        self.show_commits = match self.commits_vis {
+            PaneVis::Auto => range_revs > 1,
+            PaneVis::Shown => true,
+            PaneVis::Hidden => false,
+        };
         if !self.show_files && self.focus == Focus::Files {
             self.focus = Focus::Diff;
         }
+        if !self.show_commits && self.focus == Focus::Commits {
+            self.focus = Focus::Diff;
+        }
+    }
+
+    fn toggle_files(&mut self) {
+        self.files_vis = if self.show_files {
+            PaneVis::Hidden
+        } else {
+            PaneVis::Shown
+        };
+        self.resolve_panes();
     }
 
     /// The scope implied by the current base + cursor. Source of truth for
@@ -563,10 +621,12 @@ impl App {
     }
 
     fn toggle_commits(&mut self) {
-        self.show_commits = !self.show_commits;
-        if !self.show_commits && self.focus == Focus::Commits {
-            self.focus = Focus::Diff;
-        }
+        self.commits_vis = if self.show_commits {
+            PaneVis::Hidden
+        } else {
+            PaneVis::Shown
+        };
+        self.resolve_panes();
     }
 
     /// Re-scans all pre-rendered lines, finding all occurrences of the query (case-insensitively, Unicode-safe).
@@ -865,6 +925,10 @@ impl App {
                 };
             }
         }
+
+        // Counts may have shifted (base cycle, watch-mode edit); let Auto panes
+        // pop in or out to match while explicit overrides hold.
+        self.resolve_panes();
 
         let new_idx = prev_path
             .and_then(|p| self.changes.iter().position(|c| c.path == p))
@@ -2365,18 +2429,16 @@ fn handle_event(
                     KeyCode::Char(']') => app.cycle_rev_next(),
                     KeyCode::Char('[') => app.cycle_rev_prev(),
                     KeyCode::Char('c') => {
-                        if !app.show_commits {
-                            app.show_commits = true;
-                        }
+                        app.commits_vis = PaneVis::Shown;
+                        app.resolve_panes();
                         app.focus = Focus::Commits;
                     }
                     KeyCode::Char('C') => {
                         app.toggle_commits();
                     }
                     KeyCode::Char('f') => {
-                        if !app.show_files {
-                            app.show_files = true;
-                        }
+                        app.files_vis = PaneVis::Shown;
+                        app.resolve_panes();
                         app.focus = Focus::Files;
                     }
                     KeyCode::Char('F') => {
