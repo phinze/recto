@@ -7,7 +7,7 @@ mod wrap;
 
 use std::collections::HashMap;
 use std::io::{self, stdout};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -2741,25 +2741,50 @@ fn is_interesting_event(event: &notify::Event) -> bool {
 
 /// Register a non-recursive inotify watch per source directory under `root`.
 /// We do the walk ourselves (instead of `RecursiveMode::Recursive`) so we can
-/// honor `.gitignore` / `.ignore` / `core.excludesFile` and skip hidden dirs
-/// like `.git`, `.jj`, `.direnv` — otherwise a `.direnv` full of vendored
-/// nixpkgs trees blows past `fs.inotify.max_user_watches` at startup.
+/// honor `.gitignore` / `.ignore` / `core.excludesFile` — and so we can prune
+/// only the VCS/direnv metadata dirs rather than every dotted directory.
 ///
-/// `WalkBuilder`'s default `standard_filters(true)` covers all of that, and
+/// The `WalkBuilder` default `hidden(true)` would skip *all* dotfiles, which
+/// silently drops live-reload for tracked files under `.github`, `.cargo`, and
+/// friends — the "missed a dotted file" bug. Instead we keep the gitignore
+/// filters on (they already prune `.direnv`, `target`, etc. here) and turn
+/// `hidden` off, adding an explicit override for the metadata dirs no
+/// `.gitignore` lists: `.git` and `.jj`. Otherwise a `.direnv` full of vendored
+/// nixpkgs trees blows past `fs.inotify.max_user_watches` at startup;
 /// `follow_links(false)` keeps us out of `/nix/store` reachable from
 /// `.direnv/flake-inputs/...source` symlinks.
 fn watch_tree_pruned(watcher: &mut impl Watcher, root: &Path) {
-    for entry in ignore::WalkBuilder::new(root)
+    for dir in watched_dirs(root) {
+        // One bad directory (permission, ENOSPC) shouldn't take down the whole
+        // watcher. We just lose live-reload for that subtree.
+        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
+    }
+}
+
+/// The directories under `root` we register watches on: every tracked directory
+/// except the VCS/direnv metadata dirs. Split out from [`watch_tree_pruned`] so
+/// the pruning rules can be exercised without a live `Watcher`.
+fn watched_dirs(root: &Path) -> Vec<PathBuf> {
+    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
+    // `!` inverts gitignore sense in an `Override`, so each entry *ignores* that
+    // dir. `.git`/`.jj` aren't gitignored (each VCS ignores its own metadata
+    // implicitly); `.direnv` is belt-and-suspenders since repos gitignore it.
+    for dir in [".git", ".jj", ".direnv"] {
+        overrides
+            .add(&format!("!{dir}/"))
+            .expect("static override glob is valid");
+    }
+    let overrides = overrides.build().expect("static overrides build");
+
+    ignore::WalkBuilder::new(root)
         .follow_links(false)
+        .hidden(false)
+        .overrides(overrides)
         .build()
         .flatten()
-    {
-        if entry.file_type().is_some_and(|ft| ft.is_dir()) {
-            // One bad directory (permission, ENOSPC) shouldn't take down
-            // the whole watcher. We just lose live-reload for that subtree.
-            let _ = watcher.watch(entry.path(), RecursiveMode::NonRecursive);
-        }
-    }
+        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_dir()))
+        .map(|entry| entry.path().to_path_buf())
+        .collect()
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
@@ -3646,5 +3671,67 @@ index 1111111..2222222 100644
             "second hunk should be numbered 110..=113; line_info = {:?}",
             rd.line_info
         );
+    }
+
+    /// A throwaway directory tree, removed on drop. Avoids a `tempfile`
+    /// dev-dependency for the one test that needs a real filesystem.
+    struct TempTree(PathBuf);
+
+    impl TempTree {
+        fn new(dirs: &[&str]) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let root = std::env::temp_dir().join(format!("recto-watched-dirs-{nonce}"));
+            for d in dirs {
+                std::fs::create_dir_all(root.join(d)).expect("create temp subtree");
+            }
+            Self(root)
+        }
+    }
+
+    impl Drop for TempTree {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
+    #[test]
+    fn watched_dirs_keeps_dotted_content_but_prunes_metadata() {
+        let tree = TempTree::new(&[
+            "src",
+            ".github/workflows",
+            ".git/objects",
+            ".jj",
+            ".direnv/flake-inputs",
+        ]);
+        let root = &tree.0;
+
+        let watched: std::collections::HashSet<PathBuf> = watched_dirs(root)
+            .into_iter()
+            .map(|p| p.strip_prefix(root).unwrap_or(&p).to_path_buf())
+            .collect();
+
+        // The regression fix: dotted directories with tracked content are
+        // watched, so edits under them still trigger live-reload.
+        assert!(watched.contains(Path::new("src")), "watched = {watched:?}");
+        assert!(
+            watched.contains(Path::new(".github")),
+            "watched = {watched:?}"
+        );
+        assert!(
+            watched.contains(Path::new(".github/workflows")),
+            "watched = {watched:?}"
+        );
+
+        // The metadata dirs stay pruned (and so do their subtrees) so we don't
+        // blow past the inotify watch budget.
+        for pruned in [".git", ".git/objects", ".jj", ".direnv"] {
+            assert!(
+                !watched.contains(Path::new(pruned)),
+                "{pruned} should be pruned; watched = {watched:?}"
+            );
+        }
     }
 }
