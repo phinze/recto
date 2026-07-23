@@ -3659,9 +3659,8 @@ index 1111111..2222222 100644
         // The added line in the second hunk is new-side line 111. With the
         // bug it lands around line 6 (counter never jumped to 110), so a focus
         // request for 111 resolves to nothing.
-        assert_eq!(
+        assert!(
             rows_for_span(&rd.line_info, 0, 111, 111).is_some(),
-            true,
             "second-hunk line 111 should be focusable; line_info = {:?}",
             rd.line_info
         );
