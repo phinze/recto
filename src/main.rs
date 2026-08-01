@@ -179,6 +179,13 @@ enum ClientCommand {
     Clear,
     /// Check that a recto is listening for this workspace.
     Ping,
+    /// Leave a review comment for an agent to pick up. SPEC is
+    /// `path:LINE=body` or `path:START-END=body`. Comments accumulate; run
+    /// this once per note.
+    Comment { spec: String },
+    /// Drain the pending review comments as agent-ready markdown, clearing
+    /// them from the running recto.
+    Comments,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -315,6 +322,17 @@ struct Annotation {
     label: String,
 }
 
+/// A reviewer-authored note waiting to be handed to an agent. Anchored the same
+/// way an [`Annotation`] is, but it flows the other direction: the agent writes
+/// annotations for us to read, we write these for the agent to drain.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct Comment {
+    path: String,
+    start: u32,
+    end: u32,
+    body: String,
+}
+
 /// Cached mapping between rendered source lines and the visual rows they
 /// occupy after wrapping. `starts[i]` is the first visual row of source line
 /// `i`; the final sentinel is the total visual-row count.
@@ -415,6 +433,11 @@ struct App {
     /// Companion-driven tour annotations, in step order. Sticky like
     /// `focus_span`; replaced wholesale by each `annotate` request.
     annotations: Vec<Annotation>,
+    /// Reviewer comments awaiting a drain, in authoring order. Deliberately not
+    /// on any clear path: `clear`, Esc and `q` all drop the agent's tour, and
+    /// sweeping up our own undelivered notes alongside it would be data loss.
+    /// Draining is the only thing that empties this.
+    comments: Vec<Comment>,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
     /// here, `e` goes here" marker. Cleared on reload since the index is
@@ -509,6 +532,7 @@ impl App {
             search_active_idx: None,
             focus_span: None,
             annotations: Vec::new(),
+            comments: Vec::new(),
             diff_cursor: None,
             show_files: false,
             show_commits: false,
@@ -1226,6 +1250,7 @@ impl App {
             capabilities: link::Capabilities::recto(),
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
+            pending_comments: self.comments.len(),
         }
     }
 
@@ -1235,6 +1260,9 @@ impl App {
             link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
             link::Request::Annotate { sites } => self.annotate(sites),
+            // Deliberately leaves `comments` alone: `clear` is how an agent
+            // tidies up its own tour, and it has no business discarding review
+            // notes it hasn't read yet.
             link::Request::Clear => {
                 self.focus_span = None;
                 if !self.annotations.is_empty() {
@@ -1243,6 +1271,13 @@ impl App {
                 }
                 link::Response::ok()
             }
+            link::Request::Comment {
+                path,
+                start,
+                end,
+                body,
+            } => self.add_comment(&path, start, end, body),
+            link::Request::Comments => self.drain_comments(),
         }
     }
 
@@ -1350,6 +1385,19 @@ impl App {
             };
             inserts.push((*rows.start(), note_line(i + 1, &a.label)));
         }
+        for (i, c) in self.comments.iter().enumerate() {
+            let Some(file_idx) = self.changes.iter().position(|ch| ch.path == c.path) else {
+                continue;
+            };
+            let Some(rows) = rows_for_span(&self.base_line_info, file_idx, c.start, c.end) else {
+                continue;
+            };
+            // A comment body can be several lines; each gets its own row so a
+            // long note stays readable instead of being truncated to a preview.
+            for (j, text) in c.body.lines().enumerate() {
+                inserts.push((*rows.start(), comment_line(i + 1, text, j == 0)));
+            }
+        }
         if inserts.is_empty() {
             self.rendered = self.base_rendered.clone();
             self.file_starts = self.base_file_starts.clone();
@@ -1433,6 +1481,101 @@ impl App {
         }
     }
 
+    /// Append a reviewer comment and weave it into the render. Unlike
+    /// `annotate` this accumulates rather than replacing — a review is built up
+    /// one note at a time. Refuses spans that aren't on screen, since a comment
+    /// the reviewer can't see is one they can't trust they actually left.
+    fn add_comment(
+        &mut self,
+        path: &str,
+        start: u32,
+        end: Option<u32>,
+        body: String,
+    ) -> link::Response {
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return link::Response::err("comment body is empty");
+        }
+        let end = end.unwrap_or(start).max(start);
+        let Some(file_idx) = self.changes.iter().position(|c| c.path == path) else {
+            return link::Response::err(format!("not in current diff: {path}"));
+        };
+        if rows_for_span(&self.base_line_info, file_idx, start, end).is_none() {
+            return link::Response::err(format!(
+                "{path}:{start}-{end} not in current diff (outside any shown hunk)"
+            ));
+        }
+        self.comments.push(Comment {
+            path: path.to_string(),
+            start,
+            end,
+            body,
+        });
+        self.reweave();
+        if let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end) {
+            self.reveal_span(&rows);
+            self.take_diff_focus();
+        }
+        link::Response::ok_note(format!("{} pending", self.comments.len()))
+    }
+
+    /// Hand over every pending comment and clear the set. Clear-on-read is the
+    /// whole contract: delivered means gone, so the reviewer never wonders
+    /// whether a note was picked up, and the agent never re-reads stale notes.
+    fn drain_comments(&mut self) -> link::Response {
+        let drained: Vec<link::Comment> = std::mem::take(&mut self.comments)
+            .into_iter()
+            .enumerate()
+            .map(|(i, c)| link::Comment {
+                n: i + 1,
+                snippet: self.snippet_for(&c.path, c.start, c.end),
+                path: c.path,
+                start: c.start,
+                end: c.end,
+                body: c.body,
+            })
+            .collect();
+        self.reweave();
+        link::Response::ok_comments(drained)
+    }
+
+    /// Quote the diff rows a comment points at, plus a little context, reading
+    /// off the pristine render so woven note rows never land in the quote. The
+    /// agent edits as soon as it reads this, so `path:line` is stale on arrival
+    /// while the quoted text still says what the reviewer meant.
+    fn snippet_for(&self, path: &str, start: u32, end: u32) -> Option<Vec<link::SnippetRow>> {
+        let file_idx = self.changes.iter().position(|c| c.path == path)?;
+        let span = rows_for_span(&self.base_line_info, file_idx, start, end)?;
+        // Walk out from the span for context, stopping at anything that isn't a
+        // body row of this file — a hunk header or file separator is exactly
+        // where the quote should end.
+        let belongs = |row: usize| matches!(self.base_line_info.get(row), Some(Some((fi, _))) if *fi == file_idx);
+        let floor = span.start().saturating_sub(SNIPPET_CONTEXT);
+        let mut first = *span.start();
+        while first > floor && belongs(first - 1) {
+            first -= 1;
+        }
+        let ceiling =
+            (span.end() + SNIPPET_CONTEXT).min(self.base_rendered.len().saturating_sub(1));
+        let mut last = *span.end();
+        while last < ceiling && belongs(last + 1) {
+            last += 1;
+        }
+        let rows: Vec<link::SnippetRow> = (first..=last)
+            .filter_map(|row| {
+                let line = self.base_rendered.get(row)?;
+                let (sign, number) = gutter_signature(line)?;
+                Some(link::SnippetRow {
+                    line: number,
+                    sign,
+                    text: body_text(line),
+                    commented: span.contains(&row),
+                })
+            })
+            .collect();
+        (!rows.is_empty()).then_some(rows)
+    }
+
     /// Rendered-row ranges for the annotations, in step order, resolved
     /// against the current (woven) render — the same re-resolution discipline
     /// as `focus_rows`. Unresolvable sites are skipped, not placeholders.
@@ -1442,6 +1585,18 @@ impl App {
             .filter_map(|a| {
                 let file_idx = self.changes.iter().position(|c| c.path == a.path)?;
                 rows_for_span(&self.line_info, file_idx, a.start, a.end)
+            })
+            .collect()
+    }
+
+    /// Rendered-row ranges for the pending comments, re-resolved against the
+    /// current render just like `annotation_rows`.
+    fn comment_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
+        self.comments
+            .iter()
+            .filter_map(|c| {
+                let file_idx = self.changes.iter().position(|ch| ch.path == c.path)?;
+                rows_for_span(&self.line_info, file_idx, c.start, c.end)
             })
             .collect()
     }
@@ -2200,6 +2355,16 @@ fn run_client(command: ClientCommand) -> i32 {
                     }
                 }
             }
+            // A drain's payload is markdown on stdout, so it can be piped
+            // straight into a prompt. An empty drain writes nothing there —
+            // "no comments" belongs on stderr with the other asides.
+            if let Some(comments) = &resp.comments {
+                if comments.is_empty() {
+                    eprintln!("recto: no review comments pending");
+                } else {
+                    print!("{}", render_comments_markdown(comments));
+                }
+            }
             if let Some(note) = resp.note {
                 eprintln!("recto: {note}");
             }
@@ -2259,7 +2424,59 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 .collect::<Result<Vec<_>>>()?;
             Ok(link::Request::Annotate { sites })
         }
+        ClientCommand::Comments => Ok(link::Request::Comments),
+        ClientCommand::Comment { spec } => {
+            let (pathspec, body) = spec
+                .split_once('=')
+                .ok_or_else(|| anyhow!("missing `=body` in comment spec: {spec}"))?;
+            let (raw_path, start, end) = parse_pathspec(pathspec);
+            let start = start.ok_or_else(|| anyhow!("missing `:LINE` in comment spec: {spec}"))?;
+            let cwd = std::env::current_dir()?;
+            let root = link::workspace_root(&cwd)
+                .ok_or_else(|| anyhow!("not inside a jj or git repository"))?;
+            Ok(link::Request::Comment {
+                path: normalize_path(&cwd, &root, raw_path),
+                start,
+                end,
+                body: body.to_string(),
+            })
+        }
     }
+}
+
+/// Format a drained comment set as the markdown an agent reads. Each note leads
+/// with its number and `path:line`, then quotes the diff rows it points at, so
+/// the agent can act without re-opening the file — and so the note still makes
+/// sense after its own edits have moved those line numbers.
+fn render_comments_markdown(comments: &[link::Comment]) -> String {
+    let mut out = format!("# Review comments ({})\n\n", comments.len());
+    out.push_str(
+        "Notes the user left in recto on the current diff. They have been \
+         drained and are no longer pending. Line numbers are new-side; `>` \
+         marks the lines a note points at.\n",
+    );
+    for c in comments {
+        let span = if c.end > c.start {
+            format!("{}-{}", c.start, c.end)
+        } else {
+            c.start.to_string()
+        };
+        out.push_str(&format!(
+            "\n## {}. {}:{}\n\n{}\n",
+            c.n, c.path, span, c.body
+        ));
+        let Some(rows) = &c.snippet else { continue };
+        out.push_str(&format!("\n```{}\n", ext_for_path(&c.path)));
+        for r in rows {
+            let mark = if r.commented { '>' } else { ' ' };
+            match r.line {
+                Some(n) => out.push_str(&format!("{mark}{n:>5} {} {}\n", r.sign, r.text)),
+                None => out.push_str(&format!("{mark}      {} {}\n", r.sign, r.text)),
+            }
+        }
+        out.push_str("```\n");
+    }
+    out
 }
 
 /// Split `path`, `path:LINE`, or `path:START-END` into its parts. Only treats
@@ -2843,6 +3060,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         };
         header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
     }
+    // Pending comments are invisible once you scroll away from them, and the
+    // whole point is that they're waiting on an agent, so keep the count in
+    // view until something drains it.
+    if !app.comments.is_empty() {
+        let n = app.comments.len();
+        header_spans.push(Span::styled(
+            format!(" · ❶ {n} comment{} pending", if n == 1 { "" } else { "s" }),
+            Style::default().fg(theme::PEACH),
+        ));
+    }
     if !app.terminal_focused {
         // Recolor in place rather than restyling the Paragraph: per-span fg wins
         // over a base style, so we have to overwrite each span to read as dimmed.
@@ -3258,6 +3485,11 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // pops above the standing landmarks.
     let ann_rows = app.annotation_rows();
     let ann_bar = theme::blend(theme::MAUVE, theme::BASE, 0.45);
+    // Pending comments get the same treatment in peach. They outrank the tour
+    // in the gutter: the agent's map is scenery, my undelivered notes are the
+    // thing still waiting on someone.
+    let comment_rows = app.comment_rows();
+    let comment_bar = theme::blend(theme::PEACH, theme::BASE, 0.45);
     let cursor = app.diff_cursor;
     // Begin at the indexed source line and skip any continuation rows above
     // the visual scroll offset. Per-frame wrapping stays bounded by the
@@ -3288,6 +3520,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         };
         let focused = focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx));
         let annotated = ann_rows.iter().any(|r| r.contains(&line_idx));
+        let commented = comment_rows.iter().any(|r| r.contains(&line_idx));
         // Markers apply per visual row, so the flash wash and the bar colors
         // run down every continuation of a wrapped line. Both bar kinds claim
         // the same gutter column; the cursor wins outright on its line rather
@@ -3308,6 +3541,8 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 apply_gutter_bar(&mut row, theme::TEAL);
             } else if focused {
                 apply_gutter_bar(&mut row, focus_bar);
+            } else if commented {
+                apply_gutter_bar(&mut row, comment_bar);
             } else if annotated {
                 apply_gutter_bar(&mut row, ann_bar);
             }
@@ -3346,6 +3581,40 @@ fn rows_for_span(
     Some(first?..=last?)
 }
 
+/// Number of surrounding diff rows quoted on each side of a comment's span, so
+/// the agent can place the note without opening the file.
+const SNIPPET_CONTEXT: usize = 3;
+
+/// Recover a body row's diff sign and new-side line number from its rendered
+/// gutter. `diff_body_line` lays every body row out as four leading spans (old
+/// number, new number, marker, pad), so the two number columns say which side
+/// the row belongs to without having to sniff the marker's color. `None` for
+/// anything that isn't a body row — hunk headers, separators, woven notes.
+fn gutter_signature(line: &Line<'static>) -> Option<(char, Option<u32>)> {
+    if line.spans.len() < 4 {
+        return None;
+    }
+    let column = |i: usize| line.spans[i].content.trim().parse::<u32>().ok();
+    let (old, new) = (column(0), column(1));
+    let sign = match (old.is_some(), new.is_some()) {
+        (false, true) => '+',
+        (true, false) => '-',
+        _ => ' ',
+    };
+    Some((sign, new))
+}
+
+/// The code on a rendered body row, with the four gutter spans stripped off.
+fn body_text(line: &Line<'static>) -> String {
+    line.spans
+        .iter()
+        .skip(4)
+        .map(|s| s.content.as_ref())
+        .collect::<String>()
+        .trim_end()
+        .to_string()
+}
+
 /// Circled-digit badges for steps 1–9, the keyboard-reachable ones; later
 /// steps fall back to plain `n.`.
 const STEP_BADGES: [&str; 9] = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
@@ -3374,6 +3643,39 @@ fn note_line(n: usize, label: &str) -> Line<'static> {
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::ITALIC),
         ),
+    ])
+    .style(Style::default().bg(theme::SURFACE0))
+}
+
+/// Filled counterparts to [`STEP_BADGES`], marking comments as the same kind of
+/// object as a tour step but authored from the other side of the link.
+const COMMENT_BADGES: [&str; 9] = ["❶", "❷", "❸", "❹", "❺", "❻", "❼", "❽", "❾"];
+
+fn comment_badge(n: usize) -> String {
+    COMMENT_BADGES
+        .get(n - 1)
+        .map(|s| (*s).to_string())
+        .unwrap_or_else(|| format!("{n}."))
+}
+
+/// Render one row of a pending comment — `╭─ ❶ body`, peach against the tour's
+/// mauve so at a glance it's obvious which notes are mine and which are the
+/// agent's. Continuation rows carry the box rule but no badge.
+fn comment_line(n: usize, text: &str, first: bool) -> Line<'static> {
+    let (rule, marker) = if first {
+        (" ╭─ ", comment_badge(n))
+    } else {
+        (" │  ", " ".into())
+    };
+    Line::from(vec![
+        Span::styled(rule, Style::default().fg(theme::OVERLAY0)),
+        Span::styled(
+            marker,
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!(" {text}"), Style::default().fg(theme::TEXT)),
     ])
     .style(Style::default().bg(theme::SURFACE0))
 }
@@ -3562,6 +3864,104 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn span_rows_none_when_outside_hunk() {
         // Lines 50-60 of file 0 aren't in the diff at all.
         assert_eq!(rows_for_span(&sample_line_info(), 0, 50, 60), None);
+    }
+
+    /// Render a body row the way `render_diff` does, so the gutter readers are
+    /// tested against real output rather than a hand-built approximation.
+    fn body_row(line: &str, old_no: Option<u32>, new_no: Option<u32>) -> Line<'static> {
+        diff_body_line(
+            line,
+            "rs",
+            &Highlighter::new(),
+            old_no,
+            new_no,
+            Gutter { old_w: 3, new_w: 3 },
+            None,
+        )
+    }
+
+    /// The snippet reader recovers a row's diff sign from which line-number
+    /// columns are populated, and quotes the new-side number only. Removed rows
+    /// have no new-side number, which is what tells them apart from context.
+    #[test]
+    fn gutter_signature_reads_each_side() {
+        let added = body_row("+    let b = 3;", None, Some(42));
+        assert_eq!(gutter_signature(&added), Some(('+', Some(42))));
+        assert_eq!(body_text(&added), "    let b = 3;");
+
+        let removed = body_row("-    let b = 2;", Some(41), None);
+        assert_eq!(gutter_signature(&removed), Some(('-', None)));
+        assert_eq!(body_text(&removed), "    let b = 2;");
+
+        let context = body_row(" fn main() {", Some(40), Some(40));
+        assert_eq!(gutter_signature(&context), Some((' ', Some(40))));
+        assert_eq!(body_text(&context), "fn main() {");
+    }
+
+    /// Rows that aren't diff bodies must not be quoted into a snippet. A woven
+    /// note row is the dangerous one: it sits inside the diff stream and would
+    /// otherwise echo an agent's own annotation back to it as if it were code.
+    #[test]
+    fn gutter_signature_rejects_non_body_rows() {
+        assert_eq!(gutter_signature(&note_line(1, "Step 1: parse")), None);
+        assert_eq!(gutter_signature(&comment_line(1, "why 3?", true)), None);
+        assert_eq!(gutter_signature(&hunk_header("@@ -1,3 +1,4 @@")), None);
+    }
+
+    /// The drain's markdown is the actual agent-facing contract: number and
+    /// location first so a note is addressable, then the body, then the quoted
+    /// rows with `>` on the ones being commented on.
+    #[test]
+    fn comment_markdown_quotes_the_span() {
+        let md = render_comments_markdown(&[link::Comment {
+            n: 1,
+            path: "src/main.rs".into(),
+            start: 42,
+            end: 42,
+            body: "why 3?".into(),
+            snippet: Some(vec![
+                link::SnippetRow {
+                    line: Some(41),
+                    sign: ' ',
+                    text: "let a = 1;".into(),
+                    commented: false,
+                },
+                link::SnippetRow {
+                    line: None,
+                    sign: '-',
+                    text: "let b = 2;".into(),
+                    commented: true,
+                },
+                link::SnippetRow {
+                    line: Some(42),
+                    sign: '+',
+                    text: "let b = 3;".into(),
+                    commented: true,
+                },
+            ]),
+        }]);
+        assert!(md.starts_with("# Review comments (1)\n"));
+        assert!(md.contains("## 1. src/main.rs:42\n\nwhy 3?\n"));
+        assert!(md.contains("```rs\n"));
+        assert!(md.contains("    41   let a = 1;\n"));
+        assert!(md.contains(">      - let b = 2;\n"));
+        assert!(md.contains(">   42 + let b = 3;\n"));
+    }
+
+    /// A range renders as `start-end`, and a comment whose span fell out of the
+    /// diff still has to arrive — just without its quote.
+    #[test]
+    fn comment_markdown_handles_ranges_and_missing_snippets() {
+        let md = render_comments_markdown(&[link::Comment {
+            n: 2,
+            path: "src/link.rs".into(),
+            start: 10,
+            end: 14,
+            body: "extract this".into(),
+            snippet: None,
+        }]);
+        assert!(md.contains("## 2. src/link.rs:10-14\n\nextract this\n"));
+        assert!(!md.contains("```"));
     }
 
     fn change(path: &str) -> FileChange {

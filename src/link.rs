@@ -36,6 +36,20 @@ pub enum Request {
     Clear,
     /// Liveness check.
     Ping,
+    /// Pin a reviewer-authored comment to a span, appended to the pending set.
+    /// `start`/`end` are new-side line numbers like `Focus`. Unlike `Annotate`
+    /// (one tour, replaced wholesale) comments accumulate: each call adds one.
+    Comment {
+        path: String,
+        start: u32,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end: Option<u32>,
+        body: String,
+    },
+    /// Drain the pending reviewer comments: hand them over and clear the set.
+    /// Delivered means gone, so a drain that loses its reply loses the notes —
+    /// which is why this is never queued behind an editor handoff.
+    Comments,
 }
 
 /// One labeled site in an [`Request::Annotate`] set. `start`/`end` are
@@ -50,11 +64,43 @@ pub struct Site {
     pub label: String,
 }
 
+/// One reviewer comment handed back by a [`Request::Comments`] drain. Carries
+/// the anchoring snippet alongside the body: the agent starts editing the
+/// moment it reads this, so `path:line` goes stale almost immediately while the
+/// quoted text stays meaningful.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Comment {
+    /// 1-based position in the drained set, matching the on-screen badge.
+    pub n: usize,
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+    pub body: String,
+    /// The diff rows around the span, absent when the span no longer resolves
+    /// against the diff recto is currently showing.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<Vec<SnippetRow>>,
+}
+
+/// One row of a comment's snippet, mirroring what the reviewer had on screen:
+/// the new-side line number (absent on removed lines), the diff sign, and the
+/// body text. `commented` marks the rows the comment actually points at, as
+/// opposed to the surrounding context.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct SnippetRow {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub line: Option<u32>,
+    pub sign: char,
+    pub text: String,
+    pub commented: bool,
+}
+
 /// Reply to a [`Request`]. `error` carries the reason when `ok` is false, so a
 /// driving agent can learn (e.g.) that a target wasn't in the current diff.
 /// `note` carries an informational aside on success — e.g. that recto was in an
 /// editor and drove neovim directly rather than scrolling the TUI. `status` is
 /// the machine-readable snapshot a [`Request::Ping`] asks for; absent otherwise.
+/// `comments` is the drained set a [`Request::Comments`] asks for.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Response {
     pub ok: bool,
@@ -64,6 +110,8 @@ pub struct Response {
     pub note: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub comments: Option<Vec<Comment>>,
 }
 
 /// What a [`Request::Ping`] reports back: recto's identity, current diff, and
@@ -97,6 +145,11 @@ pub struct Status {
     pub focus: bool,
     /// Number of active tour annotations.
     pub annotations: usize,
+    /// Reviewer comments waiting for a `recto comments` drain. This is how an
+    /// agent discovers them: the skill already says to ping first, so notes get
+    /// found without the user having to remember to mention them.
+    #[serde(default)]
+    pub pending_comments: usize,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -186,24 +239,28 @@ impl Response {
             error: None,
             note: None,
             status: None,
+            comments: None,
         }
     }
 
     pub fn ok_note(msg: impl Into<String>) -> Self {
         Self {
-            ok: true,
-            error: None,
             note: Some(msg.into()),
-            status: None,
+            ..Self::ok()
         }
     }
 
     pub fn ok_status(status: Status) -> Self {
         Self {
-            ok: true,
-            error: None,
-            note: None,
             status: Some(status),
+            ..Self::ok()
+        }
+    }
+
+    pub fn ok_comments(comments: Vec<Comment>) -> Self {
+        Self {
+            comments: Some(comments),
+            ..Self::ok()
         }
     }
 
@@ -211,8 +268,7 @@ impl Response {
         Self {
             ok: false,
             error: Some(msg.into()),
-            note: None,
-            status: None,
+            ..Self::ok()
         }
     }
 }
@@ -454,6 +510,19 @@ fn handle_while_in_editor(
             queue(tx, request.clone());
             Response::ok_note("recto is in an editor; annotations will apply when you return")
         }
+        // Adding a comment is pure state, so queuing loses nothing: it lands
+        // when the loop resumes. This is the `!recto comment …` path out of
+        // neovim, so it has to keep working while we're parked here.
+        Request::Comment { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; the comment will land when you return")
+        }
+        // A drain must never be queued. `queue` discards the response, and a
+        // drained comment is gone from recto — queuing one would delete the
+        // user's notes and hand them to nobody. Refuse instead.
+        Request::Comments => {
+            Response::err("recto is in an editor; leave it before draining comments")
+        }
     }
 }
 
@@ -639,6 +708,7 @@ mod tests {
             capabilities: Capabilities::recto(),
             focus: false,
             annotations: 0,
+            pending_comments: 2,
         });
         let json = serde_json::to_string(&resp).expect("serialize");
         let back: Response = serde_json::from_str(&json).expect("round trip");
@@ -646,6 +716,7 @@ mod tests {
         assert_eq!(status.backend, "jj");
         assert_eq!(status.base, "@-");
         assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
+        assert_eq!(status.pending_comments, 2);
         assert_eq!(status.surface, Surface::Recto);
         assert_eq!(
             status.capabilities.focus,
@@ -668,6 +739,8 @@ mod tests {
         let old: Status = serde_json::from_str(old_status).expect("old status parses");
         assert_eq!(old.surface, Surface::Recto);
         assert_eq!(old.capabilities, Capabilities::recto());
+        // A recto too old to know about comments simply has none pending.
+        assert_eq!(old.pending_comments, 0);
 
         // A bare ok() stays status-free on the wire for older clients.
         assert!(
@@ -697,6 +770,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                pending_comments: 0,
             },
         );
         let (tx, _rx) = mpsc::channel::<Incoming>();
@@ -739,6 +813,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                pending_comments: 0,
             },
         );
         let (tx, _rx) = mpsc::channel::<Incoming>();
@@ -755,6 +830,132 @@ mod tests {
             status.capabilities.annotate,
             Capability::deferred(TargetScope::CurrentDiff)
         );
+    }
+
+    /// Pin the comment wire shape alongside `annotate`'s: reviewers reach this
+    /// through the CLI, but `!recto comment …` from an editor hand-writes it.
+    #[test]
+    fn comment_wire_format() {
+        let json = r#"{"cmd":"comment","path":"src/main.rs","start":42,"body":"why 3?"}"#;
+        let req: Request = serde_json::from_str(json).expect("parse");
+        let Request::Comment {
+            path,
+            start,
+            end,
+            body,
+        } = req
+        else {
+            panic!("expected Comment, got {req:?}");
+        };
+        assert_eq!(path, "src/main.rs");
+        assert_eq!(start, 42);
+        assert_eq!(end, None);
+        assert_eq!(body, "why 3?");
+
+        let drain: Request = serde_json::from_str(r#"{"cmd":"comments"}"#).expect("parse");
+        assert!(matches!(drain, Request::Comments));
+    }
+
+    /// The drained payload is what the agent actually reads, so its field names
+    /// are a contract — including the per-row snippet shape.
+    #[test]
+    fn drained_comment_wire_format() {
+        let resp = Response::ok_comments(vec![Comment {
+            n: 1,
+            path: "src/main.rs".into(),
+            start: 42,
+            end: 42,
+            body: "why 3?".into(),
+            snippet: Some(vec![
+                SnippetRow {
+                    line: Some(41),
+                    sign: ' ',
+                    text: "let a = 1;".into(),
+                    commented: false,
+                },
+                SnippetRow {
+                    line: None,
+                    sign: '-',
+                    text: "let b = 2;".into(),
+                    commented: true,
+                },
+                SnippetRow {
+                    line: Some(42),
+                    sign: '+',
+                    text: "let b = 3;".into(),
+                    commented: true,
+                },
+            ]),
+        }]);
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let back: Response = serde_json::from_str(&json).expect("round trip");
+        let comments = back.comments.expect("comments present");
+        assert_eq!(comments.len(), 1);
+        assert_eq!(comments[0].n, 1);
+        assert_eq!(comments[0].body, "why 3?");
+        let rows = comments[0].snippet.as_ref().expect("snippet present");
+        assert_eq!(rows.len(), 3);
+        // Removed rows carry the sign but no new-side number, and drop the key
+        // entirely on the wire rather than emitting a null.
+        assert_eq!(rows[1].sign, '-');
+        assert_eq!(rows[1].line, None);
+        assert!(!json.contains("\"line\":null"));
+
+        // A bare ok() stays comments-free, so `ping` and friends are unchanged.
+        assert!(
+            !serde_json::to_string(&Response::ok())
+                .expect("serialize ok")
+                .contains("comments")
+        );
+    }
+
+    /// A drain that arrives while recto is parked in an editor must be refused,
+    /// never queued: `queue` throws the response away, so queuing a drain would
+    /// clear the user's comments and deliver them nowhere.
+    #[test]
+    fn drain_in_editor_is_refused_not_queued() {
+        let editor = EditorLink::default();
+        editor.enter(
+            None,
+            Status {
+                version: "0.1.0".into(),
+                pid: 7,
+                backend: "jj".into(),
+                workspace_root: "/tmp/repo".into(),
+                base: "@-".into(),
+                scope: "range".into(),
+                files: vec!["a.rs".into()],
+                surface: Surface::Recto,
+                capabilities: Capabilities::recto(),
+                focus: false,
+                annotations: 0,
+                pending_comments: 3,
+            },
+        );
+        let (tx, rx) = mpsc::channel::<Incoming>();
+
+        let resp = handle_while_in_editor(&Request::Comments, &tx, &editor);
+        assert!(!resp.ok, "drain must fail while parked in an editor");
+        assert!(resp.comments.is_none());
+        assert!(
+            rx.try_recv().is_err(),
+            "a drain must not reach the main loop's queue"
+        );
+
+        // Authoring, by contrast, is queued and lands on return.
+        let resp = handle_while_in_editor(
+            &Request::Comment {
+                path: "a.rs".into(),
+                start: 1,
+                end: None,
+                body: "note".into(),
+            },
+            &tx,
+            &editor,
+        );
+        assert!(resp.ok);
+        let queued = rx.try_recv().expect("comment reaches the main loop");
+        assert!(matches!(queued.request, Request::Comment { .. }));
     }
 
     #[test]
