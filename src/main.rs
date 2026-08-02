@@ -288,6 +288,58 @@ fn first_file_row(rows: &[FileRow]) -> Option<usize> {
 enum Mode {
     Normal,
     SearchInput { query: String },
+    CommentInput(CommentDraft),
+}
+
+/// A comment being written. The anchor is captured when the modal opens rather
+/// than read at submit time, so a diff reload mid-sentence can't move the note
+/// to a different line than the one the reviewer was looking at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct CommentDraft {
+    path: String,
+    line: u32,
+    body: String,
+    /// Caret position as a character index into `body`.
+    caret: usize,
+    /// Why the last submit bounced, shown in the modal so the text isn't lost.
+    error: Option<String>,
+}
+
+impl CommentDraft {
+    fn byte_at(&self, caret: usize) -> usize {
+        self.body
+            .char_indices()
+            .nth(caret)
+            .map_or(self.body.len(), |(b, _)| b)
+    }
+
+    fn insert(&mut self, c: char) {
+        let at = self.byte_at(self.caret);
+        self.body.insert(at, c);
+        self.caret += 1;
+    }
+
+    fn backspace(&mut self) {
+        if self.caret == 0 {
+            return;
+        }
+        let at = self.byte_at(self.caret - 1);
+        self.body.remove(at);
+        self.caret -= 1;
+    }
+
+    fn len(&self) -> usize {
+        self.body.chars().count()
+    }
+
+    /// Caret position as (row, column) within the wrapped-free body, for
+    /// placing the terminal cursor in the modal.
+    fn caret_rc(&self) -> (usize, usize) {
+        let before: String = self.body.chars().take(self.caret).collect();
+        let row = before.matches('\n').count();
+        let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count());
+        (row, col)
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1682,6 +1734,21 @@ impl App {
         self.clamp_scroll();
     }
 
+    /// The file and new-side line the cursor sits on — the anchor a comment
+    /// gets pinned to. Falls back to the top of the viewport when no cursor has
+    /// been placed, matching how `e` picks its target.
+    fn cursor_target(&self) -> Option<(String, u32)> {
+        let line = self
+            .diff_cursor
+            .or_else(|| self.source_line_at_row(self.scroll))?;
+        let (file_idx, line_no) = self
+            .line_info
+            .iter()
+            .skip(line)
+            .find_map(|info| info.as_ref().copied())?;
+        Some((self.changes.get(file_idx)?.path.clone(), line_no))
+    }
+
     /// Index into `changes` of the file owning the current scroll position.
     fn current_file(&self) -> Option<usize> {
         let source_line = self.source_line_at_row(self.scroll)?;
@@ -2801,6 +2868,43 @@ fn handle_event(
                     }
                     _ => {}
                 },
+                Mode::CommentInput(draft) => {
+                    let ctrl = key.modifiers.contains(event::KeyModifiers::CONTROL);
+                    let alt = key.modifiers.contains(event::KeyModifiers::ALT);
+                    let shift = key.modifiers.contains(event::KeyModifiers::SHIFT);
+                    match key.code {
+                        KeyCode::Esc => app.mode = Mode::Normal,
+                        // Newline needs a modifier because plain Enter submits.
+                        // Alt+Enter is the one every terminal can express:
+                        // Ctrl+J is literally the same byte as Enter unless the
+                        // kitty protocol is on, and Shift+Enter needs it too.
+                        // Both are accepted for terminals that do distinguish.
+                        KeyCode::Enter if alt || shift => draft.insert('\n'),
+                        KeyCode::Char('j') if ctrl => draft.insert('\n'),
+                        KeyCode::Enter => {
+                            let body = draft.body.trim().to_string();
+                            if body.is_empty() {
+                                app.mode = Mode::Normal;
+                            } else {
+                                let resp = app.add_comment(&draft.path, draft.line, None, body);
+                                if resp.ok {
+                                    app.mode = Mode::Normal;
+                                } else {
+                                    // Keep the draft on screen; the reviewer
+                                    // shouldn't lose a paragraph to a reload.
+                                    draft.error = resp.error;
+                                }
+                            }
+                        }
+                        KeyCode::Backspace => draft.backspace(),
+                        KeyCode::Left => draft.caret = draft.caret.saturating_sub(1),
+                        KeyCode::Right => draft.caret = (draft.caret + 1).min(draft.len()),
+                        KeyCode::Home => draft.caret = 0,
+                        KeyCode::End => draft.caret = draft.len(),
+                        KeyCode::Char(c) if !ctrl => draft.insert(c),
+                        _ => {}
+                    }
+                }
                 // Help overlay is up: any key dismisses it and is otherwise
                 // swallowed, so the binding it names doesn't also fire.
                 Mode::Normal if app.show_help => {
@@ -2923,10 +3027,28 @@ fn handle_event(
                     }
                     KeyCode::Char('n') => app.search_next(),
                     KeyCode::Char('N') => app.search_prev(),
+                    KeyCode::Char('m') => {
+                        if let Some((path, line)) = app.cursor_target() {
+                            app.mode = Mode::CommentInput(CommentDraft {
+                                path,
+                                line,
+                                body: String::new(),
+                                caret: 0,
+                                error: None,
+                            });
+                            mode = app.mode.clone();
+                        }
+                    }
                     _ => {}
                 },
             }
-            if let Mode::SearchInput { .. } = app.mode {
+            // Write the edited clone back only if we're still in the mode that
+            // owns it: submitting or cancelling sets `app.mode` directly, and
+            // that decision has to win over the draft we were mutating.
+            if matches!(
+                app.mode,
+                Mode::SearchInput { .. } | Mode::CommentInput { .. }
+            ) {
                 app.mode = mode;
             }
         }
@@ -3212,7 +3334,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     }
                     Focus::Diff => {
                         format!(
-                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · e edit · ? help"
+                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · m comment · e edit · ? help"
                         )
                     }
                 },
@@ -3237,8 +3359,65 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
     }
 
+    if let Mode::CommentInput(draft) = &app.mode {
+        draw_comment_input(frame, frame.area(), draft);
+    }
+
     if app.show_help {
         draw_help(frame, frame.area());
+    }
+}
+
+/// The comment authoring modal. Sits at the bottom so it covers as little of
+/// the diff as possible: the note is about a line you want to keep reading.
+fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDraft) {
+    let rows: Vec<&str> = draft.body.split('\n').collect();
+    let width = (area.width * 3 / 4).clamp(40, 100).min(area.width);
+    let height = (rows.len() as u16 + 2).min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height).saturating_sub(1),
+        width,
+        height,
+    };
+
+    // The error takes over the accent colour as well as the hint line: a
+    // bounced submit should be impossible to mistake for a sent one.
+    let (accent, hint) = match &draft.error {
+        Some(e) => (theme::RED, format!(" {e} ")),
+        None => (
+            theme::PEACH,
+            " enter send · alt-enter newline · esc cancel ".to_string(),
+        ),
+    };
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(accent))
+        .title(format!(" comment on {}:{} ", draft.path, draft.line))
+        .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
+        .title_bottom(Span::styled(hint, Style::default().fg(theme::OVERLAY0)))
+        .style(Style::default().bg(theme::BASE));
+
+    let lines: Vec<Line<'static>> = rows
+        .iter()
+        .map(|r| {
+            Line::from(Span::styled(
+                (*r).to_string(),
+                Style::default().fg(theme::TEXT),
+            ))
+        })
+        .collect();
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines).block(block.padding(ratatui::widgets::Padding::horizontal(1))),
+        popup,
+    );
+
+    let (row, col) = draft.caret_rc();
+    let x = popup.x + 2 + col as u16;
+    let y = popup.y + 1 + row as u16;
+    if x < popup.right().saturating_sub(1) && y < popup.bottom().saturating_sub(1) {
+        frame.set_cursor_position((x, y));
     }
 }
 
@@ -3259,7 +3438,7 @@ const fn bind(keys: &'static str, desc: &'static str) -> HelpRow {
 
 const HELP_ROWS: &[HelpRow] = &[
     head("Navigation"),
-    bind("j k  ↓ ↑", "scroll diff / move selection"),
+    bind("j k  ↓ ↑", "move diff cursor / selection"),
     bind("h l  ← →", "scroll diff horizontally"),
     bind("0", "reset horizontal scroll"),
     bind("enter", "open selected file's diff"),
@@ -3278,6 +3457,9 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("/", "search"),
     bind("n N", "next / prev match"),
     bind("1-9", "jump to tour step"),
+    head("Review"),
+    bind("m", "comment on the cursor's line"),
+    bind("enter", "send comment · alt-enter newline"),
     head("Other"),
     bind("e", "edit file at line in $EDITOR"),
     bind("?", "toggle this help"),
@@ -3935,6 +4117,64 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             None,
             Some((1, 5)),
         ]
+    }
+
+    fn draft() -> CommentDraft {
+        CommentDraft {
+            path: "src/main.rs".into(),
+            line: 42,
+            body: String::new(),
+            caret: 0,
+            error: None,
+        }
+    }
+
+    /// The caret indexes characters, not bytes, so editing after a multi-byte
+    /// character has to keep landing on character boundaries.
+    #[test]
+    fn draft_edits_by_character_not_byte() {
+        let mut d = draft();
+        for c in "héllo".chars() {
+            d.insert(c);
+        }
+        assert_eq!(d.body, "héllo");
+        assert_eq!(d.caret, 5);
+
+        // Back up over the multi-byte char and insert in front of it.
+        d.caret = 1;
+        d.insert('x');
+        assert_eq!(d.body, "hxéllo");
+        assert_eq!(d.caret, 2);
+
+        d.backspace();
+        assert_eq!(d.body, "héllo");
+        assert_eq!(d.caret, 1);
+
+        // Backspacing at the start is a no-op rather than a panic.
+        d.caret = 0;
+        d.backspace();
+        assert_eq!(d.body, "héllo");
+    }
+
+    /// The modal places the terminal caret from this, so a body with newlines
+    /// has to report the row and the column within that row.
+    #[test]
+    fn draft_caret_tracks_rows_and_columns() {
+        let mut d = draft();
+        for c in "one".chars() {
+            d.insert(c);
+        }
+        assert_eq!(d.caret_rc(), (0, 3));
+        d.insert('\n');
+        assert_eq!(d.caret_rc(), (1, 0));
+        for c in "two".chars() {
+            d.insert(c);
+        }
+        assert_eq!(d.caret_rc(), (1, 3));
+        assert_eq!(d.body, "one\ntwo");
+        // Caret back up on the first row reports that row's column.
+        d.caret = 1;
+        assert_eq!(d.caret_rc(), (0, 1));
     }
 
     /// The cursor steps over rows with no line info, so a hunk header or a
