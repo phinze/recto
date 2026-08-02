@@ -2932,12 +2932,12 @@ fn handle_event(
                     KeyCode::Char('b') => app.cycle_base(),
                     KeyCode::Char(']') => app.cycle_rev_next(),
                     KeyCode::Char('[') => app.cycle_rev_prev(),
-                    KeyCode::Char('c') => {
+                    KeyCode::Char('r') => {
                         app.commits_vis = PaneVis::Shown;
                         app.resolve_panes();
                         app.focus = Focus::Commits;
                     }
-                    KeyCode::Char('C') => {
+                    KeyCode::Char('R') => {
                         app.toggle_commits();
                     }
                     KeyCode::Char('f') => {
@@ -3027,7 +3027,7 @@ fn handle_event(
                     }
                     KeyCode::Char('n') => app.search_next(),
                     KeyCode::Char('N') => app.search_prev(),
-                    KeyCode::Char('m') => {
+                    KeyCode::Char('c') => {
                         if let Some((path, line)) = app.cursor_target() {
                             app.mode = Mode::CommentInput(CommentDraft {
                                 path,
@@ -3334,7 +3334,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     }
                     Focus::Diff => {
                         format!(
-                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · m comment · e edit · ? help"
+                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · c comment · e edit · ? help"
                         )
                     }
                 },
@@ -3449,7 +3449,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("H L", "focus files / diff"),
     bind("J K", "focus commits / diff"),
     bind("f F", "focus / toggle files pane"),
-    bind("c C", "focus / toggle commits pane"),
+    bind("r R", "focus / toggle revs pane"),
     head("Revisions"),
     bind("b", "cycle base"),
     bind("] [", "next / prev revision"),
@@ -3458,7 +3458,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("n N", "next / prev match"),
     bind("1-9", "jump to tour step"),
     head("Review"),
-    bind("m", "comment on the cursor's line"),
+    bind("c", "comment on the cursor's line"),
     bind("enter", "send comment · alt-enter newline"),
     head("Other"),
     bind("e", "edit file at line in $EDITOR"),

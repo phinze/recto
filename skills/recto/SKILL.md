@@ -126,7 +126,7 @@ pressing Esc) removes the whole set.
 Everything above points the user's eyes at code. `recto comments` runs the
 other way: it hands you the notes they left while reading the diff, each
 one anchored to a span and quoted with the surrounding lines. They write
-those by moving the cursor with `j`/`k` and pressing `m` in recto, which is
+those by moving the cursor with `j`/`k` and pressing `c` in recto, which is
 worth mentioning if they ask how to give you line-level feedback.
 
     recto comments
