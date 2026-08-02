@@ -303,6 +303,9 @@ struct CommentDraft {
     caret: usize,
     /// Why the last submit bounced, shown in the modal so the text isn't lost.
     error: Option<String>,
+    /// Index into `App::comments` when this is re-opening an existing note
+    /// rather than writing a new one. Submitting an empty body deletes it.
+    editing: Option<usize>,
 }
 
 impl CommentDraft {
@@ -1569,6 +1572,30 @@ impl App {
             self.take_diff_focus();
         }
         link::Response::ok_note(format!("{} pending", self.comments.len()))
+    }
+
+    /// The pending comment anchored over `line` in `path`, if any. Matching the
+    /// whole span rather than just its first line means `c` re-opens the note
+    /// from anywhere inside the range it covers.
+    fn comment_at(&self, path: &str, line: u32) -> Option<usize> {
+        comment_index_at(&self.comments, path, line)
+    }
+
+    /// Replace a pending comment's body, or drop it entirely when the reviewer
+    /// submits an empty one. Deleting through the same gesture that edits keeps
+    /// Esc unambiguously "cancel", so nothing discards a note by accident.
+    fn revise_comment(&mut self, idx: usize, body: String) -> link::Response {
+        if idx >= self.comments.len() {
+            return link::Response::err("that comment is no longer pending");
+        }
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            self.comments.remove(idx);
+        } else {
+            self.comments[idx].body = body;
+        }
+        self.reweave();
+        link::Response::ok()
     }
 
     /// Hand over every pending comment and clear the set. Clear-on-read is the
@@ -2883,17 +2910,20 @@ fn handle_event(
                         KeyCode::Char('j') if ctrl => draft.insert('\n'),
                         KeyCode::Enter => {
                             let body = draft.body.trim().to_string();
-                            if body.is_empty() {
-                                app.mode = Mode::Normal;
-                            } else {
-                                let resp = app.add_comment(&draft.path, draft.line, None, body);
-                                if resp.ok {
-                                    app.mode = Mode::Normal;
-                                } else {
+                            let resp = match draft.editing {
+                                // Emptying an existing note deletes it; emptying
+                                // a new one was never a note in the first place.
+                                Some(idx) => Some(app.revise_comment(idx, body)),
+                                None if body.is_empty() => None,
+                                None => Some(app.add_comment(&draft.path, draft.line, None, body)),
+                            };
+                            match resp {
+                                Some(r) if !r.ok => {
                                     // Keep the draft on screen; the reviewer
                                     // shouldn't lose a paragraph to a reload.
-                                    draft.error = resp.error;
+                                    draft.error = r.error;
                                 }
+                                _ => app.mode = Mode::Normal,
                             }
                         }
                         KeyCode::Backspace => draft.backspace(),
@@ -3029,12 +3059,20 @@ fn handle_event(
                     KeyCode::Char('N') => app.search_prev(),
                     KeyCode::Char('c') => {
                         if let Some((path, line)) = app.cursor_target() {
+                            // Re-open the note already on this line rather than
+                            // stacking a second one on top of it.
+                            let editing = app.comment_at(&path, line);
+                            let body = editing
+                                .and_then(|i| app.comments.get(i))
+                                .map(|c| c.body.clone())
+                                .unwrap_or_default();
                             app.mode = Mode::CommentInput(CommentDraft {
                                 path,
                                 line,
-                                body: String::new(),
-                                caret: 0,
+                                caret: body.chars().count(),
+                                body,
                                 error: None,
+                                editing,
                             });
                             mode = app.mode.clone();
                         }
@@ -3383,17 +3421,28 @@ fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDra
 
     // The error takes over the accent colour as well as the hint line: a
     // bounced submit should be impossible to mistake for a sent one.
-    let (accent, hint) = match &draft.error {
-        Some(e) => (theme::RED, format!(" {e} ")),
-        None => (
+    let (accent, hint) = match (&draft.error, draft.editing) {
+        (Some(e), _) => (theme::RED, format!(" {e} ")),
+        // Deleting is only reachable from an existing note, so only advertise
+        // it there — on a new one an empty body was never a note to begin with.
+        (None, Some(_)) => (
+            theme::PEACH,
+            " enter save · empty to delete · esc cancel ".to_string(),
+        ),
+        (None, None) => (
             theme::PEACH,
             " enter send · alt-enter newline · esc cancel ".to_string(),
         ),
     };
+    let verb = if draft.editing.is_some() {
+        "editing comment on"
+    } else {
+        "comment on"
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .title(format!(" comment on {}:{} ", draft.path, draft.line))
+        .title(format!(" {verb} {}:{} ", draft.path, draft.line))
         .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
         .title_bottom(Span::styled(hint, Style::default().fg(theme::OVERLAY0)))
         .style(Style::default().bg(theme::BASE));
@@ -3458,8 +3507,8 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("n N", "next / prev match"),
     bind("1-9", "jump to tour step"),
     head("Review"),
-    bind("c", "comment on the cursor's line"),
-    bind("enter", "send comment · alt-enter newline"),
+    bind("c", "comment on the line · again to edit"),
+    bind("enter", "send · alt-enter newline · empty deletes"),
     head("Other"),
     bind("e", "edit file at line in $EDITOR"),
     bind("?", "toggle this help"),
@@ -3830,6 +3879,15 @@ fn rows_for_span(
     Some(first?..=last?)
 }
 
+/// Index of the pending comment whose span covers `line` in `path`. The whole
+/// span counts, not just its first line, so re-opening a note works from
+/// anywhere inside the range it was pinned to.
+fn comment_index_at(comments: &[Comment], path: &str, line: u32) -> Option<usize> {
+    comments
+        .iter()
+        .position(|c| c.path == path && c.start <= line && line <= c.end)
+}
+
 /// The row `delta` pointable rows from `from`, where a pointable row is one
 /// carrying line info — real diff body rows, as opposed to hunk headers, file
 /// separators and woven note rows. Running out of diff clamps to the last row
@@ -4126,6 +4184,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             body: String::new(),
             caret: 0,
             error: None,
+            editing: None,
         }
     }
 
@@ -4175,6 +4234,33 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         // Caret back up on the first row reports that row's column.
         d.caret = 1;
         assert_eq!(d.caret_rc(), (0, 1));
+    }
+
+    /// `c` anywhere inside a note's span re-opens that note, so a comment
+    /// pinned to 10-14 is reachable from line 12 and not just line 10.
+    #[test]
+    fn comment_lookup_covers_the_whole_span() {
+        let comments = vec![
+            Comment {
+                path: "src/main.rs".into(),
+                start: 10,
+                end: 14,
+                body: "range note".into(),
+            },
+            Comment {
+                path: "src/link.rs".into(),
+                start: 3,
+                end: 3,
+                body: "single".into(),
+            },
+        ];
+        assert_eq!(comment_index_at(&comments, "src/main.rs", 10), Some(0));
+        assert_eq!(comment_index_at(&comments, "src/main.rs", 12), Some(0));
+        assert_eq!(comment_index_at(&comments, "src/main.rs", 14), Some(0));
+        assert_eq!(comment_index_at(&comments, "src/link.rs", 3), Some(1));
+        // Just outside the span, and the right line in the wrong file.
+        assert_eq!(comment_index_at(&comments, "src/main.rs", 15), None);
+        assert_eq!(comment_index_at(&comments, "src/link.rs", 12), None);
     }
 
     /// The cursor steps over rows with no line info, so a hunk header or a
