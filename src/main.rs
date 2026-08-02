@@ -1615,6 +1615,73 @@ impl App {
         }
     }
 
+    /// Step the diff cursor `delta` real rows, seeding it at the top of the
+    /// viewport if it isn't placed yet. Only rows carrying line info are
+    /// candidates: hunk headers, file separators and woven note rows are things
+    /// you can look at but not point at, so the cursor walks past them.
+    fn cursor_step(&mut self, delta: isize) {
+        let pointable = |app: &Self, i: usize| app.line_info.get(i).copied().flatten().is_some();
+        let Some(seed) = self
+            .diff_cursor
+            .or_else(|| self.source_line_at_row(self.scroll))
+        else {
+            self.scroll_by(delta);
+            return;
+        };
+
+        // The first press places the cursor rather than moving it, so it
+        // appears where the eye already is instead of a row further on.
+        if self.diff_cursor.is_none() {
+            match (seed..self.line_info.len()).find(|&i| pointable(self, i)) {
+                Some(line) => {
+                    self.diff_cursor = Some(line);
+                    self.reveal_cursor();
+                }
+                None => self.scroll_by(delta),
+            }
+            return;
+        }
+
+        match step_pointable(&self.line_info, seed, delta) {
+            Some(line) => {
+                self.diff_cursor = Some(line);
+                self.reveal_cursor();
+            }
+            // Already against the first or last pointable row; let the key fall
+            // back to plain scrolling so it still does something.
+            None => self.scroll_by(delta),
+        }
+    }
+
+    fn scroll_by(&mut self, delta: isize) {
+        if delta >= 0 {
+            self.scroll_down(delta as u16);
+        } else {
+            self.scroll_up((-delta) as u16);
+        }
+    }
+
+    /// Keep the cursor inside the viewport, honouring the same scrolloff the
+    /// rest of the UI uses. Only moves the scroll when the cursor would
+    /// otherwise sit in (or past) the margin, so reading stays still.
+    fn reveal_cursor(&mut self) {
+        let Some(line) = self.diff_cursor else {
+            return;
+        };
+        let height = self.diff_content_area.height as usize;
+        if height == 0 {
+            return;
+        }
+        let row = self.display_row_of_line(line);
+        let margin = (SCROLLOFF as usize).min(height.saturating_sub(1) / 2);
+        if row < self.scroll + margin {
+            self.scroll = row.saturating_sub(margin);
+        } else if row + margin >= self.scroll + height {
+            self.scroll = (row + margin + 1).saturating_sub(height);
+        }
+        self.clamp_scroll();
+    }
+
     /// Index into `changes` of the file owning the current scroll position.
     fn current_file(&self) -> Option<usize> {
         let source_line = self.source_line_at_row(self.scroll)?;
@@ -2786,7 +2853,7 @@ fn handle_event(
                         Focus::Commits if app.show_commits => {
                             app.commits_select_next();
                         }
-                        _ => app.scroll_down(1),
+                        _ => app.cursor_step(1),
                     },
                     KeyCode::Char('k') | KeyCode::Up => match app.focus {
                         Focus::Files if app.show_files => {
@@ -2804,7 +2871,7 @@ fn handle_event(
                                 app.commits_select_prev();
                             }
                         }
-                        _ => app.scroll_up(1),
+                        _ => app.cursor_step(-1),
                     },
                     KeyCode::Char('H') => {
                         if app.show_files {
@@ -3581,6 +3648,28 @@ fn rows_for_span(
     Some(first?..=last?)
 }
 
+/// The row `delta` pointable rows from `from`, where a pointable row is one
+/// carrying line info — real diff body rows, as opposed to hunk headers, file
+/// separators and woven note rows. Running out of diff clamps to the last row
+/// actually reached; `None` means it couldn't move at all.
+fn step_pointable(line_info: &[LineInfo], from: usize, delta: isize) -> Option<usize> {
+    let step = delta.signum();
+    let mut idx = from as isize;
+    let mut remaining = delta.abs();
+    let mut landed = None;
+    while remaining > 0 {
+        idx += step;
+        if idx < 0 || idx as usize >= line_info.len() {
+            break;
+        }
+        if line_info[idx as usize].is_some() {
+            landed = Some(idx as usize);
+            remaining -= 1;
+        }
+    }
+    landed
+}
+
 /// Number of surrounding diff rows quoted on each side of a comment's span, so
 /// the agent can place the note without opening the file.
 const SNIPPET_CONTEXT: usize = 3;
@@ -3846,6 +3935,30 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             None,
             Some((1, 5)),
         ]
+    }
+
+    /// The cursor steps over rows with no line info, so a hunk header or a
+    /// woven note between two code lines costs no keypresses to cross.
+    #[test]
+    fn cursor_steps_skip_unpointable_rows() {
+        let info = sample_line_info();
+        // Row 0 has no info; from row 1 a single step lands on row 2.
+        assert_eq!(step_pointable(&info, 1, 1), Some(2));
+        // Row 4 has no info, so stepping off row 3 crosses it to row 5.
+        assert_eq!(step_pointable(&info, 3, 1), Some(5));
+        assert_eq!(step_pointable(&info, 5, -1), Some(3));
+        // Row 0 is unpointable, so walking back from row 1 finds nothing.
+        assert_eq!(step_pointable(&info, 1, -1), None);
+    }
+
+    /// A step longer than the diff clamps to the last reachable row instead of
+    /// refusing to move, so a fast repeat never sticks partway.
+    #[test]
+    fn cursor_steps_clamp_at_the_ends() {
+        let info = sample_line_info();
+        assert_eq!(step_pointable(&info, 1, 99), Some(5));
+        assert_eq!(step_pointable(&info, 5, -99), Some(1));
+        assert_eq!(step_pointable(&info, 5, 1), None);
     }
 
     #[test]
