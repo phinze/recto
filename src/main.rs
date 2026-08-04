@@ -332,8 +332,86 @@ impl CommentDraft {
         self.caret -= 1;
     }
 
+    /// Forward delete: removes the character the caret sits on.
+    fn delete(&mut self) {
+        if self.caret < self.len() {
+            let at = self.byte_at(self.caret);
+            self.body.remove(at);
+        }
+    }
+
     fn len(&self) -> usize {
         self.body.chars().count()
+    }
+
+    /// Drop a character range, pulling the caret back to the cut if it was
+    /// inside or after it.
+    fn cut(&mut self, range: Range<usize>) {
+        if range.is_empty() {
+            return;
+        }
+        let (from, to) = (self.byte_at(range.start), self.byte_at(range.end));
+        self.body.replace_range(from..to, "");
+        self.caret = if self.caret > range.end {
+            self.caret - (range.end - range.start)
+        } else {
+            self.caret.min(range.start)
+        };
+    }
+
+    /// Character range of the logical (newline-delimited) line under the
+    /// caret. The readline verbs work on this rather than on visual rows: a
+    /// note is one line however many rows it wraps to, so `ctrl-u` clears the
+    /// thought you were writing instead of whatever happened to fit on a row.
+    fn line_bounds(&self) -> Range<usize> {
+        let chars: Vec<char> = self.body.chars().collect();
+        let start = chars[..self.caret]
+            .iter()
+            .rposition(|&c| c == '\n')
+            .map_or(0, |i| i + 1);
+        let end = chars[self.caret..]
+            .iter()
+            .position(|&c| c == '\n')
+            .map_or(chars.len(), |i| self.caret + i);
+        start..end
+    }
+
+    /// Start of the word before the caret: skip any run of separators, then
+    /// the word itself, the way readline's `alt-b` does.
+    fn prev_word(&self) -> usize {
+        let chars: Vec<char> = self.body.chars().collect();
+        let mut i = self.caret;
+        while i > 0 && !chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        while i > 0 && chars[i - 1].is_alphanumeric() {
+            i -= 1;
+        }
+        i
+    }
+
+    /// End of the word after the caret; the mirror of [`Self::prev_word`].
+    fn next_word(&self) -> usize {
+        let chars: Vec<char> = self.body.chars().collect();
+        let mut i = self.caret;
+        while i < chars.len() && !chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        while i < chars.len() && chars[i].is_alphanumeric() {
+            i += 1;
+        }
+        i
+    }
+
+    /// Move the caret one visual row, holding its column where the target row
+    /// is long enough. Arrows move by what's on screen even though the kill
+    /// verbs work on logical lines — you steer by what you can see.
+    fn move_row(&mut self, rows: &[Range<usize>], delta: isize) {
+        let (row, col) = self.caret_rc(rows);
+        let Some(range) = row.checked_add_signed(delta).and_then(|r| rows.get(r)) else {
+            return;
+        };
+        self.caret = (range.start + col).min(range.end);
     }
 
     /// Visual rows of the body soft-wrapped to `width` columns, as character
@@ -529,6 +607,10 @@ struct App {
     files_area: Rect,
     diff_content_area: Rect,
     commits_area: Rect,
+    /// Column count the comment modal last wrapped its body to. Left behind by
+    /// the draw pass so key handling can move the caret by visual row without
+    /// re-deriving the popup geometry.
+    comment_wrap_width: usize,
     commits_state: ListState,
     search_query: Option<String>,
     search_matches: Vec<SearchMatch>,
@@ -631,6 +713,9 @@ impl App {
             files_area: Rect::default(),
             diff_content_area: Rect::default(),
             commits_area: Rect::default(),
+            // Plausible stand-in for the one frame between opening the modal
+            // and drawing it; the real width lands before any key arrives.
+            comment_wrap_width: 76,
             commits_state: ListState::default(),
             search_query: None,
             search_matches: Vec::new(),
@@ -2949,6 +3034,9 @@ fn handle_event(
                     let ctrl = key.modifiers.contains(event::KeyModifiers::CONTROL);
                     let alt = key.modifiers.contains(event::KeyModifiers::ALT);
                     let shift = key.modifiers.contains(event::KeyModifiers::SHIFT);
+                    // Vertical motion needs the layout the modal was last
+                    // drawn at; the draw pass leaves the width behind for us.
+                    let rows = draft.wrap_rows(app.comment_wrap_width);
                     match key.code {
                         KeyCode::Esc => app.mode = Mode::Normal,
                         // Newline needs a modifier because plain Enter submits.
@@ -2976,11 +3064,42 @@ fn handle_event(
                                 _ => app.mode = Mode::Normal,
                             }
                         }
-                        KeyCode::Backspace => draft.backspace(),
+
+                        // Motion. The line verbs span the whole note; the
+                        // arrows move by wrapped row, so up and down go where
+                        // the eye expects.
+                        KeyCode::Char('a') if ctrl => draft.caret = draft.line_bounds().start,
+                        KeyCode::Char('e') if ctrl => draft.caret = draft.line_bounds().end,
+                        KeyCode::Home => draft.caret = draft.line_bounds().start,
+                        KeyCode::End => draft.caret = draft.line_bounds().end,
+                        KeyCode::Char('b') if alt => draft.caret = draft.prev_word(),
+                        KeyCode::Char('f') if alt => draft.caret = draft.next_word(),
+                        KeyCode::Left if ctrl || alt => draft.caret = draft.prev_word(),
+                        KeyCode::Right if ctrl || alt => draft.caret = draft.next_word(),
+                        KeyCode::Char('b') if ctrl => draft.caret = draft.caret.saturating_sub(1),
+                        KeyCode::Char('f') if ctrl => {
+                            draft.caret = (draft.caret + 1).min(draft.len())
+                        }
                         KeyCode::Left => draft.caret = draft.caret.saturating_sub(1),
                         KeyCode::Right => draft.caret = (draft.caret + 1).min(draft.len()),
-                        KeyCode::Home => draft.caret = 0,
-                        KeyCode::End => draft.caret = draft.len(),
+                        KeyCode::Up => draft.move_row(&rows, -1),
+                        KeyCode::Down => draft.move_row(&rows, 1),
+
+                        // Deletion.
+                        KeyCode::Char('u') if ctrl => {
+                            draft.cut(draft.line_bounds().start..draft.caret)
+                        }
+                        KeyCode::Char('k') if ctrl => {
+                            draft.cut(draft.caret..draft.line_bounds().end)
+                        }
+                        KeyCode::Char('w') if ctrl => draft.cut(draft.prev_word()..draft.caret),
+                        KeyCode::Backspace if ctrl || alt => {
+                            draft.cut(draft.prev_word()..draft.caret)
+                        }
+                        KeyCode::Char('d') if ctrl => draft.delete(),
+                        KeyCode::Delete => draft.delete(),
+                        KeyCode::Backspace => draft.backspace(),
+
                         KeyCode::Char(c) if !ctrl => draft.insert(c),
                         _ => {}
                     }
@@ -3447,8 +3566,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
     }
 
-    if let Mode::CommentInput(draft) = &app.mode {
-        draw_comment_input(frame, frame.area(), draft);
+    if let Mode::CommentInput(draft) = app.mode.clone() {
+        app.comment_wrap_width = draw_comment_input(frame, frame.area(), &draft);
     }
 
     if app.show_help {
@@ -3458,7 +3577,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
 /// The comment authoring modal. Sits at the bottom so it covers as little of
 /// the diff as possible: the note is about a line you want to keep reading.
-fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDraft) {
+/// Returns the column count the body was wrapped to, which key handling needs
+/// to move the caret by visual row.
+fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDraft) -> usize {
     let width = (area.width * 3 / 4).clamp(40, 100).min(area.width);
     // Two border columns and one of padding each side, then one more held back
     // so the caret has somewhere to sit at the end of a completely full row.
@@ -3492,7 +3613,7 @@ fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDra
         ),
         (None, None) => (
             theme::PEACH,
-            " enter send · alt-enter newline · esc cancel ".to_string(),
+            " enter send · shift-enter newline · esc cancel ".to_string(),
         ),
     };
     let verb = if draft.editing.is_some() {
@@ -3529,6 +3650,7 @@ fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDra
     if x < popup.right().saturating_sub(1) && y < popup.bottom().saturating_sub(1) {
         frame.set_cursor_position((x, y));
     }
+    wrap_width
 }
 
 /// One row in the help overlay: either a section heading (`key` empty) or a
@@ -3569,7 +3691,14 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("1-9", "jump to tour step"),
     head("Review"),
     bind("c", "comment on the line · again to edit"),
-    bind("enter", "send · alt-enter newline · empty deletes"),
+    bind("enter", "send · shift-enter newline · empty deletes"),
+    head("Comment box"),
+    bind("^a  ^e", "start / end of the note"),
+    bind("^u  ^k", "kill to start / end"),
+    bind("^w  alt-bksp", "kill previous word"),
+    bind("alt-b  alt-f", "word back / forward"),
+    bind("^d  del", "delete forward"),
+    bind("↑ ↓", "move by wrapped row"),
     head("Other"),
     bind("e", "edit file at line in $EDITOR"),
     bind("?", "toggle this help"),
@@ -4319,6 +4448,104 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         // vanishing past the border.
         d.body = "supercalifragilistic".into();
         assert_eq!(d.wrap_rows(10), vec![0..10, 10..20]);
+    }
+
+    /// `ctrl-u` and `ctrl-k` span the whole note, not the visual row the caret
+    /// happens to sit on — clearing a wrapped sentence should clear all of it.
+    #[test]
+    fn draft_kill_verbs_span_the_logical_line() {
+        let mut d = draft();
+        d.body = "the quick brown fox".into();
+        d.caret = 10;
+        d.cut(d.line_bounds().start..d.caret);
+        assert_eq!(d.body, "brown fox");
+        assert_eq!(d.caret, 0);
+
+        d.caret = 6;
+        d.cut(d.caret..d.line_bounds().end);
+        assert_eq!(d.body, "brown ");
+        assert_eq!(d.caret, 6);
+
+        // On a multi-line note the verbs stop at the newline rather than
+        // eating the neighbouring line.
+        d.body = "one\ntwo\nthree".into();
+        d.caret = 6;
+        d.cut(d.line_bounds().start..d.caret);
+        assert_eq!(d.body, "one\no\nthree");
+    }
+
+    /// Word motion skips the separators then the word, so repeated `alt-b`
+    /// walks backwards a word at a time instead of stalling on punctuation.
+    #[test]
+    fn draft_word_motion_walks_over_separators() {
+        let mut d = draft();
+        d.body = "fix the off-by-one".into();
+        d.caret = d.len();
+        d.caret = d.prev_word();
+        assert_eq!(d.caret, 15); // "one"
+        d.caret = d.prev_word();
+        assert_eq!(d.caret, 12); // "by"
+        d.caret = d.prev_word();
+        assert_eq!(d.caret, 8); // "off"
+        d.caret = d.prev_word();
+        assert_eq!(d.caret, 4); // "the"
+
+        d.caret = 0;
+        d.caret = d.next_word();
+        assert_eq!(d.caret, 3);
+        d.caret = d.next_word();
+        assert_eq!(d.caret, 7);
+
+        // ctrl-w cuts back to the word start and leaves the caret in the hole.
+        d.caret = d.len();
+        d.cut(d.prev_word()..d.caret);
+        assert_eq!(d.body, "fix the off-by-");
+        assert_eq!(d.caret, 15);
+    }
+
+    /// Up and down move by wrapped row, so a long note is navigable by what's
+    /// on screen even though it's a single logical line.
+    #[test]
+    fn draft_vertical_motion_follows_wrapped_rows() {
+        let mut d = draft();
+        d.body = "the quick brown fox".into();
+        let rows = d.wrap_rows(10);
+
+        d.caret = 12; // row 1, column 2
+        d.move_row(&rows, -1);
+        assert_eq!(d.caret_rc(&rows), (0, 2));
+        d.move_row(&rows, 1);
+        assert_eq!(d.caret_rc(&rows), (1, 2));
+
+        // Off either end is a no-op rather than a wrap-around or a panic.
+        d.move_row(&rows, 1);
+        assert_eq!(d.caret_rc(&rows), (1, 2));
+        d.caret = 2;
+        d.move_row(&rows, -1);
+        assert_eq!(d.caret_rc(&rows), (0, 2));
+
+        // Dropping onto a shorter row clamps to its end.
+        d.body = "a longer first row\nhi".into();
+        let rows = d.wrap_rows(40);
+        d.caret = 10;
+        d.move_row(&rows, 1);
+        assert_eq!(d.caret, d.len());
+    }
+
+    /// Forward delete takes the character under the caret and is a no-op at
+    /// the end, where `backspace` would otherwise be the only way out.
+    #[test]
+    fn draft_forward_delete_stops_at_the_end() {
+        let mut d = draft();
+        d.body = "héllo".into();
+        d.caret = 1;
+        d.delete();
+        assert_eq!(d.body, "hllo");
+        assert_eq!(d.caret, 1);
+
+        d.caret = d.len();
+        d.delete();
+        assert_eq!(d.body, "hllo");
     }
 
     /// Every caret position has to land on exactly one row, including the two
