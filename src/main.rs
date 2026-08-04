@@ -7,6 +7,7 @@ mod wrap;
 
 use std::collections::HashMap;
 use std::io::{self, stdout};
+use std::ops::Range;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, mpsc};
@@ -335,13 +336,62 @@ impl CommentDraft {
         self.body.chars().count()
     }
 
-    /// Caret position as (row, column) within the wrapped-free body, for
-    /// placing the terminal cursor in the modal.
-    fn caret_rc(&self) -> (usize, usize) {
-        let before: String = self.body.chars().take(self.caret).collect();
-        let row = before.matches('\n').count();
-        let col = before.rsplit('\n').next().map_or(0, |l| l.chars().count());
-        (row, col)
+    /// Visual rows of the body soft-wrapped to `width` columns, as character
+    /// ranges into it. Ranges cover every caret position: rows touch exactly
+    /// at a soft wrap (break whitespace trails the row it broke) and leave
+    /// exactly one character — the newline — between hard-broken rows, which
+    /// is what lets [`Self::caret_rc`] map any caret to exactly one row.
+    fn wrap_rows(&self, width: usize) -> Vec<Range<usize>> {
+        let width = width.max(1);
+        let chars: Vec<char> = self.body.chars().collect();
+        let mut rows = Vec::new();
+        let mut start = 0;
+        loop {
+            let end = chars[start..]
+                .iter()
+                .position(|&c| c == '\n')
+                .map_or(chars.len(), |p| start + p);
+            let mut cur = start;
+            while end - cur > width {
+                // Break at the last space that fits; a word longer than the
+                // box has nowhere to break and gets cut at the edge.
+                let brk = (cur..cur + width).rev().find(|&i| chars[i] == ' ');
+                let mut next = brk.map_or(cur + width, |sp| sp + 1);
+                // Trailing whitespace stays on the row it broke, so a caret
+                // parked mid-run of spaces still has a row to sit on.
+                while next < end && chars[next] == ' ' {
+                    next += 1;
+                }
+                rows.push(cur..next);
+                cur = next;
+            }
+            rows.push(cur..end);
+            if end == chars.len() {
+                break;
+            }
+            start = end + 1;
+        }
+        rows
+    }
+
+    /// Caret position as (visual row, column) within `rows`, for placing the
+    /// terminal cursor in the modal.
+    fn caret_rc(&self, rows: &[Range<usize>]) -> (usize, usize) {
+        for (i, r) in rows.iter().enumerate() {
+            if self.caret < r.end {
+                return (i, self.caret - r.start);
+            }
+            if self.caret == r.end {
+                // A soft wrap leaves no gap between rows, so the caret belongs
+                // at the head of the continuation; a newline leaves one, so
+                // the caret stays put at the end of this row.
+                return match rows.get(i + 1) {
+                    Some(next) if next.start == r.end => (i + 1, 0),
+                    _ => (i, r.end - r.start),
+                };
+            }
+        }
+        (rows.len().saturating_sub(1), 0)
     }
 }
 
@@ -3409,9 +3459,20 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 /// The comment authoring modal. Sits at the bottom so it covers as little of
 /// the diff as possible: the note is about a line you want to keep reading.
 fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDraft) {
-    let rows: Vec<&str> = draft.body.split('\n').collect();
     let width = (area.width * 3 / 4).clamp(40, 100).min(area.width);
-    let height = (rows.len() as u16 + 2).min(area.height);
+    // Two border columns and one of padding each side, then one more held back
+    // so the caret has somewhere to sit at the end of a completely full row.
+    let wrap_width = (width as usize).saturating_sub(5).max(1);
+    let rows = draft.wrap_rows(wrap_width);
+    let (caret_row, caret_col) = draft.caret_rc(&rows);
+
+    // Grow with the note, but never past half the screen — the line being
+    // annotated should stay readable. Past that the body scrolls to the caret.
+    let max_body = ((area.height.saturating_sub(3) / 2) as usize).max(1);
+    let body_h = rows.len().clamp(1, max_body);
+    let scroll = caret_row.saturating_sub(body_h - 1);
+
+    let height = (body_h as u16 + 2).min(area.height);
     let popup = Rect {
         x: area.x + area.width.saturating_sub(width) / 2,
         y: area.y + area.height.saturating_sub(height).saturating_sub(1),
@@ -3447,13 +3508,12 @@ fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDra
         .title_bottom(Span::styled(hint, Style::default().fg(theme::OVERLAY0)))
         .style(Style::default().bg(theme::BASE));
 
-    let lines: Vec<Line<'static>> = rows
+    let chars: Vec<char> = draft.body.chars().collect();
+    let lines: Vec<Line<'static>> = rows[scroll..scroll + body_h]
         .iter()
         .map(|r| {
-            Line::from(Span::styled(
-                (*r).to_string(),
-                Style::default().fg(theme::TEXT),
-            ))
+            let text: String = chars[r.clone()].iter().collect();
+            Line::from(Span::styled(text, Style::default().fg(theme::TEXT)))
         })
         .collect();
     frame.render_widget(Clear, popup);
@@ -3462,9 +3522,10 @@ fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDra
         popup,
     );
 
-    let (row, col) = draft.caret_rc();
-    let x = popup.x + 2 + col as u16;
-    let y = popup.y + 1 + row as u16;
+    // A caret parked inside a run of wrapped whitespace can report a column
+    // past the wrap point; clamp rather than let it escape the border.
+    let x = popup.x + 2 + caret_col.min(wrap_width) as u16;
+    let y = popup.y + 1 + (caret_row - scroll) as u16;
     if x < popup.right().saturating_sub(1) && y < popup.bottom().saturating_sub(1) {
         frame.set_cursor_position((x, y));
     }
@@ -4223,17 +4284,87 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         for c in "one".chars() {
             d.insert(c);
         }
-        assert_eq!(d.caret_rc(), (0, 3));
+        let rc = |d: &CommentDraft| d.caret_rc(&d.wrap_rows(80));
+        assert_eq!(rc(&d), (0, 3));
         d.insert('\n');
-        assert_eq!(d.caret_rc(), (1, 0));
+        assert_eq!(rc(&d), (1, 0));
         for c in "two".chars() {
             d.insert(c);
         }
-        assert_eq!(d.caret_rc(), (1, 3));
+        assert_eq!(rc(&d), (1, 3));
         assert_eq!(d.body, "one\ntwo");
         // Caret back up on the first row reports that row's column.
         d.caret = 1;
-        assert_eq!(d.caret_rc(), (0, 1));
+        assert_eq!(rc(&d), (0, 1));
+    }
+
+    /// Long prose soft-wraps at word boundaries instead of running off the
+    /// edge, which is the whole reason the modal grew a layout pass.
+    #[test]
+    fn draft_soft_wraps_at_word_boundaries() {
+        let mut d = draft();
+        d.body = "the quick brown fox".into();
+        let rows = d.wrap_rows(10);
+        let text = |r: &Range<usize>| {
+            d.body.chars().collect::<Vec<_>>()[r.clone()]
+                .iter()
+                .collect::<String>()
+        };
+        assert_eq!(
+            rows.iter().map(text).collect::<Vec<_>>(),
+            vec!["the quick ", "brown fox"]
+        );
+
+        // A word with no break point in it gets cut at the edge rather than
+        // vanishing past the border.
+        d.body = "supercalifragilistic".into();
+        assert_eq!(d.wrap_rows(10), vec![0..10, 10..20]);
+    }
+
+    /// Every caret position has to land on exactly one row, including the two
+    /// ambiguous ones: the soft-wrap seam and the newline.
+    #[test]
+    fn draft_caret_resolves_wrap_seams() {
+        let mut d = draft();
+        d.body = "the quick brown fox".into();
+        let rows = d.wrap_rows(10);
+
+        // Mid-word is unambiguous.
+        d.caret = 4;
+        assert_eq!(d.caret_rc(&rows), (0, 4));
+
+        // The seam: rows touch, so the caret rides the continuation row rather
+        // than sitting in the column the border occupies.
+        d.caret = 10;
+        assert_eq!(d.caret_rc(&rows), (1, 0));
+
+        // End of body stays on the last row.
+        d.caret = d.len();
+        assert_eq!(d.caret_rc(&rows), (1, 9));
+
+        // A newline leaves a one-character gap between rows, so the caret sits
+        // at the end of the earlier row instead of jumping to the next.
+        d.body = "one\ntwo".into();
+        let rows = d.wrap_rows(10);
+        d.caret = 3;
+        assert_eq!(d.caret_rc(&rows), (0, 3));
+        d.caret = 4;
+        assert_eq!(d.caret_rc(&rows), (1, 0));
+    }
+
+    /// An empty body still has a row for the caret to sit on, and a trailing
+    /// newline opens a fresh one.
+    #[test]
+    fn draft_wrap_always_yields_a_caret_row() {
+        let mut d = draft();
+        assert_eq!(d.wrap_rows(10), vec![0..0]);
+        assert_eq!(d.caret_rc(&d.wrap_rows(10)), (0, 0));
+
+        d.body = "hi\n".into();
+        d.caret = 3;
+        let rows = d.wrap_rows(10);
+        assert_eq!(rows, vec![0..2, 3..3]);
+        assert_eq!(d.caret_rc(&rows), (1, 0));
     }
 
     /// `c` anywhere inside a note's span re-opens that note, so a comment
