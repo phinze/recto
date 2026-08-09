@@ -39,9 +39,11 @@ Smallest thing that proves the architecture:
    unified diffs.
 2. `j/k` to scroll, `tab` to focus the tree, `enter` to jump to a
    file's diff in the main pane.
-3. `b` to cycle base. In jj: `@-` → `trunk()` → `@--` → … In git:
-   working tree → merge-base → HEAD → index. Header shows the current
-   revision/base.
+3. `b` to change base. Originally a blind rotation through a fixed list;
+   now it opens a pick mode inside the rev panel, starting on the current
+   base, with landmarks (trunk, branch point, bookmarks) labelled so the
+   choice is made by reading rather than by cycling and seeing where you
+   land. Header shows the current revision/base in words.
 4. `e` to open the file under cursor at the right line in `$EDITOR`,
    come back cleanly.
 

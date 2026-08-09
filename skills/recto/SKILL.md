@@ -168,7 +168,7 @@ exception: its scope is the workspace, not the current diff.
   or "outside any shown hunk" (the file is in the diff but those lines
   aren't part of a changed hunk). For `annotate` this means *no* site
   resolved. If you expected the file to be there, the user may need to
-  cycle the base with `b`; tell them, don't retry blindly.
+  pick a different base with `b`; tell them, don't retry blindly.
 - **exit 2** — no recto is listening for this workspace (or you're not
   in a repo). Don't keep trying; just describe the change in text.
 

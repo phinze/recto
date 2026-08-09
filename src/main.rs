@@ -577,6 +577,13 @@ struct App {
     backend: Arc<dyn Backend>,
     bases: Vec<Base>,
     base_idx: usize,
+    /// Index into `revs` of the row being considered as a new base, while the
+    /// `b` picker is up. `None` when not picking. Deliberately separate from
+    /// `cursor`; see `begin_base_pick`.
+    base_pick: Option<usize>,
+    /// How many entries of `bases` came from the backend defaults plus
+    /// `--base`. Everything past this is the single ad-hoc pick.
+    fixed_bases: usize,
     revs: Vec<Rev>,
     cursor: Cursor,
     mode: Mode,
@@ -673,6 +680,7 @@ impl App {
         } else {
             0
         };
+        let fixed_bases = bases.len();
         let initial_req = DiffRequest {
             scope: Scope::Range(bases[base_idx].clone()),
             ignore_ws: false,
@@ -689,6 +697,8 @@ impl App {
             backend,
             bases,
             base_idx,
+            base_pick: None,
+            fixed_bases,
             revs,
             cursor: Cursor::All,
             mode: Mode::Normal,
@@ -790,9 +800,22 @@ impl App {
         }
     }
 
+    /// How a base reads in the header. A base picked out of the rev panel is
+    /// a raw change id, so it gets the short form the panel itself displays
+    /// rather than 32 hex characters nobody can read at a glance; everything
+    /// else defers to the backend's own name for it.
+    fn base_text(&self, base: &Base) -> String {
+        if let Base::Revision(r) = base
+            && let Some(rev) = self.revs.iter().find(|rev| &rev.id == r)
+        {
+            return rev.short_id.clone();
+        }
+        self.backend.base_display(base)
+    }
+
     fn scope_label(&self, scope: &Scope) -> String {
         match scope {
-            Scope::Range(base) => format!("base: {}", self.backend.base_label(base)),
+            Scope::Range(base) => format!("base: {}", self.base_text(base)),
             Scope::Rev(id) => {
                 let short = self
                     .revs
@@ -808,17 +831,68 @@ impl App {
     /// Cycle to the next base. Worker loads in the background; current diff
     /// stays visible until the response arrives. Repeated presses advance from
     /// the in-flight target, so a burst of `b`s lands on the right base.
-    fn cycle_base(&mut self) {
-        let current = self
-            .loading
-            .as_ref()
-            .and_then(|l| match &l.request.scope {
-                Scope::Range(b) => self.bases.iter().position(|x| x == b),
-                Scope::Rev(_) => None,
-            })
-            .unwrap_or(self.base_idx);
-        let next_idx = (current + 1) % self.bases.len();
-        let scope = Scope::Range(self.bases[next_idx].clone());
+    /// `b`: bring up the rev panel and start picking a base in it. The panel
+    /// already renders which rev is the base and what's in range, so it needs
+    /// no new screen space to double as the picker.
+    ///
+    /// Picking gets its own selection rather than reusing the rev cursor,
+    /// because the cursor means "what am I looking at" and moving it reloads
+    /// the diff. Choosing a base is a question about a rev you are *not*
+    /// looking at yet, so conflating the two would make every keystroke of
+    /// browsing cost a diff load and land you somewhere you didn't ask for.
+    fn begin_base_pick(&mut self) {
+        self.commits_vis = PaneVis::Shown;
+        self.resolve_panes();
+        if !self.show_commits {
+            return;
+        }
+        self.focus = Focus::Commits;
+        // Start on the current base. A picker that opens anywhere else makes
+        // you find where you already are before you can move.
+        self.base_pick = Some(self.revs.iter().position(|r| r.is_base).unwrap_or(0));
+    }
+
+    fn base_pick_step(&mut self, delta: isize) {
+        let Some(current) = self.base_pick else {
+            return;
+        };
+        if self.revs.is_empty() {
+            return;
+        }
+        let last = self.revs.len() - 1;
+        let next = (current as isize + delta).clamp(0, last as isize) as usize;
+        self.base_pick = Some(next);
+    }
+
+    /// Commit the pick. The panel closes back into normal browsing either way.
+    fn confirm_base_pick(&mut self) {
+        let Some(i) = self.base_pick.take() else {
+            return;
+        };
+        let Some(rev) = self.revs.get(i) else { return };
+        // Re-basing on the rev you're already based on is a no-op worth
+        // short-circuiting: it would otherwise cost a full reload to arrive
+        // exactly where you started.
+        if rev.is_base {
+            return;
+        }
+        self.select_base(Base::Revision(rev.id.clone()));
+    }
+
+    fn select_base(&mut self, base: Base) {
+        let idx = match self.bases.iter().position(|b| b == &base) {
+            Some(i) => i,
+            None => {
+                // Ad-hoc picks are transient, so only ever one of them is
+                // kept. Appending each pick instead would grow `bases` for
+                // the life of the session with entries nothing reads back.
+                self.bases.truncate(self.fixed_bases);
+                self.bases.push(base.clone());
+                self.bases.len() - 1
+            }
+        };
+        self.base_idx = idx;
+        let scope = Scope::Range(base);
         let label = self.scope_label(&scope);
         let request = DiffRequest {
             scope,
@@ -3109,6 +3183,19 @@ fn handle_event(
                 Mode::Normal if app.show_help => {
                     app.show_help = false;
                 }
+                // Base picker is up. Same swallow-everything-else discipline as
+                // the help overlay: a stray key backs out of the pick rather
+                // than half-applying it and half-doing something unrelated.
+                Mode::Normal if app.base_pick.is_some() => match key.code {
+                    KeyCode::Char('j') | KeyCode::Down => app.base_pick_step(1),
+                    KeyCode::Char('k') | KeyCode::Up => app.base_pick_step(-1),
+                    KeyCode::Char('g') | KeyCode::Home => app.base_pick = Some(0),
+                    KeyCode::Char('G') | KeyCode::End => {
+                        app.base_pick = Some(app.revs.len().saturating_sub(1))
+                    }
+                    KeyCode::Char('b') | KeyCode::Enter => app.confirm_base_pick(),
+                    _ => app.base_pick = None,
+                },
                 Mode::Normal => match key.code {
                     KeyCode::Char('?') => app.show_help = true,
                     KeyCode::Char('q') | KeyCode::Esc => {
@@ -3128,7 +3215,13 @@ fn handle_event(
                     KeyCode::Tab => {
                         app.focus = app.focus.cycle(app.show_files, app.show_commits);
                     }
-                    KeyCode::Char('b') => app.cycle_base(),
+                    KeyCode::Char('b') => {
+                        if app.base_pick.is_some() {
+                            app.confirm_base_pick();
+                        } else {
+                            app.begin_base_pick();
+                        }
+                    }
                     KeyCode::Char(']') => app.cycle_rev_next(),
                     KeyCode::Char('[') => app.cycle_rev_prev(),
                     KeyCode::Char('r') => {
@@ -3413,11 +3506,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         .split(area);
 
     let n_revs = app.revs.len();
+    // Revs *in the diff*, not revs in the panel. The panel window is
+    // deliberately deeper than the range so there's something to pick a base
+    // from, which makes its length a number about the picker rather than
+    // about what you're reading.
+    let n_in_range = app.revs.iter().filter(|r| r.is_in_range).count();
     let n_files = app.changes.len();
     let cursor_str = match app.cursor {
         Cursor::All => format!(
-            "all changes · {n_revs} rev{}",
-            if n_revs == 1 { "" } else { "s" }
+            "all changes · {n_in_range} rev{}",
+            if n_in_range == 1 { "" } else { "s" }
         ),
         Cursor::Rev(i) => {
             let r = &app.revs[i];
@@ -3427,7 +3525,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let mut header_spans = vec![Span::styled(
         format!(
             "recto — base: {} · {cursor_str} · {n_files} file{}",
-            app.backend.base_label(app.base()),
+            app.base_text(app.base()),
             if n_files == 1 { "" } else { "s" },
         ),
         Style::default()
@@ -3530,10 +3628,25 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                 "W ignore ws"
             };
             let mut text = match &app.mode {
+                // The warning is the whole guard against basing off @'s line.
+                // It costs no row width and appears exactly when it's
+                // actionable, which a per-row label manages neither of.
+                Mode::Normal if app.base_pick.is_some() => {
+                    let off_line = app
+                        .base_pick
+                        .and_then(|i| app.revs.get(i))
+                        .is_some_and(|r| !r.is_ancestor);
+                    if off_line {
+                        "picking base — not on @'s line: its commits will read as reversals · b / enter anyway · any other key cancels".to_string()
+                    } else {
+                        "picking base — j k move · b / enter set base · any other key cancels"
+                            .to_string()
+                    }
+                }
                 Mode::Normal => match app.focus {
                     Focus::Commits => {
                         format!(
-                            "q quit · j k select · esc focus diff · {wrap_hint} · {ws_hint} · ? help"
+                            "q quit · j k select · b pick base · enter view rev · esc focus diff · {wrap_hint} · {ws_hint} · ? help"
                         )
                     }
                     Focus::Files => {
@@ -3683,7 +3796,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("f F", "focus / toggle files pane"),
     bind("r R", "focus / toggle revs pane"),
     head("Revisions"),
-    bind("b", "cycle base"),
+    bind("b", "pick base (in rev panel: set base to rev)"),
     bind("] [", "next / prev revision"),
     head("Search & tour"),
     bind("/", "search"),
@@ -3810,7 +3923,11 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         Cursor::Rev(i) => i + 1,
     };
     let commits_focused = app.focus == Focus::Commits && matches!(app.mode, Mode::Normal);
-    let selected = Some(cursor_idx);
+    // While picking, the list's own selection follows the pick rather than the
+    // view cursor. That's what scrolls the candidate into view, which is the
+    // whole reason the pick has its own index: the base can easily sit below
+    // the fold, and a picker you have to go hunting for isn't one.
+    let picking = app.base_pick;
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.revs.len() + 1);
 
@@ -3822,27 +3939,46 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 .fg(theme::MAUVE)
                 .add_modifier(Modifier::BOLD),
         ),
-        Span::styled("  ", Style::default()), // aligned to bullet
+        Span::styled("   ", Style::default()), // aligned to the graph node
         Span::styled(
             "all changes",
             Style::default().add_modifier(Modifier::ITALIC),
         ),
     ])));
 
-    for (i, rev) in app.revs.iter().enumerate() {
-        let marker = if cursor_idx == i + 1 { "▸ " } else { "  " };
+    // Display row for each rev, since graph tails put rows between them and
+    // the list's selection is a row index, not a rev index.
+    let mut rev_rows: Vec<usize> = Vec::with_capacity(app.revs.len());
 
-        let bullet = if rev.is_base {
-            Span::styled(
-                "○ ",
-                Style::default()
-                    .fg(theme::YELLOW)
-                    .add_modifier(Modifier::BOLD),
-            )
-        } else if rev.is_in_range {
-            Span::styled("● ", Style::default().fg(theme::GREEN))
+    for (i, rev) in app.revs.iter().enumerate() {
+        rev_rows.push(items.len());
+        let is_pick = picking == Some(i);
+        // Two distinct glyphs in the leftmost column rather than a trailing
+        // "← set base here": the left edge is the one part of a row that
+        // never truncates, and on a narrow pane a hint at the end of the line
+        // is a hint you don't get to read. The view cursor keeps its own
+        // marker while picking so you don't lose what the diff pane is on.
+        let marker = if is_pick {
+            "» "
+        } else if cursor_idx == i + 1 {
+            "▸ "
         } else {
-            Span::styled("· ", Style::default().fg(theme::OVERLAY0))
+            "  "
+        };
+
+        // The graph carries its own node glyph, so a separate bullet was two
+        // symbols and four columns spent on overlapping facts. Colour jj's
+        // node instead. Tinting the whole prefix is safe: connector lines only
+        // appear on a spur off @'s line, and a spur is never in range, so a
+        // coloured row never has a connector to miscolour.
+        let graph_style = if rev.is_base {
+            Style::default()
+                .fg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD)
+        } else if rev.is_in_range {
+            Style::default().fg(theme::GREEN)
+        } else {
+            Style::default().fg(theme::OVERLAY0)
         };
 
         let is_dimmed = !rev.is_in_range && !rev.is_base && !rev.is_head;
@@ -3864,14 +4000,18 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .fg(theme::MAUVE)
                     .add_modifier(Modifier::BOLD),
             ),
-            bullet,
+            Span::styled(rev.graph.clone(), graph_style),
             Span::styled(format!("{} ", rev.short_id), id_style),
-            Span::styled(rev.summary.clone(), summary_style),
         ];
 
+        // Landmarks go before the description, not after it. They're what
+        // makes the panel a picker rather than a list, and appended they were
+        // the first thing a narrow pane threw away — leaving the hundredth
+        // identical "bump 1 fast-moving input(s)" occupying the width that
+        // "(trunk)" needed.
         if rev.is_base {
             spans.push(Span::styled(
-                " (base)",
+                "(base) ",
                 Style::default()
                     .fg(theme::YELLOW)
                     .add_modifier(Modifier::ITALIC),
@@ -3879,9 +4019,9 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         }
         if rev.is_head {
             let head_label = if rev.id.len() == 32 {
-                " (@)"
+                "(@) "
             } else {
-                " (HEAD)"
+                "(HEAD) "
             };
             spans.push(Span::styled(
                 head_label,
@@ -3890,14 +4030,63 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .add_modifier(Modifier::ITALIC),
             ));
         }
+        // The fork point is suppressed when it's already the base, since
+        // "(base) (branch point)" is two labels for one fact.
+        if rev.is_fork_point && !rev.is_base {
+            spans.push(Span::styled(
+                "(branch point) ",
+                Style::default()
+                    .fg(theme::YELLOW)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        if rev.is_trunk {
+            spans.push(Span::styled(
+                "(trunk) ",
+                Style::default()
+                    .fg(theme::TEAL)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        for name in &rev.refs {
+            spans.push(Span::styled(
+                format!("{name} "),
+                Style::default().fg(theme::GREEN),
+            ));
+        }
+        spans.push(Span::styled(rev.summary.clone(), summary_style));
 
         items.push(ListItem::new(Line::from(spans)));
+
+        // Graph structure jj drew below this rev — the `├─╯` closing a fork,
+        // or `~` for elided history. Indented past the marker column so it
+        // lines up with the glyphs on the rev rows.
+        for tail in &rev.graph_tail {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(tail.clone(), Style::default().fg(theme::OVERLAY0)),
+            ])));
+        }
     }
 
+    let title = if picking.is_some() {
+        "Pick base"
+    } else {
+        "Revs"
+    };
     let list = List::new(items)
-        .block(pane_block("Revs", commits_focused, app.terminal_focused))
+        .block(pane_block(title, commits_focused, app.terminal_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
 
+    // Both indices are into `revs`; the row they land on is whatever the
+    // graph tails pushed them to.
+    let selected = match picking {
+        Some(i) => rev_rows.get(i).copied(),
+        None => match app.cursor {
+            Cursor::All => Some(0),
+            Cursor::Rev(i) => rev_rows.get(i).copied(),
+        },
+    };
     app.commits_state.select(selected);
     frame.render_stateful_widget(list, area, &mut app.commits_state);
 }

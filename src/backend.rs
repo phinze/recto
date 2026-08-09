@@ -9,7 +9,7 @@ pub enum Base {
     Revision(String),
     /// Latest common ancestor of `@` and `against`. The right base for "show
     /// me what's on this branch and nothing else" — equivalent to git's
-    /// `against...@` three-dot form or jj's `heads(::@ & ::against)`.
+    /// `against...@` three-dot form or jj's `fork_point(against | @)`.
     MergeBase {
         against: Box<Base>,
     },
@@ -46,6 +46,27 @@ pub struct Rev {
     pub is_base: bool,
     pub is_head: bool,
     pub is_in_range: bool,
+    /// Bookmarks (jj) or branch/tag decorations (git) pointing at this rev.
+    pub refs: Vec<String>,
+    /// This rev is `trunk()` / the trunk branch.
+    pub is_trunk: bool,
+    /// This rev is where the current stack forks off trunk. Distinct from
+    /// `is_base`: the fork point is worth pointing at even when you're
+    /// currently based somewhere else, since it's the base you most often
+    /// want next.
+    pub is_fork_point: bool,
+    /// Whether this rev is an ancestor of `@`. A base that isn't renders the
+    /// other line's commits as reversals, so the panel says so rather than
+    /// letting the choice look as ordinary as any other.
+    pub is_ancestor: bool,
+    /// Graph glyphs jj drew to the left of this rev's line, e.g. `"│ "`.
+    /// Empty for backends that don't draw one.
+    pub graph: String,
+    /// Pure-graph lines that followed this rev with no rev of their own —
+    /// the `├─╯` that closes a fork, or the `~` marking elided history.
+    /// Carried on the preceding rev so `revs` stays a list of real revs and
+    /// every index into it is still selectable.
+    pub graph_tail: Vec<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -80,9 +101,14 @@ pub trait Backend: Send + Sync {
     /// status payload so a companion session knows the model it's driving.
     fn kind(&self) -> &'static str;
     /// Label for a base in the backend's own vocabulary — the exact string
-    /// you could paste into `jj diff --from` or `git diff`. This is what the
-    /// header shows and what `--base` is matched against.
+    /// you could paste into `jj diff --from` or `git diff`. This is what
+    /// `--base` is matched against and what the companion status reports.
     fn base_label(&self, base: &Base) -> String;
+    /// How the base reads in the header. `base_label` answers "what would I
+    /// type", which is the wrong question for a status line: nobody wants to
+    /// read `fork_point(trunk() | @)` to learn they're looking at the branch
+    /// point. Falls back to the raw label for revsets we have no name for.
+    fn base_display(&self, base: &Base) -> String;
     /// `ignore_ws` maps to `-w` (`--ignore-all-space`), matching GitHub's
     /// "ignore whitespace" toggle. Passed to the summary command too, so a
     /// whitespace-only file drops out of the tree and the diff together.
@@ -143,13 +169,35 @@ impl JjBackend {
 }
 
 impl JjBackend {
-    /// Native revset string for a base. `MergeBase` becomes `heads(::@ & ::X)`
-    /// which is jj's idiom for the latest common ancestor of `@` and X.
+    /// Native revset string for a base. `MergeBase` uses jj's own
+    /// `fork_point()` rather than the hand-rolled `heads(::@ & ::X)`: the
+    /// latter is the classic idiom but can yield more than one head across a
+    /// criss-cross merge, and every caller here wants a single commit.
     fn revset(base: &Base) -> String {
         match base {
             Base::Revision(r) => r.clone(),
-            Base::MergeBase { against } => format!("heads(::@ & ::{})", Self::revset(against)),
+            Base::MergeBase { against } => format!("fork_point({} | @)", Self::revset(against)),
         }
+    }
+
+    /// Resolve a revset to exactly one change id, or empty if it doesn't
+    /// resolve. `--limit 1` matters: without it a revset returning two commits
+    /// concatenates their ids into a string that matches no rev at all, which
+    /// silently drops the marker rather than failing loudly.
+    fn resolve_change_id(&self, revset: &str) -> String {
+        self.run(&[
+            "log",
+            "-r",
+            revset,
+            "--limit",
+            "1",
+            "--no-graph",
+            "-T",
+            "change_id ++ \"\\n\"",
+        ])
+        .ok()
+        .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
+        .unwrap_or_default()
     }
 }
 
@@ -160,6 +208,22 @@ impl Backend for JjBackend {
 
     fn base_label(&self, base: &Base) -> String {
         Self::revset(base)
+    }
+
+    fn base_display(&self, base: &Base) -> String {
+        match base {
+            Base::Revision(r) => match r.as_str() {
+                "@-" => "parent".into(),
+                "@--" => "grandparent".into(),
+                "trunk()" => "trunk".into(),
+                "root()" => "repo root".into(),
+                other => other.into(),
+            },
+            Base::MergeBase { against } => match against.as_ref() {
+                Base::Revision(r) if r == "trunk()" => "branch point".into(),
+                other => format!("branch point off {}", self.base_display(other)),
+            },
+        }
     }
 
     fn list_changes(&self, scope: &Scope, ignore_ws: bool) -> Result<Vec<FileChange>> {
@@ -206,11 +270,12 @@ impl Backend for JjBackend {
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
         let base_revset = Self::revset(base);
 
-        // Resolve base to its canonical change_id
-        let base_id = self
-            .run(&["log", "-r", &base_revset, "--no-graph", "-T", "change_id"])
-            .map(|s| s.trim().to_string())
-            .unwrap_or_default();
+        let base_id = self.resolve_change_id(&base_revset);
+        // Landmarks worth pointing at in the picker. Both are cheap single-rev
+        // resolves, and both are answers to "where would I plausibly want to
+        // be based instead", which is the question the panel exists to answer.
+        let trunk_id = self.resolve_change_id("trunk()");
+        let fork_id = self.resolve_change_id("fork_point(trunk() | @)");
 
         // Get the set of change_ids that fall within the range `base_revset..@`
         let range_output = self
@@ -229,37 +294,83 @@ impl Backend for JjBackend {
             .filter(|id| !id.is_empty())
             .collect();
 
-        // Fetch a slice of recent history (up to 20 revisions) leading to @ and base
-        let revset = format!("::@ | ::{base_revset}");
-        let template = r#"change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\n""#;
-        let out = self.run(&[
-            "log",
-            "-r",
-            &revset,
-            "--limit",
-            "20",
-            "--no-graph",
-            "-T",
-            template,
-        ])?;
+        // Which revs are actually on @'s line. Everything else in the window
+        // belongs to a branch that merely shares history with it.
+        let ancestors: std::collections::HashSet<String> = self
+            .run(&[
+                "log",
+                "-r",
+                "::@",
+                "--no-graph",
+                "-T",
+                "change_id ++ \"\\n\"",
+            ])
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|id| !id.is_empty())
+            .collect();
 
-        let mut revs: Vec<Rev> = out.lines().filter_map(parse_jj_rev_line).collect();
+        // History slice behind @ and the base. The window has to be deep
+        // enough to *choose* a base from, not just to show the current range,
+        // so it reaches further back than the range usually needs. Trunk is
+        // unioned in explicitly: on a long-lived branch it can fall outside a
+        // plain ancestor slice, and it's the one landmark that must be here.
+        //
+        // Drawn *with* the graph, which is not decoration: graph mode also
+        // orders topologically, so a diverged trunk gets grouped under its own
+        // spur instead of being interleaved into @'s line by timestamp. A flat
+        // list of this revset reads as one sequence when it's two.
+        let revset = format!("::@ | ::{base_revset} | ::trunk()");
+        // The leading tab is a sentinel. Graph glyphs are box-drawing
+        // characters and spaces and never contain a tab, so the first tab in a
+        // line is exactly the graph/data boundary — and lines with no tab at
+        // all are pure graph. That keeps this off the rake jjui steps on,
+        // where a `|` in the payload is indistinguishable from a graph pipe.
+        let template = r#""\t" ++ change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\n""#;
+        let out = self.run(&["log", "-r", &revset, "--limit", "40", "-T", template])?;
+
+        let mut revs: Vec<Rev> = Vec::new();
+        for line in out.lines() {
+            match line.split_once('\t') {
+                Some((graph, data)) => {
+                    if let Some(mut rev) = parse_jj_rev_line(data) {
+                        rev.graph = graph.to_string();
+                        revs.push(rev);
+                    }
+                }
+                // A line with no data is graph structure for the rev above it.
+                None if !line.trim().is_empty() => {
+                    if let Some(last) = revs.last_mut() {
+                        last.graph_tail.push(line.to_string());
+                    }
+                }
+                None => {}
+            }
+        }
 
         // Post-process to set relationships
         for r in &mut revs {
             r.is_base = r.id == base_id;
             r.is_in_range = range_ids.contains(&r.id);
+            r.is_trunk = !trunk_id.is_empty() && r.id == trunk_id;
+            r.is_fork_point = !fork_id.is_empty() && r.id == fork_id;
+            r.is_ancestor = ancestors.contains(&r.id);
         }
 
         Ok(revs)
     }
 
     fn default_bases(&self) -> Vec<Base> {
+        // Branch point leads: "what's on this branch and nothing upstream" is
+        // the reading recto is for, and it degrades gracefully — sitting
+        // directly on trunk, the fork point *is* `@-`, so the plain
+        // working-copy case looks the same as it always did.
         vec![
-            Base::Revision("@-".into()),
             Base::MergeBase {
                 against: Box::new(Base::Revision("trunk()".into())),
             },
+            Base::Revision("@-".into()),
             Base::Revision("trunk()".into()),
             Base::Revision("@--".into()),
             Base::Revision("root()".into()),
@@ -319,6 +430,19 @@ impl Backend for GitBackend {
 
     fn base_label(&self, base: &Base) -> String {
         Self::diff_arg(base)
+    }
+
+    fn base_display(&self, base: &Base) -> String {
+        match base {
+            Base::Revision(r) => match r.as_str() {
+                "HEAD" => "working tree".into(),
+                "HEAD~1" => "previous commit".into(),
+                other => other.into(),
+            },
+            Base::MergeBase { against } => {
+                format!("branch point off {}", self.base_display(against))
+            }
+        }
     }
 
     fn list_changes(&self, scope: &Scope, ignore_ws: bool) -> Result<Vec<FileChange>> {
@@ -395,34 +519,64 @@ impl Backend for GitBackend {
             .filter(|sha| !sha.is_empty())
             .collect();
 
-        // Fetch a slice of recent history (up to 20 commits) reachable from HEAD or base_ref
+        // Whichever of main/master this repo actually uses, so the trunk
+        // landmark points somewhere real instead of guessing.
+        let trunk_ref = ["main", "master"]
+            .into_iter()
+            .find(|r| self.run(&["rev-parse", "--verify", "--quiet", r]).is_ok());
+        let trunk_id = trunk_ref
+            .and_then(|r| self.run(&["rev-parse", r]).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+        let fork_id = trunk_ref
+            .and_then(|r| self.run(&["merge-base", r, "HEAD"]).ok())
+            .map(|s| s.trim().to_string())
+            .unwrap_or_default();
+
+        // History slice behind HEAD and the base. Deep enough to choose a base
+        // from, not just to show the current range.
         let out = self.run(&[
             "log",
-            "--format=%H%x09%h%x09%s",
+            "--format=%H%x09%h%x09%s%x09%D",
             "-n",
-            "20",
+            "40",
             "HEAD",
             &base_ref,
         ])?;
 
         let mut revs: Vec<Rev> = out.lines().filter_map(parse_git_rev_line).collect();
 
+        // Which commits are on HEAD's line. jj is the backend that draws a
+        // graph; git stays a flat list, so this is the only thing keeping its
+        // panel honest about a base off to one side.
+        let ancestors: std::collections::HashSet<String> = self
+            .run(&["rev-list", "HEAD"])
+            .unwrap_or_default()
+            .lines()
+            .map(|l| l.trim().to_string())
+            .filter(|sha| !sha.is_empty())
+            .collect();
+
         // Post-process to set relationships
         for r in &mut revs {
             r.is_base = r.id == base_id;
             r.is_head = r.id == head_id;
             r.is_in_range = range_ids.contains(&r.id);
+            r.is_trunk = !trunk_id.is_empty() && r.id == trunk_id;
+            r.is_fork_point = !fork_id.is_empty() && r.id == fork_id;
+            r.is_ancestor = ancestors.contains(&r.id);
         }
 
         Ok(revs)
     }
 
     fn default_bases(&self) -> Vec<Base> {
+        // Branch point leads, matching the jj backend.
         vec![
-            Base::Revision("HEAD".into()),
             Base::MergeBase {
                 against: Box::new(Base::Revision("main".into())),
             },
+            Base::Revision("HEAD".into()),
             Base::Revision("main".into()),
             Base::Revision("master".into()),
             Base::Revision("HEAD~1".into()),
@@ -435,11 +589,12 @@ impl Backend for GitBackend {
 }
 
 fn parse_jj_rev_line(line: &str) -> Option<Rev> {
-    let mut fields = line.splitn(4, '\t');
+    let mut fields = line.splitn(5, '\t');
     let id = fields.next()?.trim().to_string();
     let short_id = fields.next()?.trim().to_string();
     let summary = fields.next().unwrap_or("").trim().to_string();
     let is_wc = fields.next().is_some_and(|s| s.trim() == "true");
+    let refs = parse_refs(fields.next().unwrap_or(""), ',');
     if id.is_empty() {
         return None;
     }
@@ -455,14 +610,39 @@ fn parse_jj_rev_line(line: &str) -> Option<Rev> {
         is_base: false,
         is_head: is_wc,
         is_in_range: false,
+        refs,
+        is_trunk: false,
+        is_fork_point: false,
+        is_ancestor: false,
+        graph: String::new(),
+        graph_tail: Vec::new(),
     })
 }
 
+/// Split a delimited ref list, dropping empties and the noise git's `%D`
+/// carries: `HEAD -> main` is the same ref twice, and remote-tracking copies
+/// of a local bookmark say nothing the local one didn't.
+fn parse_refs(raw: &str, sep: char) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for part in raw.split(sep) {
+        let name = part.trim().trim_start_matches("HEAD -> ").trim();
+        if name.is_empty() || name == "HEAD" {
+            continue;
+        }
+        let short = name.rsplit_once('/').map_or(name, |(_, s)| s);
+        if !out.iter().any(|existing| existing == short) {
+            out.push(short.to_string());
+        }
+    }
+    out
+}
+
 fn parse_git_rev_line(line: &str) -> Option<Rev> {
-    let mut fields = line.splitn(3, '\t');
+    let mut fields = line.splitn(4, '\t');
     let id = fields.next()?.trim().to_string();
     let short_id = fields.next()?.trim().to_string();
     let summary = fields.next().unwrap_or("").trim().to_string();
+    let refs = parse_refs(fields.next().unwrap_or(""), ',');
     if id.is_empty() {
         return None;
     }
@@ -473,6 +653,12 @@ fn parse_git_rev_line(line: &str) -> Option<Rev> {
         is_base: false,
         is_head: false,
         is_in_range: false,
+        refs,
+        is_trunk: false,
+        is_fork_point: false,
+        is_ancestor: false,
+        graph: String::new(),
+        graph_tail: Vec::new(),
     })
 }
 
@@ -512,4 +698,56 @@ fn parse_git_name_status(line: &str) -> Option<FileChange> {
         path: path.to_string(),
         status,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn refs_drop_head_and_its_arrow_form() {
+        assert_eq!(parse_refs("HEAD -> main, origin/main", ','), vec!["main"]);
+        assert_eq!(parse_refs("HEAD", ','), Vec::<String>::new());
+    }
+
+    #[test]
+    fn refs_shorten_and_dedupe_remote_copies() {
+        // origin/main says nothing local main didn't, and a bare list of
+        // "main main" in the panel reads as a bug.
+        assert_eq!(parse_refs("main, origin/main", ','), vec!["main"]);
+        assert_eq!(
+            parse_refs("feature, origin/other", ','),
+            vec!["feature", "other"]
+        );
+    }
+
+    #[test]
+    fn refs_tolerate_empty_and_padded_input() {
+        assert_eq!(parse_refs("", ','), Vec::<String>::new());
+        assert_eq!(parse_refs("  ,  ", ','), Vec::<String>::new());
+        assert_eq!(parse_refs(" main , feat ", ','), vec!["main", "feat"]);
+    }
+
+    #[test]
+    fn jj_merge_base_uses_fork_point() {
+        // The hand-rolled heads(::@ & ::X) form can return two commits on a
+        // criss-cross history, and every caller here wants exactly one.
+        let base = Base::MergeBase {
+            against: Box::new(Base::Revision("trunk()".into())),
+        };
+        assert_eq!(JjBackend::revset(&base), "fork_point(trunk() | @)");
+    }
+
+    #[test]
+    fn jj_base_display_names_the_landmarks() {
+        let jj = JjBackend::new();
+        let fork = Base::MergeBase {
+            against: Box::new(Base::Revision("trunk()".into())),
+        };
+        assert_eq!(jj.base_display(&fork), "branch point");
+        assert_eq!(jj.base_display(&Base::Revision("@-".into())), "parent");
+        // Anything we have no name for falls through as itself rather than
+        // becoming a lie.
+        assert_eq!(jj.base_display(&Base::Revision("abc123".into())), "abc123");
+    }
 }
