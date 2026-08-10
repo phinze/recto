@@ -1,5 +1,6 @@
 mod backend;
 mod funcname;
+mod graph;
 mod highlight;
 mod link;
 mod theme;
@@ -3198,7 +3199,13 @@ fn handle_event(
                 },
                 Mode::Normal => match key.code {
                     KeyCode::Char('?') => app.show_help = true,
-                    KeyCode::Char('q') | KeyCode::Esc => {
+                    // `q` quits, which is what the footer has been promising
+                    // in every state. It used to share Esc's peel-one-layer
+                    // chain, so leaving the rev panel took three presses:
+                    // cancel, change focus, quit. Esc keeps the chain, since
+                    // backing out a layer at a time is exactly what it's for.
+                    KeyCode::Char('q') => return Ok(Action::Quit),
+                    KeyCode::Esc => {
                         if app.search_query.is_some() {
                             app.clear_search();
                         } else if app.focus_span.is_some() {
@@ -3505,7 +3512,6 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         ])
         .split(area);
 
-    let n_revs = app.revs.len();
     // Revs *in the diff*, not revs in the panel. The panel window is
     // deliberately deeper than the range so there's something to pick a base
     // from, which makes its length a number about the picker rather than
@@ -3518,8 +3524,22 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             if n_in_range == 1 { "" } else { "s" }
         ),
         Cursor::Rev(i) => {
+            // Position among the revs in the *diff*, not among the rows in the
+            // picker window. Counting against the window gave "rev 4/40" for
+            // the first of two revs you're actually reading, disagreeing with
+            // the "2 revs" this same header shows for the range.
             let r = &app.revs[i];
-            format!("rev {}/{} · {} {}", i + 1, n_revs, r.short_id, r.summary)
+            let place = app.revs[..=i].iter().filter(|x| x.is_in_range).count();
+            if r.is_in_range && n_in_range > 0 {
+                format!(
+                    "rev {}/{} · {} {}",
+                    place, n_in_range, r.short_id, r.summary
+                )
+            } else {
+                // Outside the range there's no "of N" to be part of, so don't
+                // invent one.
+                format!("rev {} {}", r.short_id, r.summary)
+            }
         }
     };
     let mut header_spans = vec![Span::styled(
@@ -3930,6 +3950,7 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let picking = app.base_pick;
 
     let mut items: Vec<ListItem> = Vec::with_capacity(app.revs.len() + 1);
+    let in_range = app.revs.iter().filter(|r| r.is_in_range).count();
 
     let all_marker = if cursor_idx == 0 { "▸ " } else { "  " };
     items.push(ListItem::new(Line::from(vec![
@@ -3944,6 +3965,18 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             "all changes",
             Style::default().add_modifier(Modifier::ITALIC),
         ),
+        // Say the range in words on the row that means it. Everything else in
+        // this panel encodes the range in glyphs and colour, which is a lot to
+        // reassemble when you just want to know what you're looking at.
+        Span::styled(
+            format!(
+                "  {} rev{} from {}",
+                in_range,
+                if in_range == 1 { "" } else { "s" },
+                app.base_text(app.base())
+            ),
+            Style::default().fg(theme::OVERLAY0),
+        ),
     ])));
 
     // Display row for each rev, since graph tails put rows between them and
@@ -3951,6 +3984,15 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let mut rev_rows: Vec<usize> = Vec::with_capacity(app.revs.len());
 
     for (i, rev) in app.revs.iter().enumerate() {
+        // The connector goes *above* the rev the lines meet at, between it and
+        // the last row of the spur folding in. Recorded before `rev_rows` so
+        // the selection index still lands on the rev's own row.
+        if let Some(join) = &rev.graph_join {
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled("  ", Style::default()),
+                Span::styled(join.clone(), Style::default().fg(theme::OVERLAY0)),
+            ])));
+        }
         rev_rows.push(items.len());
         let is_pick = picking == Some(i);
         // Two distinct glyphs in the leftmost column rather than a trailing
@@ -3993,6 +4035,21 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Style::default().fg(theme::TEXT)
         };
 
+        // Now that recto draws the graph, the node *is* the bullet: one glyph
+        // carrying both "where this rev sits" and "what it is to the current
+        // diff", instead of the two competing symbols this had before. The
+        // vocabulary follows jj's so it reads the same as the rest of the
+        // jj world.
+        let node = if rev.is_head {
+            "@"
+        } else if rev.is_base {
+            "○"
+        } else if rev.is_in_range {
+            "●"
+        } else {
+            "·"
+        };
+
         let mut spans = vec![
             Span::styled(
                 marker,
@@ -4000,51 +4057,39 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                     .fg(theme::MAUVE)
                     .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(rev.graph.clone(), graph_style),
+            Span::styled(rev.graph.clone(), Style::default().fg(theme::OVERLAY0)),
+            Span::styled(node.to_string(), graph_style),
+            Span::styled(" ", Style::default()),
+            Span::styled(
+                rev.graph_right.clone(),
+                Style::default().fg(theme::OVERLAY0),
+            ),
             Span::styled(format!("{} ", rev.short_id), id_style),
         ];
 
-        // Landmarks go before the description, not after it. They're what
-        // makes the panel a picker rather than a list, and appended they were
-        // the first thing a narrow pane threw away — leaving the hundredth
-        // identical "bump 1 fast-moving input(s)" occupying the width that
-        // "(trunk)" needed.
-        if rev.is_base {
-            spans.push(Span::styled(
-                "(base) ",
-                Style::default()
-                    .fg(theme::YELLOW)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-        if rev.is_head {
-            let head_label = if rev.id.len() == 32 {
-                "(@) "
-            } else {
-                "(HEAD) "
-            };
-            spans.push(Span::styled(
-                head_label,
-                Style::default()
-                    .fg(theme::MAUVE)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-        // The fork point is suppressed when it's already the base, since
-        // "(base) (branch point)" is two labels for one fact.
-        if rev.is_fork_point && !rev.is_base {
-            spans.push(Span::styled(
-                "(branch point) ",
-                Style::default()
-                    .fg(theme::YELLOW)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
+        // Only *identity* goes in the label slot: what this rev is, which is
+        // true no matter what you're doing with it. State — "this is what I'm
+        // diffing from", "this is the working copy" — lives in the node glyph
+        // instead. Rendering both as parenthesised tags made (base), (trunk)
+        // and (branch point) read as three coequal facts when it's really one
+        // dial and two signposts, which is the part that doesn't land.
+        //
+        // Labels lead the description because appended they were the first
+        // thing a narrow pane threw away, leaving the hundredth identical
+        // "bump 1 fast-moving input(s)" holding the width "trunk" needed.
         if rev.is_trunk {
             spans.push(Span::styled(
-                "(trunk) ",
+                "trunk ",
                 Style::default()
                     .fg(theme::TEAL)
+                    .add_modifier(Modifier::ITALIC),
+            ));
+        }
+        if rev.is_fork_point {
+            spans.push(Span::styled(
+                "branch point ",
+                Style::default()
+                    .fg(theme::YELLOW)
                     .add_modifier(Modifier::ITALIC),
             ));
         }
@@ -4057,16 +4102,6 @@ fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         spans.push(Span::styled(rev.summary.clone(), summary_style));
 
         items.push(ListItem::new(Line::from(spans)));
-
-        // Graph structure jj drew below this rev — the `├─╯` closing a fork,
-        // or `~` for elided history. Indented past the marker column so it
-        // lines up with the glyphs on the rev rows.
-        for tail in &rev.graph_tail {
-            items.push(ListItem::new(Line::from(vec![
-                Span::styled("  ", Style::default()),
-                Span::styled(tail.clone(), Style::default().fg(theme::OVERLAY0)),
-            ])));
-        }
     }
 
     let title = if picking.is_some() {

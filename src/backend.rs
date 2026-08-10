@@ -59,14 +59,18 @@ pub struct Rev {
     /// other line's commits as reversals, so the panel says so rather than
     /// letting the choice look as ordinary as any other.
     pub is_ancestor: bool,
-    /// Graph glyphs jj drew to the left of this rev's line, e.g. `"│ "`.
-    /// Empty for backends that don't draw one.
+    /// Parent ids, for laying out the graph. Parents outside the window are
+    /// kept here and simply ignored by the layout, which is what makes the
+    /// drawing stop at the bottom of the slice rather than run off it.
+    pub parents: Vec<String>,
+    /// Lane glyphs left of this rev's node, filled in by `crate::graph`.
     pub graph: String,
-    /// Pure-graph lines that followed this rev with no rev of their own —
-    /// the `├─╯` that closes a fork, or the `~` marking elided history.
-    /// Carried on the preceding rev so `revs` stays a list of real revs and
-    /// every index into it is still selectable.
-    pub graph_tail: Vec<String>,
+    /// Lanes continuing to the right of the node.
+    pub graph_right: String,
+    /// Connector drawn above this rev when lines converge into it, e.g.
+    /// `├─╯`. Kept on the rev it describes rather than as its own entry so
+    /// `revs` stays a list of real revs and every index is still selectable.
+    pub graph_join: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -271,6 +275,7 @@ impl Backend for JjBackend {
         let base_revset = Self::revset(base);
 
         let base_id = self.resolve_change_id(&base_revset);
+        let wc_id = self.resolve_change_id("@");
         // Landmarks worth pointing at in the picker. Both are cheap single-rev
         // resolves, and both are answers to "where would I plausibly want to
         // be based instead", which is the question the panel exists to answer.
@@ -317,37 +322,25 @@ impl Backend for JjBackend {
         // unioned in explicitly: on a long-lived branch it can fall outside a
         // plain ancestor slice, and it's the one landmark that must be here.
         //
-        // Drawn *with* the graph, which is not decoration: graph mode also
-        // orders topologically, so a diverged trunk gets grouped under its own
-        // spur instead of being interleaved into @'s line by timestamp. A flat
-        // list of this revset reads as one sequence when it's two.
+        // `--no-graph` with an explicit template is the stable contract: we
+        // named the fields and separators, so jj changing how it *renders* a
+        // log can't reach us. Topology comes back as parent ids and the graph
+        // is drawn from those in `crate::graph`, which is why this asks for
+        // data rather than glyphs.
         let revset = format!("::@ | ::{base_revset} | ::trunk()");
-        // The leading tab is a sentinel. Graph glyphs are box-drawing
-        // characters and spaces and never contain a tab, so the first tab in a
-        // line is exactly the graph/data boundary — and lines with no tab at
-        // all are pure graph. That keeps this off the rake jjui steps on,
-        // where a `|` in the payload is indistinguishable from a graph pipe.
-        let template = r#""\t" ++ change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\n""#;
-        let out = self.run(&["log", "-r", &revset, "--limit", "40", "-T", template])?;
+        let template = r#"change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\t" ++ parents.map(|p| p.change_id()).join(" ") ++ "\n""#;
+        let out = self.run(&[
+            "log",
+            "-r",
+            &revset,
+            "--limit",
+            "40",
+            "--no-graph",
+            "-T",
+            template,
+        ])?;
 
-        let mut revs: Vec<Rev> = Vec::new();
-        for line in out.lines() {
-            match line.split_once('\t') {
-                Some((graph, data)) => {
-                    if let Some(mut rev) = parse_jj_rev_line(data) {
-                        rev.graph = graph.to_string();
-                        revs.push(rev);
-                    }
-                }
-                // A line with no data is graph structure for the rev above it.
-                None if !line.trim().is_empty() => {
-                    if let Some(last) = revs.last_mut() {
-                        last.graph_tail.push(line.to_string());
-                    }
-                }
-                None => {}
-            }
-        }
+        let mut revs: Vec<Rev> = out.lines().filter_map(parse_jj_rev_line).collect();
 
         // Post-process to set relationships
         for r in &mut revs {
@@ -358,7 +351,7 @@ impl Backend for JjBackend {
             r.is_ancestor = ancestors.contains(&r.id);
         }
 
-        Ok(revs)
+        Ok(draw_graph(revs, &wc_id))
     }
 
     fn default_bases(&self) -> Vec<Base> {
@@ -589,12 +582,18 @@ impl Backend for GitBackend {
 }
 
 fn parse_jj_rev_line(line: &str) -> Option<Rev> {
-    let mut fields = line.splitn(5, '\t');
+    let mut fields = line.splitn(6, '\t');
     let id = fields.next()?.trim().to_string();
     let short_id = fields.next()?.trim().to_string();
     let summary = fields.next().unwrap_or("").trim().to_string();
     let is_wc = fields.next().is_some_and(|s| s.trim() == "true");
     let refs = parse_refs(fields.next().unwrap_or(""), ',');
+    let parents: Vec<String> = fields
+        .next()
+        .unwrap_or("")
+        .split_whitespace()
+        .map(|s| s.to_string())
+        .collect();
     if id.is_empty() {
         return None;
     }
@@ -614,9 +613,57 @@ fn parse_jj_rev_line(line: &str) -> Option<Rev> {
         is_trunk: false,
         is_fork_point: false,
         is_ancestor: false,
+        parents,
         graph: String::new(),
-        graph_tail: Vec::new(),
+        graph_right: String::new(),
+        graph_join: None,
     })
+}
+
+/// Reorder revs children-before-parents and fill in their lane glyphs.
+/// Splitting this out of `list_revs` keeps the jj call and the drawing
+/// separable, and means the drawing is reachable from a test without a repo.
+fn draw_graph(revs: Vec<Rev>, priority: &str) -> Vec<Rev> {
+    let nodes: Vec<crate::graph::Node<'_>> = revs
+        .iter()
+        .map(|r| crate::graph::Node {
+            id: &r.id,
+            parents: &r.parents,
+        })
+        .collect();
+    let order = crate::graph::topo_order(
+        &nodes,
+        if priority.is_empty() {
+            None
+        } else {
+            Some(priority)
+        },
+    );
+
+    let ordered: Vec<crate::graph::Node<'_>> = order
+        .iter()
+        .map(|&i| crate::graph::Node {
+            id: &revs[i].id,
+            parents: &revs[i].parents,
+        })
+        .collect();
+    let rows = crate::graph::lay_out(&ordered);
+
+    // `order` indexes the original vec, so walk it rather than sorting in
+    // place; the rows come back parallel to the ordered view, not the input.
+    let mut by_index: Vec<Option<Rev>> = revs.into_iter().map(Some).collect();
+    order
+        .into_iter()
+        .zip(rows)
+        .filter_map(|(i, row)| {
+            by_index[i].take().map(|mut rev| {
+                rev.graph = row.left;
+                rev.graph_right = row.right;
+                rev.graph_join = row.join;
+                rev
+            })
+        })
+        .collect()
 }
 
 /// Split a delimited ref list, dropping empties and the noise git's `%D`
@@ -657,8 +704,10 @@ fn parse_git_rev_line(line: &str) -> Option<Rev> {
         is_trunk: false,
         is_fork_point: false,
         is_ancestor: false,
+        parents: Vec::new(),
         graph: String::new(),
-        graph_tail: Vec::new(),
+        graph_right: String::new(),
+        graph_join: None,
     })
 }
 
