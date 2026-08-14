@@ -66,6 +66,11 @@ review threads. The user toggles between it and the diff with `p`, moves among
 public threads with `t` / `T`, and presses `enter` on an anchored thread in the
 diff to open its full conversation.
 
+Published threads, shared review drafts, and private agent notes also appear as
+typed child rows beneath their changed file in the file pane. Moving onto a
+child with `j` / `k` reveals its anchor in the diff. `enter` opens a published
+conversation or the matching draft/note editor.
+
 ## Co-author a public review draft
 
 Shared review comments are durable local drafts, not published GitHub content

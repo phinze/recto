@@ -266,15 +266,23 @@ enum Cursor {
     Rev(usize),
 }
 
-/// One rendered line of the file pane. `Dir` is a muted group header injected
-/// when the directory changes as we walk `changes` in order; `File(i)` indexes
-/// back into `changes`. `file_state` selects in this row space, so navigation
-/// has to skip `Dir` rows and callers go through `selected_change` /
-/// `select_change` to translate between row and change indices.
+/// One rendered line of the file pane. Review objects are typed child rows so
+/// the pane is also a navigator without collapsing their different semantics.
 #[derive(Debug, Clone, PartialEq, Eq)]
 enum FileRow {
     Dir(String),
     File(usize),
+    ReviewObject {
+        file_idx: usize,
+        object: FileReviewObject,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FileReviewObject {
+    PublishedThread(usize),
+    SharedDraft(u64),
+    AgentNote(usize),
 }
 
 /// Directory component of a change path, or `None` for a root-level file.
@@ -305,9 +313,63 @@ fn build_file_rows(changes: &[FileChange]) -> Vec<FileRow> {
     rows
 }
 
+fn build_review_file_rows(
+    changes: &[FileChange],
+    threads: &[link::ReviewThread],
+    drafts: &[link::DraftReviewComment],
+    agent_notes: &[AgentNote],
+) -> Vec<FileRow> {
+    let mut rows = Vec::new();
+    for row in build_file_rows(changes) {
+        let file_idx = match row {
+            FileRow::File(i) => Some(i),
+            _ => None,
+        };
+        rows.push(row);
+        let Some(file_idx) = file_idx else {
+            continue;
+        };
+        let path = &changes[file_idx].path;
+        rows.extend(
+            threads
+                .iter()
+                .enumerate()
+                .filter(|(_, thread)| thread.path == *path)
+                .map(|(i, _)| FileRow::ReviewObject {
+                    file_idx,
+                    object: FileReviewObject::PublishedThread(i),
+                }),
+        );
+        rows.extend(
+            drafts
+                .iter()
+                .filter(|comment| comment.path == *path)
+                .map(|comment| FileRow::ReviewObject {
+                    file_idx,
+                    object: FileReviewObject::SharedDraft(comment.id),
+                }),
+        );
+        rows.extend(
+            agent_notes
+                .iter()
+                .enumerate()
+                .filter(|(_, note)| note.path == *path)
+                .map(|(i, _)| FileRow::ReviewObject {
+                    file_idx,
+                    object: FileReviewObject::AgentNote(i),
+                }),
+        );
+    }
+    rows
+}
+
 /// Row index of the first selectable file row, skipping any leading header.
 fn first_file_row(rows: &[FileRow]) -> Option<usize> {
     rows.iter().position(|r| matches!(r, FileRow::File(_)))
+}
+
+fn file_row_selectable(row: &FileRow) -> bool {
+    !matches!(row, FileRow::Dir(_))
 }
 
 /// Top-level interaction mode.
@@ -1458,8 +1520,46 @@ impl App {
     fn selected_change(&self) -> Option<usize> {
         match self.file_rows.get(self.file_state.selected()?)? {
             FileRow::File(i) => Some(*i),
+            FileRow::ReviewObject { file_idx, .. } => Some(*file_idx),
             FileRow::Dir(_) => None,
         }
+    }
+
+    fn rebuild_file_rows(&mut self) {
+        let selected = self
+            .file_state
+            .selected()
+            .and_then(|row| self.file_rows.get(row))
+            .cloned();
+        let selected_change = selected.as_ref().and_then(|row| match row {
+            FileRow::File(i) => Some(*i),
+            FileRow::ReviewObject { file_idx, .. } => Some(*file_idx),
+            FileRow::Dir(_) => None,
+        });
+
+        let threads = self
+            .pull_request
+            .as_ref()
+            .map_or(&[][..], |pr| pr.threads.as_slice());
+        let rows = build_review_file_rows(
+            &self.changes,
+            threads,
+            &self.review_draft_comments,
+            &self.agent_notes,
+        );
+
+        let selected_row = selected
+            .as_ref()
+            .and_then(|selected| rows.iter().position(|row| row == selected))
+            .or_else(|| {
+                selected_change.and_then(|change_idx| {
+                    rows.iter()
+                        .position(|row| matches!(row, FileRow::File(i) if *i == change_idx))
+                })
+            })
+            .or_else(|| first_file_row(&rows));
+        self.file_rows = rows;
+        self.file_state.select(selected_row);
     }
 
     /// Move the file-pane selection to the row showing `change_idx`.
@@ -1480,7 +1580,7 @@ impl App {
             .iter()
             .enumerate()
             .skip(cur + 1)
-            .find(|(_, r)| matches!(r, FileRow::File(_)))
+            .find(|(_, r)| file_row_selectable(r))
             .map(|(i, _)| i)
         {
             self.file_state.select(Some(row));
@@ -1495,7 +1595,7 @@ impl App {
             .enumerate()
             .take(cur)
             .rev()
-            .find(|(_, r)| matches!(r, FileRow::File(_)))
+            .find(|(_, r)| file_row_selectable(r))
             .map(|(i, _)| i)
         {
             self.file_state.select(Some(row));
@@ -1503,14 +1603,124 @@ impl App {
     }
 
     fn jump_to_selected(&mut self) {
-        let Some(i) = self.selected_change() else {
+        let Some(row) = self
+            .file_state
+            .selected()
+            .and_then(|row| self.file_rows.get(row))
+            .cloned()
+        else {
             return;
         };
-        if let Some(&offset) = self.file_starts.get(i) {
-            self.scroll = self
-                .display_row_of_line(offset as usize)
-                .min(self.max_scroll());
-            self.h_scroll = 0;
+        match row {
+            FileRow::File(i) => {
+                if let Some(&offset) = self.file_starts.get(i) {
+                    self.scroll = self
+                        .display_row_of_line(offset as usize)
+                        .min(self.max_scroll());
+                    self.h_scroll = 0;
+                }
+            }
+            FileRow::ReviewObject { object, .. } => self.reveal_file_review_object(object),
+            FileRow::Dir(_) => {}
+        }
+    }
+
+    fn reveal_file_review_object(&mut self, object: FileReviewObject) {
+        let anchor = match object {
+            FileReviewObject::PublishedThread(i) => {
+                self.active_thread = Some(i);
+                self.pull_request
+                    .as_ref()
+                    .and_then(|pr| pr.threads.get(i))
+                    .and_then(|thread| {
+                        review_thread_span(thread)
+                            .map(|(start, end)| (thread.path.clone(), start, end))
+                    })
+            }
+            FileReviewObject::SharedDraft(id) => self
+                .review_draft_comments
+                .iter()
+                .find(|comment| comment.id == id)
+                .map(|comment| (comment.path.clone(), comment.start, comment.end)),
+            FileReviewObject::AgentNote(i) => self
+                .agent_notes
+                .get(i)
+                .map(|note| (note.path.clone(), note.start, note.end)),
+        };
+        let Some((path, start, end)) = anchor else {
+            return;
+        };
+        let Some(file_idx) = self.changes.iter().position(|change| change.path == path) else {
+            return;
+        };
+        if let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end) {
+            let selected_row = self.file_state.selected();
+            self.reveal_span(&rows);
+            self.file_state.select(selected_row);
+            self.diff_cursor = Some(*rows.start());
+        }
+    }
+
+    fn activate_selected_file_row(&mut self) {
+        let Some(row) = self
+            .file_state
+            .selected()
+            .and_then(|row| self.file_rows.get(row))
+            .cloned()
+        else {
+            return;
+        };
+        match row {
+            FileRow::File(_) => self.jump_to_selected(),
+            FileRow::ReviewObject {
+                object: FileReviewObject::PublishedThread(i),
+                ..
+            } => {
+                self.active_thread = Some(i);
+                self.thread_scroll = 0;
+                self.page = Page::ReviewThread;
+            }
+            FileRow::ReviewObject {
+                object: FileReviewObject::SharedDraft(id),
+                ..
+            } => {
+                let Some(comment) = self
+                    .review_draft_comments
+                    .iter()
+                    .find(|comment| comment.id == id)
+                else {
+                    return;
+                };
+                let body = comment.body.clone();
+                self.mode = Mode::NoteInput(NoteDraft {
+                    kind: ComposerKind::ReviewComment,
+                    path: comment.path.clone(),
+                    line: comment.start,
+                    caret: body.chars().count(),
+                    body,
+                    error: None,
+                    editing: Some(ComposerEdit::ReviewComment(id)),
+                });
+            }
+            FileRow::ReviewObject {
+                object: FileReviewObject::AgentNote(i),
+                ..
+            } => {
+                let Some(note) = self.agent_notes.get(i) else {
+                    return;
+                };
+                let body = note.body.clone();
+                self.mode = Mode::NoteInput(NoteDraft {
+                    kind: ComposerKind::AgentNote,
+                    path: note.path.clone(),
+                    line: note.start,
+                    caret: body.chars().count(),
+                    body,
+                    error: None,
+                    editing: Some(ComposerEdit::AgentNote(i)),
+                });
+            }
+            FileRow::Dir(_) => {}
         }
     }
 
@@ -1745,6 +1955,7 @@ impl App {
     /// editor jumps stay anchored to real diff lines; everything downstream
     /// (scroll, search, clicks) sees one consistent rendered stream.
     fn reweave(&mut self) {
+        self.rebuild_file_rows();
         let mut inserts: Vec<(usize, Line<'static>)> = Vec::new();
         for (i, a) in self.annotations.iter().enumerate() {
             let Some(file_idx) = self.changes.iter().position(|c| c.path == a.path) else {
@@ -4075,7 +4286,10 @@ fn handle_event(
                         app.toggle_files();
                     }
                     KeyCode::Enter => {
-                        if app.focus != Focus::Diff || !app.open_thread_at_cursor() {
+                        if app.focus == Focus::Files {
+                            app.activate_selected_file_row();
+                            mode = app.mode.clone();
+                        } else if app.focus != Focus::Diff || !app.open_thread_at_cursor() {
                             app.jump_to_selected();
                         }
                     }
@@ -4281,7 +4495,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 if m.row >= inner_y {
                     let row = (m.row - inner_y) as usize + app.file_state.offset();
                     // Header rows aren't selectable; clicking one is a no-op.
-                    if let Some(FileRow::File(_)) = app.file_rows.get(row) {
+                    if app.file_rows.get(row).is_some_and(file_row_selectable) {
                         app.file_state.select(Some(row));
                         app.jump_to_selected();
                     }
@@ -4572,7 +4786,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                         )
                     }
                     Focus::Files => {
-                        format!("q quit · tab focus · b base · {wrap_hint} · {ws_hint} · ? help")
+                        format!(
+                            "q quit · j k select · enter open · tab focus · b base · {wrap_hint} · {ws_hint} · ? help"
+                        )
                     }
                     Focus::Diff => {
                         format!(
@@ -5051,7 +5267,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("j k  ↓ ↑", "move diff cursor / selection"),
     bind("h l  ← →", "scroll diff horizontally"),
     bind("0", "reset horizontal scroll"),
-    bind("enter", "open selected file's diff"),
+    bind("enter", "open selected file or review object"),
     bind("w", "toggle line wrap"),
     bind("W", "toggle ignore whitespace"),
     head("Focus"),
@@ -5177,6 +5393,7 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 let stats = app.file_stats.get(*i).copied().unwrap_or((0, 0));
                 file_row_line(&app.changes[*i], stats, inner_width)
             }
+            FileRow::ReviewObject { object, .. } => file_review_object_line(app, *object),
         })
         .collect();
     let files_focused = app.focus == Focus::Files && matches!(app.mode, Mode::Normal);
@@ -5184,6 +5401,71 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         .block(pane_block("Files", files_focused, app.terminal_focused))
         .highlight_style(Style::default().add_modifier(Modifier::REVERSED));
     frame.render_stateful_widget(tree, area, &mut app.file_state);
+}
+
+fn file_review_object_line(app: &App, object: FileReviewObject) -> ListItem<'static> {
+    let spans = match object {
+        FileReviewObject::PublishedThread(i) => {
+            let thread = app.pull_request.as_ref().and_then(|pr| pr.threads.get(i));
+            let author = thread
+                .and_then(|thread| thread.comments.first())
+                .map(|comment| format!("@{}", comment.author.login))
+                .unwrap_or_else(|| "thread".into());
+            let state = thread.map_or("", |thread| {
+                if thread.outdated {
+                    " · outdated"
+                } else if thread.resolved {
+                    " · resolved"
+                } else {
+                    ""
+                }
+            });
+            vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("◉{}", i + 1),
+                    Style::default()
+                        .fg(theme::TEAL)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(" {author}{state}"),
+                    Style::default().fg(theme::SUBTEXT0),
+                ),
+            ]
+        }
+        FileReviewObject::SharedDraft(id) => {
+            let comment = app
+                .review_draft_comments
+                .iter()
+                .find(|comment| comment.id == id);
+            let editor = comment.map_or("draft", |comment| match comment.last_editor {
+                link::DraftEditor::User => "you edited",
+                link::DraftEditor::Agent => "agent edited",
+            });
+            vec![
+                Span::raw("  "),
+                Span::styled(
+                    format!("✎{id}"),
+                    Style::default()
+                        .fg(theme::YELLOW)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {editor}"), Style::default().fg(theme::SUBTEXT0)),
+            ]
+        }
+        FileReviewObject::AgentNote(i) => vec![
+            Span::raw("  "),
+            Span::styled(
+                agent_note_badge(i + 1),
+                Style::default()
+                    .fg(theme::PEACH)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" agent note", Style::default().fg(theme::SUBTEXT0)),
+        ],
+    };
+    ListItem::new(Line::from(spans))
 }
 
 fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -6490,6 +6772,58 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert_eq!(rows, vec![FileRow::Dir("src/".into()), FileRow::File(0)]);
         // First selectable row skips the leading header.
         assert_eq!(first_file_row(&rows), Some(1));
+    }
+
+    #[test]
+    fn review_objects_nest_under_their_file_without_losing_type() {
+        let changes = [change("src/main.rs"), change("src/link.rs")];
+        let threads = [link::ReviewThread {
+            id: "thread-1".into(),
+            path: "src/link.rs".into(),
+            side: link::DiffSide::Right,
+            line: Some(42),
+            start_line: None,
+            original_line: Some(42),
+            original_start_line: None,
+            resolved: false,
+            outdated: false,
+            comments: Vec::new(),
+        }];
+        let drafts = [link::DraftReviewComment {
+            id: 7,
+            path: "src/link.rs".into(),
+            start: 42,
+            end: 42,
+            body: "Shared words.".into(),
+            last_editor: link::DraftEditor::Agent,
+        }];
+        let notes = [AgentNote {
+            path: "src/link.rs".into(),
+            start: 42,
+            end: 42,
+            body: "Private direction.".into(),
+        }];
+
+        assert_eq!(
+            build_review_file_rows(&changes, &threads, &drafts, &notes),
+            vec![
+                FileRow::Dir("src/".into()),
+                FileRow::File(0),
+                FileRow::File(1),
+                FileRow::ReviewObject {
+                    file_idx: 1,
+                    object: FileReviewObject::PublishedThread(0),
+                },
+                FileRow::ReviewObject {
+                    file_idx: 1,
+                    object: FileReviewObject::SharedDraft(7),
+                },
+                FileRow::ReviewObject {
+                    file_idx: 1,
+                    object: FileReviewObject::AgentNote(0),
+                },
+            ]
+        );
     }
 
     #[test]
