@@ -181,13 +181,15 @@ enum ClientCommand {
     Clear,
     /// Check that a recto is listening for this workspace.
     Ping,
-    /// Leave a review comment for an agent to pick up. SPEC is
-    /// `path:LINE=body` or `path:START-END=body`. Comments accumulate; run
+    /// Leave a private note for the local agent. SPEC is
+    /// `path:LINE=body` or `path:START-END=body`. Notes accumulate; run
     /// this once per note.
-    Comment { spec: String },
-    /// Drain the pending review comments as agent-ready markdown, clearing
+    #[command(alias = "comment")]
+    Note { spec: String },
+    /// Drain the pending agent notes as agent-ready markdown, clearing
     /// them from the running recto.
-    Comments,
+    #[command(alias = "comments")]
+    Notes,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -290,14 +292,14 @@ fn first_file_row(rows: &[FileRow]) -> Option<usize> {
 enum Mode {
     Normal,
     SearchInput { query: String },
-    CommentInput(CommentDraft),
+    NoteInput(NoteDraft),
 }
 
-/// A comment being written. The anchor is captured when the modal opens rather
+/// A private agent note being written. The anchor is captured when the modal opens rather
 /// than read at submit time, so a diff reload mid-sentence can't move the note
 /// to a different line than the one the reviewer was looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]
-struct CommentDraft {
+struct NoteDraft {
     path: String,
     line: u32,
     body: String,
@@ -305,12 +307,12 @@ struct CommentDraft {
     caret: usize,
     /// Why the last submit bounced, shown in the modal so the text isn't lost.
     error: Option<String>,
-    /// Index into `App::comments` when this is re-opening an existing note
+    /// Index into `App::agent_notes` when this is re-opening an existing note
     /// rather than writing a new one. Submitting an empty body deletes it.
     editing: Option<usize>,
 }
 
-impl CommentDraft {
+impl NoteDraft {
     fn byte_at(&self, caret: usize) -> usize {
         self.body
             .char_indices()
@@ -510,7 +512,7 @@ struct Annotation {
 /// way an [`Annotation`] is, but it flows the other direction: the agent writes
 /// annotations for us to read, we write these for the agent to drain.
 #[derive(Clone, Debug, PartialEq, Eq)]
-struct Comment {
+struct AgentNote {
     path: String,
     start: u32,
     end: u32,
@@ -615,10 +617,10 @@ struct App {
     files_area: Rect,
     diff_content_area: Rect,
     commits_area: Rect,
-    /// Column count the comment modal last wrapped its body to. Left behind by
+    /// Column count the agent-note modal last wrapped its body to. Left behind by
     /// the draw pass so key handling can move the caret by visual row without
     /// re-deriving the popup geometry.
-    comment_wrap_width: usize,
+    note_wrap_width: usize,
     commits_state: ListState,
     search_query: Option<String>,
     search_matches: Vec<SearchMatch>,
@@ -628,11 +630,11 @@ struct App {
     /// Companion-driven tour annotations, in step order. Sticky like
     /// `focus_span`; replaced wholesale by each `annotate` request.
     annotations: Vec<Annotation>,
-    /// Reviewer comments awaiting a drain, in authoring order. Deliberately not
+    /// Private agent notes awaiting a drain, in authoring order. Deliberately not
     /// on any clear path: `clear`, Esc and `q` all drop the agent's tour, and
     /// sweeping up our own undelivered notes alongside it would be data loss.
     /// Draining is the only thing that empties this.
-    comments: Vec<Comment>,
+    agent_notes: Vec<AgentNote>,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
     /// here, `e` goes here" marker. Cleared on reload since the index is
@@ -726,14 +728,14 @@ impl App {
             commits_area: Rect::default(),
             // Plausible stand-in for the one frame between opening the modal
             // and drawing it; the real width lands before any key arrives.
-            comment_wrap_width: 76,
+            note_wrap_width: 76,
             commits_state: ListState::default(),
             search_query: None,
             search_matches: Vec::new(),
             search_active_idx: None,
             focus_span: None,
             annotations: Vec::new(),
-            comments: Vec::new(),
+            agent_notes: Vec::new(),
             diff_cursor: None,
             show_files: false,
             show_commits: false,
@@ -1515,7 +1517,7 @@ impl App {
             capabilities: link::Capabilities::recto(),
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
-            pending_comments: self.comments.len(),
+            pending_comments: self.agent_notes.len(),
         }
     }
 
@@ -1525,7 +1527,7 @@ impl App {
             link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
             link::Request::Annotate { sites } => self.annotate(sites),
-            // Deliberately leaves `comments` alone: `clear` is how an agent
+            // Deliberately leaves `agent_notes` alone: `clear` is how an agent
             // tidies up its own tour, and it has no business discarding review
             // notes it hasn't read yet.
             link::Request::Clear => {
@@ -1536,13 +1538,13 @@ impl App {
                 }
                 link::Response::ok()
             }
-            link::Request::Comment {
+            link::Request::AgentNote {
                 path,
                 start,
                 end,
                 body,
-            } => self.add_comment(&path, start, end, body),
-            link::Request::Comments => self.drain_comments(),
+            } => self.add_agent_note(&path, start, end, body),
+            link::Request::AgentNotes => self.drain_agent_notes(),
         }
     }
 
@@ -1650,7 +1652,7 @@ impl App {
             };
             inserts.push((*rows.start(), note_line(i + 1, &a.label)));
         }
-        for (i, c) in self.comments.iter().enumerate() {
+        for (i, c) in self.agent_notes.iter().enumerate() {
             let Some(file_idx) = self.changes.iter().position(|ch| ch.path == c.path) else {
                 continue;
             };
@@ -1660,7 +1662,7 @@ impl App {
             // A comment body can be several lines; each gets its own row so a
             // long note stays readable instead of being truncated to a preview.
             for (j, text) in c.body.lines().enumerate() {
-                inserts.push((*rows.start(), comment_line(i + 1, text, j == 0)));
+                inserts.push((*rows.start(), agent_note_line(i + 1, text, j == 0)));
             }
         }
         if inserts.is_empty() {
@@ -1750,7 +1752,7 @@ impl App {
     /// `annotate` this accumulates rather than replacing — a review is built up
     /// one note at a time. Refuses spans that aren't on screen, since a comment
     /// the reviewer can't see is one they can't trust they actually left.
-    fn add_comment(
+    fn add_agent_note(
         &mut self,
         path: &str,
         start: u32,
@@ -1759,7 +1761,7 @@ impl App {
     ) -> link::Response {
         let body = body.trim().to_string();
         if body.is_empty() {
-            return link::Response::err("comment body is empty");
+            return link::Response::err("note body is empty");
         }
         let end = end.unwrap_or(start).max(start);
         let Some(file_idx) = self.changes.iter().position(|c| c.path == path) else {
@@ -1770,7 +1772,7 @@ impl App {
                 "{path}:{start}-{end} not in current diff (outside any shown hunk)"
             ));
         }
-        self.comments.push(Comment {
+        self.agent_notes.push(AgentNote {
             path: path.to_string(),
             start,
             end,
@@ -1781,28 +1783,28 @@ impl App {
             self.reveal_span(&rows);
             self.take_diff_focus();
         }
-        link::Response::ok_note(format!("{} pending", self.comments.len()))
+        link::Response::ok_note(format!("{} pending", self.agent_notes.len()))
     }
 
     /// The pending comment anchored over `line` in `path`, if any. Matching the
     /// whole span rather than just its first line means `c` re-opens the note
     /// from anywhere inside the range it covers.
-    fn comment_at(&self, path: &str, line: u32) -> Option<usize> {
-        comment_index_at(&self.comments, path, line)
+    fn agent_note_at(&self, path: &str, line: u32) -> Option<usize> {
+        agent_note_index_at(&self.agent_notes, path, line)
     }
 
     /// Replace a pending comment's body, or drop it entirely when the reviewer
     /// submits an empty one. Deleting through the same gesture that edits keeps
     /// Esc unambiguously "cancel", so nothing discards a note by accident.
-    fn revise_comment(&mut self, idx: usize, body: String) -> link::Response {
-        if idx >= self.comments.len() {
-            return link::Response::err("that comment is no longer pending");
+    fn revise_agent_note(&mut self, idx: usize, body: String) -> link::Response {
+        if idx >= self.agent_notes.len() {
+            return link::Response::err("that note is no longer pending");
         }
         let body = body.trim().to_string();
         if body.is_empty() {
-            self.comments.remove(idx);
+            self.agent_notes.remove(idx);
         } else {
-            self.comments[idx].body = body;
+            self.agent_notes[idx].body = body;
         }
         self.reweave();
         link::Response::ok()
@@ -1811,11 +1813,11 @@ impl App {
     /// Hand over every pending comment and clear the set. Clear-on-read is the
     /// whole contract: delivered means gone, so the reviewer never wonders
     /// whether a note was picked up, and the agent never re-reads stale notes.
-    fn drain_comments(&mut self) -> link::Response {
-        let drained: Vec<link::Comment> = std::mem::take(&mut self.comments)
+    fn drain_agent_notes(&mut self) -> link::Response {
+        let drained: Vec<link::AgentNote> = std::mem::take(&mut self.agent_notes)
             .into_iter()
             .enumerate()
-            .map(|(i, c)| link::Comment {
+            .map(|(i, c)| link::AgentNote {
                 n: i + 1,
                 snippet: self.snippet_for(&c.path, c.start, c.end),
                 path: c.path,
@@ -1825,7 +1827,7 @@ impl App {
             })
             .collect();
         self.reweave();
-        link::Response::ok_comments(drained)
+        link::Response::ok_agent_notes(drained)
     }
 
     /// Quote the diff rows a comment points at, plus a little context, reading
@@ -1880,8 +1882,8 @@ impl App {
 
     /// Rendered-row ranges for the pending comments, re-resolved against the
     /// current render just like `annotation_rows`.
-    fn comment_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
-        self.comments
+    fn agent_note_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
+        self.agent_notes
             .iter()
             .filter_map(|c| {
                 let file_idx = self.changes.iter().position(|ch| ch.path == c.path)?;
@@ -2731,9 +2733,9 @@ fn run_client(command: ClientCommand) -> i32 {
             // "no comments" belongs on stderr with the other asides.
             if let Some(comments) = &resp.comments {
                 if comments.is_empty() {
-                    eprintln!("recto: no review comments pending");
+                    eprintln!("recto: no agent notes pending");
                 } else {
-                    print!("{}", render_comments_markdown(comments));
+                    print!("{}", render_agent_notes_markdown(comments));
                 }
             }
             if let Some(note) = resp.note {
@@ -2795,17 +2797,17 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 .collect::<Result<Vec<_>>>()?;
             Ok(link::Request::Annotate { sites })
         }
-        ClientCommand::Comments => Ok(link::Request::Comments),
-        ClientCommand::Comment { spec } => {
+        ClientCommand::Notes => Ok(link::Request::AgentNotes),
+        ClientCommand::Note { spec } => {
             let (pathspec, body) = spec
                 .split_once('=')
-                .ok_or_else(|| anyhow!("missing `=body` in comment spec: {spec}"))?;
+                .ok_or_else(|| anyhow!("missing `=body` in note spec: {spec}"))?;
             let (raw_path, start, end) = parse_pathspec(pathspec);
-            let start = start.ok_or_else(|| anyhow!("missing `:LINE` in comment spec: {spec}"))?;
+            let start = start.ok_or_else(|| anyhow!("missing `:LINE` in note spec: {spec}"))?;
             let cwd = std::env::current_dir()?;
             let root = link::workspace_root(&cwd)
                 .ok_or_else(|| anyhow!("not inside a jj or git repository"))?;
-            Ok(link::Request::Comment {
+            Ok(link::Request::AgentNote {
                 path: normalize_path(&cwd, &root, raw_path),
                 start,
                 end,
@@ -2819,10 +2821,10 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
 /// with its number and `path:line`, then quotes the diff rows it points at, so
 /// the agent can act without re-opening the file — and so the note still makes
 /// sense after its own edits have moved those line numbers.
-fn render_comments_markdown(comments: &[link::Comment]) -> String {
-    let mut out = format!("# Review comments ({})\n\n", comments.len());
+fn render_agent_notes_markdown(comments: &[link::AgentNote]) -> String {
+    let mut out = format!("# Agent notes ({})\n\n", comments.len());
     out.push_str(
-        "Notes the user left in recto on the current diff. They have been \
+        "Private notes the user left for the local agent on the current diff. They have been \
          drained and are no longer pending. Line numbers are new-side; `>` \
          marks the lines a note points at.\n",
     );
@@ -3105,13 +3107,13 @@ fn handle_event(
                     }
                     _ => {}
                 },
-                Mode::CommentInput(draft) => {
+                Mode::NoteInput(draft) => {
                     let ctrl = key.modifiers.contains(event::KeyModifiers::CONTROL);
                     let alt = key.modifiers.contains(event::KeyModifiers::ALT);
                     let shift = key.modifiers.contains(event::KeyModifiers::SHIFT);
                     // Vertical motion needs the layout the modal was last
                     // drawn at; the draw pass leaves the width behind for us.
-                    let rows = draft.wrap_rows(app.comment_wrap_width);
+                    let rows = draft.wrap_rows(app.note_wrap_width);
                     match key.code {
                         KeyCode::Esc => app.mode = Mode::Normal,
                         // Newline needs a modifier because plain Enter submits.
@@ -3126,9 +3128,11 @@ fn handle_event(
                             let resp = match draft.editing {
                                 // Emptying an existing note deletes it; emptying
                                 // a new one was never a note in the first place.
-                                Some(idx) => Some(app.revise_comment(idx, body)),
+                                Some(idx) => Some(app.revise_agent_note(idx, body)),
                                 None if body.is_empty() => None,
-                                None => Some(app.add_comment(&draft.path, draft.line, None, body)),
+                                None => {
+                                    Some(app.add_agent_note(&draft.path, draft.line, None, body))
+                                }
                             };
                             match resp {
                                 Some(r) if !r.ok => {
@@ -3330,12 +3334,12 @@ fn handle_event(
                         if let Some((path, line)) = app.cursor_target() {
                             // Re-open the note already on this line rather than
                             // stacking a second one on top of it.
-                            let editing = app.comment_at(&path, line);
+                            let editing = app.agent_note_at(&path, line);
                             let body = editing
-                                .and_then(|i| app.comments.get(i))
+                                .and_then(|i| app.agent_notes.get(i))
                                 .map(|c| c.body.clone())
                                 .unwrap_or_default();
-                            app.mode = Mode::CommentInput(CommentDraft {
+                            app.mode = Mode::NoteInput(NoteDraft {
                                 path,
                                 line,
                                 caret: body.chars().count(),
@@ -3352,10 +3356,7 @@ fn handle_event(
             // Write the edited clone back only if we're still in the mode that
             // owns it: submitting or cancelling sets `app.mode` directly, and
             // that decision has to win over the draft we were mutating.
-            if matches!(
-                app.mode,
-                Mode::SearchInput { .. } | Mode::CommentInput { .. }
-            ) {
+            if matches!(app.mode, Mode::SearchInput { .. } | Mode::NoteInput { .. }) {
                 app.mode = mode;
             }
         }
@@ -3574,13 +3575,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         };
         header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
     }
-    // Pending comments are invisible once you scroll away from them, and the
+    // Pending agent notes are invisible once you scroll away from them, and the
     // whole point is that they're waiting on an agent, so keep the count in
     // view until something drains it.
-    if !app.comments.is_empty() {
-        let n = app.comments.len();
+    if !app.agent_notes.is_empty() {
+        let n = app.agent_notes.len();
         header_spans.push(Span::styled(
-            format!(" · ❶ {n} comment{} pending", if n == 1 { "" } else { "s" }),
+            format!(
+                " · ❶ {n} agent note{} pending",
+                if n == 1 { "" } else { "s" }
+            ),
             Style::default().fg(theme::PEACH),
         ));
     }
@@ -3674,7 +3678,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     }
                     Focus::Diff => {
                         format!(
-                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · c comment · e edit · ? help"
+                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · c note for agent · e edit · ? help"
                         )
                     }
                 },
@@ -3699,8 +3703,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
     }
 
-    if let Mode::CommentInput(draft) = app.mode.clone() {
-        app.comment_wrap_width = draw_comment_input(frame, frame.area(), &draft);
+    if let Mode::NoteInput(draft) = app.mode.clone() {
+        app.note_wrap_width = draw_note_input(frame, frame.area(), &draft);
     }
 
     if app.show_help {
@@ -3708,11 +3712,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
-/// The comment authoring modal. Sits at the bottom so it covers as little of
+/// The private agent-note modal. Sits at the bottom so it covers as little of
 /// the diff as possible: the note is about a line you want to keep reading.
 /// Returns the column count the body was wrapped to, which key handling needs
 /// to move the caret by visual row.
-fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDraft) -> usize {
+fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) -> usize {
     let width = (area.width * 3 / 4).clamp(40, 100).min(area.width);
     // Two border columns and one of padding each side, then one more held back
     // so the caret has somewhere to sit at the end of a completely full row.
@@ -3750,9 +3754,9 @@ fn draw_comment_input(frame: &mut ratatui::Frame, area: Rect, draft: &CommentDra
         ),
     };
     let verb = if draft.editing.is_some() {
-        "editing comment on"
+        "editing agent note on"
     } else {
-        "comment on"
+        "note for agent on"
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -3823,9 +3827,12 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("n N", "next / prev match"),
     bind("1-9", "jump to tour step"),
     head("Review"),
-    bind("c", "comment on the line · again to edit"),
+    bind(
+        "c",
+        "leave a private note for the local agent · again to edit",
+    ),
     bind("enter", "send · shift-enter newline · empty deletes"),
-    head("Comment box"),
+    head("Agent note box"),
     bind("^a  ^e", "start / end of the note"),
     bind("^u  ^k", "kill to start / end"),
     bind("^w  alt-bksp", "kill previous word"),
@@ -4200,7 +4207,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // Pending comments get the same treatment in peach. They outrank the tour
     // in the gutter: the agent's map is scenery, my undelivered notes are the
     // thing still waiting on someone.
-    let comment_rows = app.comment_rows();
+    let agent_note_rows = app.agent_note_rows();
     let comment_bar = theme::blend(theme::PEACH, theme::BASE, 0.45);
     let cursor = app.diff_cursor;
     // Begin at the indexed source line and skip any continuation rows above
@@ -4232,7 +4239,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         };
         let focused = focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx));
         let annotated = ann_rows.iter().any(|r| r.contains(&line_idx));
-        let commented = comment_rows.iter().any(|r| r.contains(&line_idx));
+        let commented = agent_note_rows.iter().any(|r| r.contains(&line_idx));
         // Markers apply per visual row, so the flash wash and the bar colors
         // run down every continuation of a wrapped line. Both bar kinds claim
         // the same gutter column; the cursor wins outright on its line rather
@@ -4296,8 +4303,8 @@ fn rows_for_span(
 /// Index of the pending comment whose span covers `line` in `path`. The whole
 /// span counts, not just its first line, so re-opening a note works from
 /// anywhere inside the range it was pinned to.
-fn comment_index_at(comments: &[Comment], path: &str, line: u32) -> Option<usize> {
-    comments
+fn agent_note_index_at(notes: &[AgentNote], path: &str, line: u32) -> Option<usize> {
+    notes
         .iter()
         .position(|c| c.path == path && c.start <= line && line <= c.end)
 }
@@ -4394,7 +4401,7 @@ fn note_line(n: usize, label: &str) -> Line<'static> {
 /// object as a tour step but authored from the other side of the link.
 const COMMENT_BADGES: [&str; 9] = ["❶", "❷", "❸", "❹", "❺", "❻", "❼", "❽", "❾"];
 
-fn comment_badge(n: usize) -> String {
+fn agent_note_badge(n: usize) -> String {
     COMMENT_BADGES
         .get(n - 1)
         .map(|s| (*s).to_string())
@@ -4404,9 +4411,9 @@ fn comment_badge(n: usize) -> String {
 /// Render one row of a pending comment — `╭─ ❶ body`, peach against the tour's
 /// mauve so at a glance it's obvious which notes are mine and which are the
 /// agent's. Continuation rows carry the box rule but no badge.
-fn comment_line(n: usize, text: &str, first: bool) -> Line<'static> {
+fn agent_note_line(n: usize, text: &str, first: bool) -> Line<'static> {
     let (rule, marker) = if first {
-        (" ╭─ ", comment_badge(n))
+        (" ╭─ ", agent_note_badge(n))
     } else {
         (" │  ", " ".into())
     };
@@ -4591,8 +4598,8 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         ]
     }
 
-    fn draft() -> CommentDraft {
-        CommentDraft {
+    fn draft() -> NoteDraft {
+        NoteDraft {
             path: "src/main.rs".into(),
             line: 42,
             body: String::new(),
@@ -4637,7 +4644,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         for c in "one".chars() {
             d.insert(c);
         }
-        let rc = |d: &CommentDraft| d.caret_rc(&d.wrap_rows(80));
+        let rc = |d: &NoteDraft| d.caret_rc(&d.wrap_rows(80));
         assert_eq!(rc(&d), (0, 3));
         d.insert('\n');
         assert_eq!(rc(&d), (1, 0));
@@ -4823,26 +4830,26 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     #[test]
     fn comment_lookup_covers_the_whole_span() {
         let comments = vec![
-            Comment {
+            AgentNote {
                 path: "src/main.rs".into(),
                 start: 10,
                 end: 14,
                 body: "range note".into(),
             },
-            Comment {
+            AgentNote {
                 path: "src/link.rs".into(),
                 start: 3,
                 end: 3,
                 body: "single".into(),
             },
         ];
-        assert_eq!(comment_index_at(&comments, "src/main.rs", 10), Some(0));
-        assert_eq!(comment_index_at(&comments, "src/main.rs", 12), Some(0));
-        assert_eq!(comment_index_at(&comments, "src/main.rs", 14), Some(0));
-        assert_eq!(comment_index_at(&comments, "src/link.rs", 3), Some(1));
+        assert_eq!(agent_note_index_at(&comments, "src/main.rs", 10), Some(0));
+        assert_eq!(agent_note_index_at(&comments, "src/main.rs", 12), Some(0));
+        assert_eq!(agent_note_index_at(&comments, "src/main.rs", 14), Some(0));
+        assert_eq!(agent_note_index_at(&comments, "src/link.rs", 3), Some(1));
         // Just outside the span, and the right line in the wrong file.
-        assert_eq!(comment_index_at(&comments, "src/main.rs", 15), None);
-        assert_eq!(comment_index_at(&comments, "src/link.rs", 12), None);
+        assert_eq!(agent_note_index_at(&comments, "src/main.rs", 15), None);
+        assert_eq!(agent_note_index_at(&comments, "src/link.rs", 12), None);
     }
 
     /// The cursor steps over rows with no line info, so a hunk header or a
@@ -4925,7 +4932,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     #[test]
     fn gutter_signature_rejects_non_body_rows() {
         assert_eq!(gutter_signature(&note_line(1, "Step 1: parse")), None);
-        assert_eq!(gutter_signature(&comment_line(1, "why 3?", true)), None);
+        assert_eq!(gutter_signature(&agent_note_line(1, "why 3?", true)), None);
         assert_eq!(gutter_signature(&hunk_header("@@ -1,3 +1,4 @@")), None);
     }
 
@@ -4934,7 +4941,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     /// rows with `>` on the ones being commented on.
     #[test]
     fn comment_markdown_quotes_the_span() {
-        let md = render_comments_markdown(&[link::Comment {
+        let md = render_agent_notes_markdown(&[link::AgentNote {
             n: 1,
             path: "src/main.rs".into(),
             start: 42,
@@ -4961,7 +4968,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 },
             ]),
         }]);
-        assert!(md.starts_with("# Review comments (1)\n"));
+        assert!(md.starts_with("# Agent notes (1)\n"));
         assert!(md.contains("## 1. src/main.rs:42\n\nwhy 3?\n"));
         assert!(md.contains("```rs\n"));
         assert!(md.contains("    41   let a = 1;\n"));
@@ -4973,7 +4980,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     /// diff still has to arrive — just without its quote.
     #[test]
     fn comment_markdown_handles_ranges_and_missing_snippets() {
-        let md = render_comments_markdown(&[link::Comment {
+        let md = render_agent_notes_markdown(&[link::AgentNote {
             n: 2,
             path: "src/link.rs".into(),
             start: 10,

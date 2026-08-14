@@ -1,6 +1,6 @@
 ---
 name: recto
-description: Drive a running recto diff viewer from a companion session — scroll to and highlight a file or line span, or lay down a numbered multi-site tour whose narration advances only when the user says to continue. Load whenever you are explaining, reviewing, or walking through code changes in a workspace where recto might be open, or when asked to "show me where", "point at", or "tour" a diff. Lets you direct the user's eyes to the exact lines you're describing instead of just naming them. Also runs the other way: collects the review comments the user left on the diff, so load it whenever they say they left notes, ask you to address their comments, or mention having marked something up.
+description: Drive a running recto diff viewer from a companion session — scroll to and highlight a file or line span, or lay down a numbered multi-site tour whose narration advances only when the user says to continue. Load whenever you are explaining, reviewing, or walking through code changes in a workspace where recto might be open, or when asked to "show me where", "point at", or "tour" a diff. Lets you direct the user's eyes to the exact lines you're describing instead of just naming them. Also runs the other way: collects the private agent notes the user left on the diff, so load it whenever they say they left notes, ask you to address their notes, or mention having marked something up.
 ---
 
 # recto
@@ -24,7 +24,7 @@ through Rig and name the repo subdirectory from the generated rig instructions:
     rig recto cloud ping
     rig recto cloud focus src/app.rs:42-58
     rig recto brand annotate 'docs/index.md:10=Update the headline'
-    rig recto cloud comments
+    rig recto cloud notes
     rig recto cloud clear
 
 `rig recto <repo>` promotes that repo's existing viewer into the main window;
@@ -45,7 +45,7 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
     recto clear                  # remove the highlight and any annotations
     recto ping                   # is a recto listening here?
-    recto comments               # collect the review comments the user left
+    recto notes                  # collect the private notes the user left for you
 
 PATH is relative to anywhere in the workspace (recto normalizes it to
 the repo root). Line numbers are **new-side** — the line numbers in the
@@ -121,15 +121,15 @@ them as the conversation moves — focus is the bright "look here now"
 pointer, annotations are the standing map. `recto clear` (or the user
 pressing Esc) removes the whole set.
 
-## Reading the user's review comments
+## Reading the user's agent notes
 
-Everything above points the user's eyes at code. `recto comments` runs the
-other way: it hands you the notes they left while reading the diff, each
+Everything above points the user's eyes at code. `recto notes` runs the other
+way: it hands you private notes they left for the local agent while reading the diff, each
 one anchored to a span and quoted with the surrounding lines. They write
 those by moving the cursor with `j`/`k` and pressing `c` in recto, which is
 worth mentioning if they ask how to give you line-level feedback.
 
-    recto comments
+    recto notes
 
 The output is markdown on stdout, one numbered section per note, with the
 commented lines marked by `>` inside a fenced snippet. Treat each note as a
@@ -137,16 +137,16 @@ task. The quoted snippet is the reliable part of the anchor, not the line
 number: the moment you start editing, the numbers in the header shift, while
 the quoted text still says what the user was looking at.
 
-**Draining clears.** A comment is delivered exactly once, so it disappears
-from recto the moment you read it. Only run `recto comments` when you are
+**Draining clears.** A note is delivered exactly once, so it disappears
+from recto the moment you read it. Only run `recto notes` when you are
 actually about to act on what comes back. Never run it to check whether
 comments exist, never run it and then discard the output, and never run it
 twice hoping to re-read something. If you need to know whether notes are
 waiting, that is what `ping` is for.
 
-**Do not write comments.** `recto comment` exists, but it is the user's
-channel into recto, not yours. Your channel is `annotate`. If you push your
-own notes into the comment set you will drain them straight back to yourself
+**Do not write agent notes.** `recto note` exists, but it is the user's
+private channel into recto, not yours. Your channel is `annotate`. If you push your
+own notes into the note set you will drain them straight back to yourself
 and lose the user's in the noise.
 
 Drain in one of two situations: the user says they left notes or asks you to
@@ -172,8 +172,8 @@ exception: its scope is the workspace, not the current diff.
 - **exit 2** — no recto is listening for this workspace (or you're not
   in a repo). Don't keep trying; just describe the change in text.
 
-`recto comments` is the one command that exits 0 with nothing on stdout: that
-means no comments were pending. It exits 1 only when recto is parked in an
+`recto notes` is the one command that exits 0 with nothing on stdout: that
+means no notes were pending. It exits 1 only when recto is parked in an
 editor, where a drain would destroy the notes rather than deliver them. Ask
 the user to come back to recto, then try again.
 
@@ -209,8 +209,8 @@ When focus scope is `workspace`, a path absent from `files` is still a valid
 focus target. `scope` is `"range"` for the whole base diff or `"rev"` when
 narrowed to a single revision.
 
-`pending_comments` is how you find out the user left you notes. They have no
+`pending_comments` is the backward-compatible wire field that tells you the user left agent notes. They have no
 way to push into your session, so a ping you were already going to run is the
-cheapest place to notice. Anything above zero means `recto comments` has
+cheapest place to notice. Anything above zero means `recto notes` has
 something for you. An older recto that predates the feature omits the field
 entirely, which reads as zero.

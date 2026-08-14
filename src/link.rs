@@ -36,20 +36,22 @@ pub enum Request {
     Clear,
     /// Liveness check.
     Ping,
-    /// Pin a reviewer-authored comment to a span, appended to the pending set.
+    /// Pin a private note for the local agent to a span, appended to the pending set.
     /// `start`/`end` are new-side line numbers like `Focus`. Unlike `Annotate`
-    /// (one tour, replaced wholesale) comments accumulate: each call adds one.
-    Comment {
+    /// (one tour, replaced wholesale) notes accumulate: each call adds one.
+    #[serde(rename = "note", alias = "comment")]
+    AgentNote {
         path: String,
         start: u32,
         #[serde(skip_serializing_if = "Option::is_none")]
         end: Option<u32>,
         body: String,
     },
-    /// Drain the pending reviewer comments: hand them over and clear the set.
+    /// Drain the pending agent notes: hand them over and clear the set.
     /// Delivered means gone, so a drain that loses its reply loses the notes —
     /// which is why this is never queued behind an editor handoff.
-    Comments,
+    #[serde(rename = "notes", alias = "comments")]
+    AgentNotes,
 }
 
 /// One labeled site in an [`Request::Annotate`] set. `start`/`end` are
@@ -64,12 +66,12 @@ pub struct Site {
     pub label: String,
 }
 
-/// One reviewer comment handed back by a [`Request::Comments`] drain. Carries
+/// One private note handed back by a [`Request::AgentNotes`] drain. Carries
 /// the anchoring snippet alongside the body: the agent starts editing the
 /// moment it reads this, so `path:line` goes stale almost immediately while the
 /// quoted text stays meaningful.
 #[derive(Debug, Clone, Deserialize, Serialize)]
-pub struct Comment {
+pub struct AgentNote {
     /// 1-based position in the drained set, matching the on-screen badge.
     pub n: usize,
     pub path: String,
@@ -82,7 +84,7 @@ pub struct Comment {
     pub snippet: Option<Vec<SnippetRow>>,
 }
 
-/// One row of a comment's snippet, mirroring what the reviewer had on screen:
+/// One row of a note's snippet, mirroring what the reviewer had on screen:
 /// the new-side line number (absent on removed lines), the diff sign, and the
 /// body text. `commented` marks the rows the comment actually points at, as
 /// opposed to the surrounding context.
@@ -100,7 +102,8 @@ pub struct SnippetRow {
 /// `note` carries an informational aside on success — e.g. that recto was in an
 /// editor and drove neovim directly rather than scrolling the TUI. `status` is
 /// the machine-readable snapshot a [`Request::Ping`] asks for; absent otherwise.
-/// `comments` is the drained set a [`Request::Comments`] asks for.
+/// `comments` is the legacy wire field carrying a drained [`Request::AgentNotes`]
+/// set. The field name stays stable for older companion clients.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Response {
     pub ok: bool,
@@ -111,7 +114,7 @@ pub struct Response {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub status: Option<Status>,
     #[serde(skip_serializing_if = "Option::is_none")]
-    pub comments: Option<Vec<Comment>>,
+    pub comments: Option<Vec<AgentNote>>,
 }
 
 /// What a [`Request::Ping`] reports back: recto's identity, current diff, and
@@ -145,9 +148,8 @@ pub struct Status {
     pub focus: bool,
     /// Number of active tour annotations.
     pub annotations: usize,
-    /// Reviewer comments waiting for a `recto comments` drain. This is how an
-    /// agent discovers them: the skill already says to ping first, so notes get
-    /// found without the user having to remember to mention them.
+    /// Private agent notes waiting for a `recto notes` drain. The field retains
+    /// its old wire name so older companion clients can still discover them.
     #[serde(default)]
     pub pending_comments: usize,
 }
@@ -257,7 +259,7 @@ impl Response {
         }
     }
 
-    pub fn ok_comments(comments: Vec<Comment>) -> Self {
+    pub fn ok_agent_notes(comments: Vec<AgentNote>) -> Self {
         Self {
             comments: Some(comments),
             ..Self::ok()
@@ -513,15 +515,15 @@ fn handle_while_in_editor(
         // Adding a comment is pure state, so queuing loses nothing: it lands
         // when the loop resumes. This is the `!recto comment …` path out of
         // neovim, so it has to keep working while we're parked here.
-        Request::Comment { .. } => {
+        Request::AgentNote { .. } => {
             queue(tx, request.clone());
             Response::ok_note("recto is in an editor; the comment will land when you return")
         }
         // A drain must never be queued. `queue` discards the response, and a
         // drained comment is gone from recto — queuing one would delete the
         // user's notes and hand them to nobody. Refuse instead.
-        Request::Comments => {
-            Response::err("recto is in an editor; leave it before draining comments")
+        Request::AgentNotes => {
+            Response::err("recto is in an editor; leave it before draining agent notes")
         }
     }
 }
@@ -838,7 +840,7 @@ mod tests {
     fn comment_wire_format() {
         let json = r#"{"cmd":"comment","path":"src/main.rs","start":42,"body":"why 3?"}"#;
         let req: Request = serde_json::from_str(json).expect("parse");
-        let Request::Comment {
+        let Request::AgentNote {
             path,
             start,
             end,
@@ -853,14 +855,14 @@ mod tests {
         assert_eq!(body, "why 3?");
 
         let drain: Request = serde_json::from_str(r#"{"cmd":"comments"}"#).expect("parse");
-        assert!(matches!(drain, Request::Comments));
+        assert!(matches!(drain, Request::AgentNotes));
     }
 
     /// The drained payload is what the agent actually reads, so its field names
     /// are a contract — including the per-row snippet shape.
     #[test]
     fn drained_comment_wire_format() {
-        let resp = Response::ok_comments(vec![Comment {
+        let resp = Response::ok_agent_notes(vec![AgentNote {
             n: 1,
             path: "src/main.rs".into(),
             start: 42,
@@ -934,7 +936,7 @@ mod tests {
         );
         let (tx, rx) = mpsc::channel::<Incoming>();
 
-        let resp = handle_while_in_editor(&Request::Comments, &tx, &editor);
+        let resp = handle_while_in_editor(&Request::AgentNotes, &tx, &editor);
         assert!(!resp.ok, "drain must fail while parked in an editor");
         assert!(resp.comments.is_none());
         assert!(
@@ -944,7 +946,7 @@ mod tests {
 
         // Authoring, by contrast, is queued and lands on return.
         let resp = handle_while_in_editor(
-            &Request::Comment {
+            &Request::AgentNote {
                 path: "a.rs".into(),
                 start: 1,
                 end: None,
@@ -955,7 +957,7 @@ mod tests {
         );
         assert!(resp.ok);
         let queued = rx.try_recv().expect("comment reaches the main loop");
-        assert!(matches!(queued.request, Request::Comment { .. }));
+        assert!(matches!(queued.request, Request::AgentNote { .. }));
     }
 
     #[test]
