@@ -195,6 +195,17 @@ enum ClientCommand {
     /// them from the running recto.
     #[command(alias = "comments")]
     Notes,
+    /// Show the session-durable local review draft as JSON. Unlike `notes`, this is a
+    /// non-consuming read and may be called throughout co-authoring.
+    Review,
+    /// Add or revise a shared public review comment. Without --id, INPUT is
+    /// `path:LINE=body` or `path:START-END=body`. With --id, INPUT is the new
+    /// body; an empty body deletes that draft.
+    ReviewComment {
+        #[arg(long)]
+        id: Option<u64>,
+        input: String,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -307,11 +318,24 @@ enum Mode {
     NoteInput(NoteDraft),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerKind {
+    AgentNote,
+    ReviewComment,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ComposerEdit {
+    AgentNote(usize),
+    ReviewComment(u64),
+}
+
 /// A private agent note being written. The anchor is captured when the modal opens rather
 /// than read at submit time, so a diff reload mid-sentence can't move the note
 /// to a different line than the one the reviewer was looking at.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NoteDraft {
+    kind: ComposerKind,
     path: String,
     line: u32,
     body: String,
@@ -319,9 +343,10 @@ struct NoteDraft {
     caret: usize,
     /// Why the last submit bounced, shown in the modal so the text isn't lost.
     error: Option<String>,
-    /// Index into `App::agent_notes` when this is re-opening an existing note
-    /// rather than writing a new one. Submitting an empty body deletes it.
-    editing: Option<usize>,
+    /// Stable target when re-opening existing content. Public drafts use their
+    /// id rather than a vector index so an agent-side update while the composer
+    /// is open cannot make the user's save land on a different comment.
+    editing: Option<ComposerEdit>,
 }
 
 impl NoteDraft {
@@ -654,6 +679,11 @@ struct App {
     /// sweeping up our own undelivered notes alongside it would be data loss.
     /// Draining is the only thing that empties this.
     agent_notes: Vec<AgentNote>,
+    /// Durable public review comments shared with the companion agent. These
+    /// are local draft content, distinct from both published PR threads and
+    /// drain-on-read private notes.
+    review_draft_comments: Vec<link::DraftReviewComment>,
+    next_review_draft_id: u64,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
     /// here, `e` goes here" marker. Cleared on reload since the index is
@@ -762,6 +792,8 @@ impl App {
             focus_span: None,
             annotations: Vec::new(),
             agent_notes: Vec::new(),
+            review_draft_comments: Vec::new(),
+            next_review_draft_id: 1,
             diff_cursor: None,
             show_files: false,
             show_commits: false,
@@ -1544,6 +1576,7 @@ impl App {
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
             pending_comments: self.agent_notes.len(),
+            draft_comments: self.review_draft_comments.len(),
             pull_request: self.pull_request.as_ref().map(|pr| link::PullRequestRef {
                 repository: pr.repository.clone(),
                 number: pr.number,
@@ -1558,6 +1591,17 @@ impl App {
             link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::AttachPr { pull_request } => {
                 let pull_request = *pull_request;
+                if !self.review_draft_comments.is_empty()
+                    && self.pull_request.as_ref().is_some_and(|current| {
+                        current.repository != pull_request.repository
+                            || current.number != pull_request.number
+                            || current.head_oid != pull_request.head_oid
+                    })
+                {
+                    return link::Response::err(
+                        "another PR or head has shared review drafts; delete them before switching",
+                    );
+                }
                 let label = format!("{}#{}", pull_request.repository, pull_request.number);
                 self.pull_request = Some(pull_request);
                 self.pr_scroll = 0;
@@ -1586,6 +1630,24 @@ impl App {
                 body,
             } => self.add_agent_note(&path, start, end, body),
             link::Request::AgentNotes => self.drain_agent_notes(),
+            link::Request::ReviewDraft => self.review_draft_response(),
+            link::Request::ReviewDraftComment {
+                id,
+                path,
+                start,
+                end,
+                body,
+            } => match id {
+                Some(id) => self.revise_review_draft_comment(id, body, link::DraftEditor::Agent),
+                None => {
+                    let (Some(path), Some(start)) = (path, start) else {
+                        return link::Response::err(
+                            "a new review draft comment needs path and start",
+                        );
+                    };
+                    self.add_review_draft_comment(&path, start, end, body, link::DraftEditor::Agent)
+                }
+            },
         }
     }
 
@@ -1705,6 +1767,22 @@ impl App {
                     continue;
                 };
                 inserts.push((*rows.start(), review_thread_line(i + 1, thread)));
+            }
+        }
+        for (i, comment) in self.review_draft_comments.iter().enumerate() {
+            let Some(file_idx) = self.changes.iter().position(|ch| ch.path == comment.path) else {
+                continue;
+            };
+            let Some(rows) =
+                rows_for_span(&self.base_line_info, file_idx, comment.start, comment.end)
+            else {
+                continue;
+            };
+            for (j, line) in markdown::lines(&comment.body).into_iter().enumerate() {
+                inserts.push((
+                    *rows.start(),
+                    review_draft_line(i + 1, comment, line, j == 0),
+                ));
             }
         }
         for (i, c) in self.agent_notes.iter().enumerate() {
@@ -1885,6 +1963,109 @@ impl App {
         link::Response::ok_agent_notes(drained)
     }
 
+    fn review_draft_response(&self) -> link::Response {
+        let Some(pr) = &self.pull_request else {
+            return link::Response::err("no pull request attached");
+        };
+        link::Response::ok_review_draft(link::ReviewDraft {
+            pull_request: link::PullRequestRef {
+                repository: pr.repository.clone(),
+                number: pr.number,
+                head_oid: pr.head_oid.clone(),
+            },
+            comments: self.review_draft_comments.clone(),
+        })
+    }
+
+    fn add_review_draft_comment(
+        &mut self,
+        path: &str,
+        start: u32,
+        end: Option<u32>,
+        body: String,
+        last_editor: link::DraftEditor,
+    ) -> link::Response {
+        if self.pull_request.is_none() {
+            return link::Response::err("attach a pull request before drafting a review");
+        }
+        let body = body.trim().to_string();
+        if body.is_empty() {
+            return link::Response::err("review comment body is empty");
+        }
+        let end = end.unwrap_or(start).max(start);
+        let Some(file_idx) = self.changes.iter().position(|c| c.path == path) else {
+            return link::Response::err(format!("not in current diff: {path}"));
+        };
+        if rows_for_span(&self.base_line_info, file_idx, start, end).is_none() {
+            return link::Response::err(format!(
+                "{path}:{start}-{end} not in current diff (outside any shown hunk)"
+            ));
+        }
+        let id = self.next_review_draft_id;
+        self.next_review_draft_id += 1;
+        self.review_draft_comments.push(link::DraftReviewComment {
+            id,
+            path: path.to_string(),
+            start,
+            end,
+            body,
+            last_editor,
+        });
+        self.reweave();
+        if let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end) {
+            self.reveal_span(&rows);
+            self.diff_cursor = Some(*rows.start());
+            self.page = Page::Diff;
+            self.take_diff_focus();
+        }
+        self.review_draft_response()
+    }
+
+    fn revise_review_draft_comment(
+        &mut self,
+        id: u64,
+        body: String,
+        last_editor: link::DraftEditor,
+    ) -> link::Response {
+        let Some(idx) = self
+            .review_draft_comments
+            .iter()
+            .position(|comment| comment.id == id)
+        else {
+            return link::Response::err(format!("review draft comment {id} does not exist"));
+        };
+        let anchor = (
+            self.review_draft_comments[idx].path.clone(),
+            self.review_draft_comments[idx].start,
+            self.review_draft_comments[idx].end,
+        );
+        let body = body.trim().to_string();
+        let deleting = body.is_empty();
+        if deleting {
+            self.review_draft_comments.remove(idx);
+        } else {
+            self.review_draft_comments[idx].body = body;
+            self.review_draft_comments[idx].last_editor = last_editor;
+        }
+        self.reweave();
+        if !deleting
+            && let Some(file_idx) = self.changes.iter().position(|c| c.path == anchor.0)
+            && let Some(rows) = rows_for_span(&self.line_info, file_idx, anchor.1, anchor.2)
+        {
+            self.reveal_span(&rows);
+            self.diff_cursor = Some(*rows.start());
+            self.page = Page::Diff;
+            self.take_diff_focus();
+        }
+        self.review_draft_response()
+    }
+
+    fn review_draft_comment_at(&self, path: &str, line: u32) -> Option<usize> {
+        self.review_draft_comments.iter().position(|comment| {
+            comment.path == path && (comment.start..=comment.end).contains(&line)
+        })
+    }
+
     /// Quote the diff rows a comment points at, plus a little context, reading
     /// off the pristine render so woven note rows never land in the quote. The
     /// agent edits as soon as it reads this, so `path:line` is stale on arrival
@@ -1943,6 +2124,16 @@ impl App {
             .filter_map(|c| {
                 let file_idx = self.changes.iter().position(|ch| ch.path == c.path)?;
                 rows_for_span(&self.line_info, file_idx, c.start, c.end)
+            })
+            .collect()
+    }
+
+    fn review_draft_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
+        self.review_draft_comments
+            .iter()
+            .filter_map(|comment| {
+                let file_idx = self.changes.iter().position(|c| c.path == comment.path)?;
+                rows_for_span(&self.line_info, file_idx, comment.start, comment.end)
             })
             .collect()
     }
@@ -2872,6 +3063,15 @@ fn run_client(command: ClientCommand) -> i32 {
                     print!("{}", render_agent_notes_markdown(comments));
                 }
             }
+            if let Some(draft) = &resp.review_draft {
+                match serde_json::to_string_pretty(draft) {
+                    Ok(json) => println!("{json}"),
+                    Err(e) => {
+                        eprintln!("recto: could not encode review draft: {e}");
+                        return 2;
+                    }
+                }
+            }
             if let Some(note) = resp.note {
                 eprintln!("recto: {note}");
             }
@@ -2935,6 +3135,35 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
             Ok(link::Request::Annotate { sites })
         }
         ClientCommand::Notes => Ok(link::Request::AgentNotes),
+        ClientCommand::Review => Ok(link::Request::ReviewDraft),
+        ClientCommand::ReviewComment {
+            id: Some(id),
+            input,
+        } => Ok(link::Request::ReviewDraftComment {
+            id: Some(*id),
+            path: None,
+            start: None,
+            end: None,
+            body: input.clone(),
+        }),
+        ClientCommand::ReviewComment { id: None, input } => {
+            let (pathspec, body) = input
+                .split_once('=')
+                .ok_or_else(|| anyhow!("missing `=body` in review-comment input: {input}"))?;
+            let (raw_path, start, end) = parse_pathspec(pathspec);
+            let start =
+                start.ok_or_else(|| anyhow!("missing `:LINE` in review-comment input: {input}"))?;
+            let cwd = std::env::current_dir()?;
+            let root = link::workspace_root(&cwd)
+                .ok_or_else(|| anyhow!("not inside a jj or git repository"))?;
+            Ok(link::Request::ReviewDraftComment {
+                id: None,
+                path: Some(normalize_path(&cwd, &root, raw_path)),
+                start: Some(start),
+                end,
+                body: body.to_string(),
+            })
+        }
         ClientCommand::Note { spec } => {
             let (pathspec, body) = spec
                 .split_once('=')
@@ -3634,14 +3863,35 @@ fn handle_event(
                         KeyCode::Char('j') if ctrl => draft.insert('\n'),
                         KeyCode::Enter => {
                             let body = draft.body.trim().to_string();
-                            let resp = match draft.editing {
-                                // Emptying an existing note deletes it; emptying
-                                // a new one was never a note in the first place.
-                                Some(idx) => Some(app.revise_agent_note(idx, body)),
-                                None if body.is_empty() => None,
-                                None => {
+                            let resp = match (draft.kind, draft.editing) {
+                                (ComposerKind::AgentNote, Some(ComposerEdit::AgentNote(idx))) => {
+                                    Some(app.revise_agent_note(idx, body))
+                                }
+                                (ComposerKind::AgentNote, None) if body.is_empty() => None,
+                                (ComposerKind::AgentNote, None) => {
                                     Some(app.add_agent_note(&draft.path, draft.line, None, body))
                                 }
+                                (
+                                    ComposerKind::ReviewComment,
+                                    Some(ComposerEdit::ReviewComment(id)),
+                                ) => Some(app.revise_review_draft_comment(
+                                    id,
+                                    body,
+                                    link::DraftEditor::User,
+                                )),
+                                (ComposerKind::ReviewComment, None) if body.is_empty() => None,
+                                (ComposerKind::ReviewComment, None) => {
+                                    Some(app.add_review_draft_comment(
+                                        &draft.path,
+                                        draft.line,
+                                        None,
+                                        body,
+                                        link::DraftEditor::User,
+                                    ))
+                                }
+                                _ => Some(link::Response::err(
+                                    "the comment being edited changed unexpectedly",
+                                )),
                             };
                             match resp {
                                 Some(r) if !r.ok => {
@@ -3905,26 +4155,48 @@ fn handle_event(
                         };
                         mode = app.mode.clone();
                     }
-                    KeyCode::Char('n') => app.search_next(),
-                    KeyCode::Char('N') => app.search_prev(),
+                    KeyCode::Char('n') if app.search_query.is_some() => app.search_next(),
+                    KeyCode::Char('N') if app.search_query.is_some() => app.search_prev(),
                     KeyCode::Char('t') => app.cycle_diff_thread(1),
                     KeyCode::Char('T') => app.cycle_diff_thread(-1),
-                    KeyCode::Char('c') => {
+                    KeyCode::Char('n') => {
                         if let Some((path, line)) = app.cursor_target() {
                             // Re-open the note already on this line rather than
                             // stacking a second one on top of it.
-                            let editing = app.agent_note_at(&path, line);
-                            let body = editing
+                            let note_idx = app.agent_note_at(&path, line);
+                            let body = note_idx
                                 .and_then(|i| app.agent_notes.get(i))
                                 .map(|c| c.body.clone())
                                 .unwrap_or_default();
                             app.mode = Mode::NoteInput(NoteDraft {
+                                kind: ComposerKind::AgentNote,
                                 path,
                                 line,
                                 caret: body.chars().count(),
                                 body,
                                 error: None,
-                                editing,
+                                editing: note_idx.map(ComposerEdit::AgentNote),
+                            });
+                            mode = app.mode.clone();
+                        }
+                    }
+                    KeyCode::Char('c') if app.pull_request.is_some() => {
+                        if let Some((path, line)) = app.cursor_target() {
+                            let comment_idx = app.review_draft_comment_at(&path, line);
+                            let body = comment_idx
+                                .and_then(|i| app.review_draft_comments.get(i))
+                                .map(|comment| comment.body.clone())
+                                .unwrap_or_default();
+                            app.mode = Mode::NoteInput(NoteDraft {
+                                kind: ComposerKind::ReviewComment,
+                                path,
+                                line,
+                                caret: body.chars().count(),
+                                body,
+                                error: None,
+                                editing: comment_idx
+                                    .and_then(|i| app.review_draft_comments.get(i))
+                                    .map(|comment| ComposerEdit::ReviewComment(comment.id)),
                             });
                             mode = app.mode.clone();
                         }
@@ -4204,6 +4476,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Style::default().fg(theme::PEACH),
         ));
     }
+    if !app.review_draft_comments.is_empty() {
+        let n = app.review_draft_comments.len();
+        header_spans.push(Span::styled(
+            format!(
+                " · ✎ {n} shared review draft{}",
+                if n == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(theme::YELLOW),
+        ));
+    }
     if !app.terminal_focused {
         // Recolor in place rather than restyling the Paragraph: per-span fg wins
         // over a base style, so we have to overwrite each span to read as dimmed.
@@ -4294,7 +4576,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     }
                     Focus::Diff => {
                         format!(
-                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · c note for agent · e edit · ? help"
+                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · n agent note · e edit · ? help"
                         )
                     }
                 },
@@ -4312,6 +4594,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             }
             if let Some(pr) = &app.pull_request {
                 text = format!("{text} · p PR context");
+                text = format!("{text} · c shared review draft");
                 if !pr.threads.is_empty() {
                     text = format!("{text} · t T review thread");
                 }
@@ -4661,8 +4944,8 @@ fn short_timestamp(timestamp: &str) -> String {
         .collect()
 }
 
-/// The private agent-note modal. Sits at the bottom so it covers as little of
-/// the diff as possible: the note is about a line you want to keep reading.
+/// The inline-comment composer. Sits at the bottom so it covers as little of
+/// the diff as possible: the draft is about a line you want to keep reading.
 /// Returns the column count the body was wrapped to, which key handling needs
 /// to move the caret by visual row.
 fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) -> usize {
@@ -4689,23 +4972,32 @@ fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) ->
 
     // The error takes over the accent colour as well as the hint line: a
     // bounced submit should be impossible to mistake for a sent one.
-    let (accent, hint) = match (&draft.error, draft.editing) {
-        (Some(e), _) => (theme::RED, format!(" {e} ")),
+    let (accent, hint) = match (&draft.error, draft.kind, draft.editing) {
+        (Some(e), _, _) => (theme::RED, format!(" {e} ")),
         // Deleting is only reachable from an existing note, so only advertise
         // it there — on a new one an empty body was never a note to begin with.
-        (None, Some(_)) => (
+        (None, ComposerKind::AgentNote, Some(_)) => (
             theme::PEACH,
             " enter save · empty to delete · esc cancel ".to_string(),
         ),
-        (None, None) => (
+        (None, ComposerKind::AgentNote, None) => (
             theme::PEACH,
             " enter send · shift-enter newline · esc cancel ".to_string(),
         ),
+        (None, ComposerKind::ReviewComment, Some(_)) => (
+            theme::YELLOW,
+            " enter save shared draft · empty to delete · esc cancel ".to_string(),
+        ),
+        (None, ComposerKind::ReviewComment, None) => (
+            theme::YELLOW,
+            " enter stage shared draft · shift-enter newline · esc cancel ".to_string(),
+        ),
     };
-    let verb = if draft.editing.is_some() {
-        "editing agent note on"
-    } else {
-        "note for agent on"
+    let verb = match (draft.kind, draft.editing.is_some()) {
+        (ComposerKind::AgentNote, true) => "editing agent note on",
+        (ComposerKind::AgentNote, false) => "note for agent on",
+        (ComposerKind::ReviewComment, true) => "editing shared review draft on",
+        (ComposerKind::ReviewComment, false) => "shared review draft on",
     };
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4779,12 +5071,13 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("p", "open the attached PR description and review timeline"),
     bind("t T", "next / prev public review thread"),
     bind("enter", "open the public thread anchored at the cursor"),
+    bind("c", "create / edit a shared public review draft"),
+    bind("n", "leave a private note for the local agent"),
     bind(
-        "c",
-        "leave a private note for the local agent · again to edit",
+        "enter",
+        "stage locally · shift-enter newline · empty deletes",
     ),
-    bind("enter", "send · shift-enter newline · empty deletes"),
-    head("Agent note box"),
+    head("Comment composer"),
     bind("^a  ^e", "start / end of the note"),
     bind("^u  ^k", "kill to start / end"),
     bind("^w  alt-bksp", "kill previous word"),
@@ -5161,6 +5454,8 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // thing still waiting on someone.
     let agent_note_rows = app.agent_note_rows();
     let comment_bar = theme::blend(theme::PEACH, theme::BASE, 0.45);
+    let review_draft_rows = app.review_draft_rows();
+    let draft_bar = theme::blend(theme::YELLOW, theme::BASE, 0.35);
     let review_thread_rows = app.review_thread_rows();
     let thread_bar = theme::blend(theme::TEAL, theme::BASE, 0.45);
     let cursor = app.diff_cursor;
@@ -5194,6 +5489,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let focused = focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx));
         let annotated = ann_rows.iter().any(|r| r.contains(&line_idx));
         let commented = agent_note_rows.iter().any(|r| r.contains(&line_idx));
+        let drafted = review_draft_rows.iter().any(|r| r.contains(&line_idx));
         let threaded = review_thread_rows
             .iter()
             .any(|(_, rows)| rows.contains(&line_idx));
@@ -5219,6 +5515,8 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 apply_gutter_bar(&mut row, focus_bar);
             } else if commented {
                 apply_gutter_bar(&mut row, comment_bar);
+            } else if drafted {
+                apply_gutter_bar(&mut row, draft_bar);
             } else if threaded {
                 apply_gutter_bar(&mut row, thread_bar);
             } else if annotated {
@@ -5402,6 +5700,42 @@ fn review_thread_line(n: usize, thread: &link::ReviewThread) -> Line<'static> {
         Span::styled(preview, Style::default().fg(theme::TEXT)),
     ])
     .style(Style::default().bg(theme::SURFACE0))
+}
+
+fn review_draft_line(
+    n: usize,
+    comment: &link::DraftReviewComment,
+    content: Line<'static>,
+    first: bool,
+) -> Line<'static> {
+    let (rule, marker) = if first {
+        (" ╭─ ", format!("✎{n}"))
+    } else {
+        (" │  ", " ".into())
+    };
+    let editor = match comment.last_editor {
+        link::DraftEditor::User => "you",
+        link::DraftEditor::Agent => "agent",
+    };
+    let mut spans = vec![
+        Span::styled(rule, Style::default().fg(theme::OVERLAY0)),
+        Span::styled(
+            marker,
+            Style::default()
+                .fg(theme::YELLOW)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    if first {
+        spans.push(Span::styled(
+            format!(" shared draft · {editor} edited "),
+            Style::default().fg(theme::SUBTEXT0),
+        ));
+    } else {
+        spans.push(Span::raw(" "));
+    }
+    spans.extend(content.spans);
+    Line::from(spans).style(Style::default().bg(theme::SURFACE0))
 }
 
 /// Filled counterparts to [`STEP_BADGES`], marking comments as the same kind of
@@ -5725,6 +6059,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
 
     fn draft() -> NoteDraft {
         NoteDraft {
+            kind: ComposerKind::AgentNote,
             path: "src/main.rs".into(),
             line: 42,
             body: String::new(),

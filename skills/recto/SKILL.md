@@ -1,6 +1,6 @@
 ---
 name: recto
-description: Drive a running recto diff viewer from a companion session — scroll to and highlight a file or line span, or lay down a numbered multi-site tour whose narration advances only when the user says to continue. Load whenever you are explaining, reviewing, or walking through code changes in a workspace where recto might be open, or when asked to "show me where", "point at", or "tour" a diff. Lets you direct the user's eyes to the exact lines you're describing instead of just naming them. Also runs the other way: collects the private agent notes the user left on the diff, so load it whenever they say they left notes, ask you to address their notes, or mention having marked something up.
+description: Drive a running recto diff viewer from a companion session — scroll to and highlight code, lay down a numbered tour, collect private agent notes, and co-author durable local review drafts. Load whenever you are explaining or reviewing changes where recto might be open, when asked to point at code, when the user says they left notes, or while collaboratively writing PR review comments.
 ---
 
 # recto
@@ -47,6 +47,9 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto ping                   # is a recto listening here?
     recto pr OWNER/REPO#NUMBER   # fetch and open public PR context in the TUI
     recto notes                  # collect the private notes the user left for you
+    recto review                 # peek at the shared, local-only review draft
+    recto review-comment PATH:LINE=BODY
+    recto review-comment --id ID BODY
 
 PATH is relative to anywhere in the workspace (recto normalizes it to
 the repo root). Line numbers are **new-side** — the line numbers in the
@@ -62,6 +65,25 @@ The PR overview opens immediately with its description, timeline, and inline
 review threads. The user toggles between it and the diff with `p`, moves among
 public threads with `t` / `T`, and presses `enter` on an anchored thread in the
 diff to open its full conversation.
+
+## Co-author a public review draft
+
+Shared review comments are durable local drafts, not published GitHub content
+and not drain-on-read agent notes. The user stages or edits one with `c` on a
+diff line. Read the whole shared draft with `recto review`; this is a peek, so
+calling it repeatedly never consumes anything. Each comment has a stable `id`
+and a `last_editor` field.
+
+Revise the same comment with `recto review-comment --id ID 'new Markdown'`.
+Create one from the companion side with
+`recto review-comment 'PATH:LINE=Markdown'`. Passing an empty body with `--id`
+deletes the draft. Every mutation returns the updated draft as JSON so both
+sides can immediately see the same object.
+
+These commands require an attached PR, and this workflow does not post
+anything publicly. Do not drain private `recto notes` into the review draft by
+assumption: notes are ephemeral direction, while shared drafts are the exact
+public-facing prose being co-authored.
 
 ## Choose the active surface
 
@@ -135,7 +157,7 @@ pressing Esc) removes the whole set.
 Everything above points the user's eyes at code. `recto notes` runs the other
 way: it hands you private notes they left for the local agent while reading the diff, each
 one anchored to a span and quoted with the surrounding lines. They write
-those by moving the cursor with `j`/`k` and pressing `c` in recto, which is
+those by moving the cursor with `j`/`k` and pressing `n` in recto, which is
 worth mentioning if they ask how to give you line-level feedback.
 
     recto notes
@@ -209,7 +231,8 @@ It looks like:
       },
       "focus": false,
       "annotations": 0,
-      "pending_comments": 2
+      "pending_comments": 2,
+      "draft_comments": 1
     }
 
 The `files` array is always the changed-path list in the diff recto currently
@@ -223,3 +246,7 @@ way to push into your session, so a ping you were already going to run is the
 cheapest place to notice. Anything above zero means `recto notes` has
 something for you. An older recto that predates the feature omits the field
 entirely, which reads as zero.
+
+`draft_comments` counts the session-durable public review comments being
+co-authored locally. It is safe to follow a nonzero count with `recto review`:
+that command only peeks and can never remove draft content.

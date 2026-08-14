@@ -57,6 +57,24 @@ pub enum Request {
     /// which is why this is never queued behind an editor handoff.
     #[serde(rename = "notes", alias = "comments")]
     AgentNotes,
+    /// Read the shared, local-only review draft without consuming it.
+    #[serde(rename = "review")]
+    ReviewDraft,
+    /// Create, revise, or delete one shared inline review comment. New comments
+    /// carry an anchor and no id; revisions carry the stable id. An empty body
+    /// deletes an existing draft.
+    #[serde(rename = "review-comment")]
+    ReviewDraftComment {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        path: Option<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        start: Option<u32>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        end: Option<u32>,
+        body: String,
+    },
 }
 
 /// One labeled site in an [`Request::Annotate`] set. `start`/`end` are
@@ -87,6 +105,31 @@ pub struct AgentNote {
     /// against the diff recto is currently showing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<Vec<SnippetRow>>,
+}
+
+/// The session-durable, local-only public review being co-authored in recto. Reading
+/// this object never changes it; posting is deliberately a later boundary.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReviewDraft {
+    pub pull_request: PullRequestRef,
+    pub comments: Vec<DraftReviewComment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DraftReviewComment {
+    pub id: u64,
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+    pub body: String,
+    pub last_editor: DraftEditor,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DraftEditor {
+    User,
+    Agent,
 }
 
 /// Read-only GitHub pull request context. These are public review objects, not
@@ -207,6 +250,8 @@ pub struct Response {
     pub status: Option<Status>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub comments: Option<Vec<AgentNote>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub review_draft: Option<ReviewDraft>,
 }
 
 /// What a [`Request::Ping`] reports back: recto's identity, current diff, and
@@ -244,6 +289,9 @@ pub struct Status {
     /// its old wire name so older companion clients can still discover them.
     #[serde(default)]
     pub pending_comments: usize,
+    /// Durable public review comments currently being co-authored locally.
+    #[serde(default)]
+    pub draft_comments: usize,
     /// Public PR snapshot currently attached to the TUI, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequestRef>,
@@ -344,6 +392,7 @@ impl Response {
             note: None,
             status: None,
             comments: None,
+            review_draft: None,
         }
     }
 
@@ -364,6 +413,13 @@ impl Response {
     pub fn ok_agent_notes(comments: Vec<AgentNote>) -> Self {
         Self {
             comments: Some(comments),
+            ..Self::ok()
+        }
+    }
+
+    pub fn ok_review_draft(review_draft: ReviewDraft) -> Self {
+        Self {
+            review_draft: Some(review_draft),
             ..Self::ok()
         }
     }
@@ -633,6 +689,15 @@ fn handle_while_in_editor(
         Request::AgentNotes => {
             Response::err("recto is in an editor; leave it before draining agent notes")
         }
+        Request::ReviewDraft => {
+            Response::err("recto is in an editor; leave it before reading the review draft")
+        }
+        Request::ReviewDraftComment { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note(
+                "recto is in an editor; the shared draft update will land when you return",
+            )
+        }
     }
 }
 
@@ -801,6 +866,64 @@ mod tests {
         assert_eq!(sites[1].label, "Step 2: send");
     }
 
+    #[test]
+    fn shared_review_draft_wire_format() {
+        let create = r#"{"cmd":"review-comment","path":"src/main.rs","start":42,"body":"Could this return the error?"}"#;
+        let req: Request = serde_json::from_str(create).expect("parse create");
+        let Request::ReviewDraftComment {
+            id,
+            path,
+            start,
+            body,
+            ..
+        } = req
+        else {
+            panic!("expected shared review comment request");
+        };
+        assert_eq!(id, None);
+        assert_eq!(path.as_deref(), Some("src/main.rs"));
+        assert_eq!(start, Some(42));
+        assert_eq!(body, "Could this return the error?");
+
+        let revise =
+            r#"{"cmd":"review-comment","id":7,"body":"Please return the error directly."}"#;
+        let req: Request = serde_json::from_str(revise).expect("parse revision");
+        let Request::ReviewDraftComment { id, path, body, .. } = req else {
+            panic!("expected shared review comment revision");
+        };
+        assert_eq!(id, Some(7));
+        assert_eq!(path, None);
+        assert_eq!(body, "Please return the error directly.");
+        assert!(matches!(
+            serde_json::from_str::<Request>(r#"{"cmd":"review"}"#),
+            Ok(Request::ReviewDraft)
+        ));
+    }
+
+    #[test]
+    fn shared_review_draft_response_preserves_editor_identity() {
+        let response = Response::ok_review_draft(ReviewDraft {
+            pull_request: PullRequestRef {
+                repository: "phinze/recto".into(),
+                number: 7,
+                head_oid: "abc123".into(),
+            },
+            comments: vec![DraftReviewComment {
+                id: 1,
+                path: "src/main.rs".into(),
+                start: 42,
+                end: 42,
+                body: "Shared words.".into(),
+                last_editor: DraftEditor::Agent,
+            }],
+        });
+        let json = serde_json::to_string(&response).expect("serialize");
+        let back: Response = serde_json::from_str(&json).expect("round trip");
+        let draft = back.review_draft.expect("review draft present");
+        assert_eq!(draft.comments[0].id, 1);
+        assert_eq!(draft.comments[0].last_editor, DraftEditor::Agent);
+    }
+
     /// Pin the ping/status wire shape: companion agents parse this JSON, so the
     /// field names are a contract. Also guards backward compatibility — a plain
     /// `ok()` must not emit a `status` key, so older clients see the old shape.
@@ -819,6 +942,7 @@ mod tests {
             focus: false,
             annotations: 0,
             pending_comments: 2,
+            draft_comments: 0,
             pull_request: None,
         });
         let json = serde_json::to_string(&resp).expect("serialize");
@@ -852,6 +976,7 @@ mod tests {
         assert_eq!(old.capabilities, Capabilities::recto());
         // A recto too old to know about comments simply has none pending.
         assert_eq!(old.pending_comments, 0);
+        assert_eq!(old.draft_comments, 0);
 
         // A bare ok() stays status-free on the wire for older clients.
         assert!(
@@ -882,6 +1007,7 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 pending_comments: 0,
+                draft_comments: 0,
                 pull_request: None,
             },
         );
@@ -926,6 +1052,7 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 pending_comments: 0,
+                draft_comments: 0,
                 pull_request: None,
             },
         );
@@ -1043,6 +1170,7 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 pending_comments: 3,
+                draft_comments: 0,
                 pull_request: None,
             },
         );
