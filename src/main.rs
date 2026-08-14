@@ -3,6 +3,7 @@ mod funcname;
 mod graph;
 mod highlight;
 mod link;
+mod markdown;
 mod theme;
 mod wrap;
 
@@ -32,10 +33,11 @@ use ratatui::{
     layout::{Constraint, Direction, Layout, Position, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
 use notify::{EventKind, RecursiveMode, Watcher};
+use serde::Deserialize;
 use similar::{ChangeTag, TextDiff};
 
 use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope, detect_backend};
@@ -181,6 +183,9 @@ enum ClientCommand {
     Clear,
     /// Check that a recto is listening for this workspace.
     Ping,
+    /// Fetch and open a GitHub PR in the running recto. LOCATOR is a full PR
+    /// URL or `OWNER/REPO#NUMBER`.
+    Pr { locator: String },
     /// Leave a private note for the local agent. SPEC is
     /// `path:LINE=body` or `path:START-END=body`. Notes accumulate; run
     /// this once per note.
@@ -197,6 +202,12 @@ enum Focus {
     Files,
     Diff,
     Commits,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Page {
+    Diff,
+    PullRequest,
 }
 
 impl Focus {
@@ -590,6 +601,10 @@ struct App {
     revs: Vec<Rev>,
     cursor: Cursor,
     mode: Mode,
+    page: Page,
+    pull_request: Option<link::PullRequest>,
+    pr_scroll: usize,
+    pr_max_scroll: usize,
     loading: Option<Loading>,
     changes: Vec<FileChange>,
     /// The pristine render as the worker produced it, before annotation note
@@ -705,6 +720,10 @@ impl App {
             revs,
             cursor: Cursor::All,
             mode: Mode::Normal,
+            page: Page::Diff,
+            pull_request: None,
+            pr_scroll: 0,
+            pr_max_scroll: 0,
             loading: None,
             changes: loaded.changes,
             base_rendered: loaded.rendered.clone(),
@@ -1518,6 +1537,11 @@ impl App {
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
             pending_comments: self.agent_notes.len(),
+            pull_request: self.pull_request.as_ref().map(|pr| link::PullRequestRef {
+                repository: pr.repository.clone(),
+                number: pr.number,
+                head_oid: pr.head_oid.clone(),
+            }),
         }
     }
 
@@ -1525,6 +1549,14 @@ impl App {
     fn handle_request(&mut self, request: link::Request) -> link::Response {
         match request {
             link::Request::Ping => link::Response::ok_status(self.status()),
+            link::Request::AttachPr { pull_request } => {
+                let pull_request = *pull_request;
+                let label = format!("{}#{}", pull_request.repository, pull_request.number);
+                self.pull_request = Some(pull_request);
+                self.pr_scroll = 0;
+                self.page = Page::PullRequest;
+                link::Response::ok_note(format!("opened {label}"))
+            }
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
             link::Request::Annotate { sites } => self.annotate(sites),
             // Deliberately leaves `agent_notes` alone: `clear` is how an agent
@@ -1880,7 +1912,7 @@ impl App {
             .collect()
     }
 
-    /// Rendered-row ranges for the pending comments, re-resolved against the
+    /// Rendered-row ranges for the pending agent notes, re-resolved against the
     /// current render just like `annotation_rows`.
     fn agent_note_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
         self.agent_notes
@@ -2762,6 +2794,9 @@ fn run_client(command: ClientCommand) -> i32 {
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
         ClientCommand::Ping => Ok(link::Request::Ping),
+        ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
+            pull_request: Box::new(fetch_pull_request(locator)?),
+        }),
         ClientCommand::Clear => Ok(link::Request::Clear),
         ClientCommand::Focus { pathspec } => {
             let (raw_path, start, end) = parse_pathspec(pathspec);
@@ -2814,6 +2849,197 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 body: body.to_string(),
             })
         }
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct PrLocator {
+    repository: String,
+    number: u64,
+}
+
+fn parse_pr_locator(raw: &str) -> Result<PrLocator> {
+    let raw = raw.trim().trim_end_matches('/');
+    let path = raw
+        .strip_prefix("https://github.com/")
+        .or_else(|| raw.strip_prefix("http://github.com/"))
+        .unwrap_or(raw);
+    if let Some((repository, number)) = path.split_once('#') {
+        validate_repository(repository)?;
+        return Ok(PrLocator {
+            repository: repository.to_string(),
+            number: number
+                .parse()
+                .map_err(|_| anyhow!("invalid PR number in `{raw}`"))?,
+        });
+    }
+    let parts: Vec<&str> = path.split('/').collect();
+    if let [owner, repo, "pull", number] = parts.as_slice() {
+        let repository = format!("{owner}/{repo}");
+        validate_repository(&repository)?;
+        return Ok(PrLocator {
+            repository,
+            number: number
+                .parse()
+                .map_err(|_| anyhow!("invalid PR number in `{raw}`"))?,
+        });
+    }
+    Err(anyhow!(
+        "PR locator must be a GitHub pull URL or OWNER/REPO#NUMBER: `{raw}`"
+    ))
+}
+
+fn validate_repository(repository: &str) -> Result<()> {
+    let mut parts = repository.split('/');
+    if parts.next().is_some_and(|s| !s.is_empty())
+        && parts.next().is_some_and(|s| !s.is_empty())
+        && parts.next().is_none()
+    {
+        Ok(())
+    } else {
+        Err(anyhow!("invalid GitHub repository `{repository}`"))
+    }
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPullRequest {
+    number: u64,
+    title: String,
+    body: String,
+    author: Option<GhActor>,
+    base_ref_name: String,
+    head_ref_name: String,
+    head_ref_oid: String,
+    url: String,
+    comments: Vec<GhConversationComment>,
+    reviews: Vec<GhReviewSummary>,
+}
+
+#[derive(Deserialize)]
+struct GhActor {
+    login: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhConversationComment {
+    author: Option<GhActor>,
+    body: String,
+    created_at: String,
+    url: String,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewSummary {
+    author: Option<GhActor>,
+    body: String,
+    state: String,
+    #[serde(default)]
+    submitted_at: Option<String>,
+    #[serde(default)]
+    commit: Option<GhCommit>,
+}
+
+#[derive(Deserialize)]
+struct GhCommit {
+    oid: String,
+}
+
+fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
+    let locator = parse_pr_locator(raw)?;
+    let output = Command::new("gh")
+        .args([
+            "pr",
+            "view",
+            &locator.number.to_string(),
+            "-R",
+            &locator.repository,
+            "--json",
+            "number,title,body,author,baseRefName,headRefName,headRefOid,url,comments,reviews",
+        ])
+        .output()
+        .map_err(|e| anyhow!("could not run gh: {e}"))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        return Err(anyhow!(
+            "could not fetch {}/#{}: {}",
+            locator.repository,
+            locator.number,
+            if stderr.is_empty() {
+                "gh failed without an error message"
+            } else {
+                &stderr
+            }
+        ));
+    }
+    let gh: GhPullRequest = serde_json::from_slice(&output.stdout)
+        .map_err(|e| anyhow!("could not decode gh PR response: {e}"))?;
+    Ok(link::PullRequest {
+        repository: locator.repository,
+        number: gh.number,
+        title: gh.title,
+        body: normalize_github_text(gh.body),
+        author: actor_or_ghost(gh.author),
+        base_ref: gh.base_ref_name,
+        head_ref: gh.head_ref_name,
+        head_oid: gh.head_ref_oid,
+        url: gh.url,
+        conversation: gh
+            .comments
+            .into_iter()
+            .map(|comment| link::ConversationComment {
+                author: actor_or_ghost(comment.author),
+                body: normalize_github_text(comment.body),
+                created_at: comment.created_at,
+                url: comment.url,
+            })
+            .collect(),
+        reviews: gh
+            .reviews
+            .into_iter()
+            .map(|review| link::ReviewSummary {
+                author: actor_or_ghost(review.author),
+                body: normalize_github_text(review.body),
+                state: parse_review_state(&review.state),
+                submitted_at: review.submitted_at,
+                commit_oid: review.commit.map(|commit| commit.oid),
+            })
+            .collect(),
+    })
+}
+
+impl From<GhActor> for link::Actor {
+    fn from(actor: GhActor) -> Self {
+        Self {
+            login: actor.login,
+            name: actor.name,
+        }
+    }
+}
+
+fn actor_or_ghost(actor: Option<GhActor>) -> link::Actor {
+    actor.map(Into::into).unwrap_or_else(|| link::Actor {
+        login: "ghost".into(),
+        name: None,
+    })
+}
+
+fn normalize_github_text(text: String) -> String {
+    text.replace("\r\n", "\n")
+}
+
+fn parse_review_state(state: &str) -> link::ReviewState {
+    match state {
+        "APPROVED" => link::ReviewState::Approved,
+        "CHANGES_REQUESTED" => link::ReviewState::ChangesRequested,
+        "COMMENTED" => link::ReviewState::Commented,
+        "DISMISSED" => link::ReviewState::Dismissed,
+        "PENDING" => link::ReviewState::Pending,
+        _ => link::ReviewState::Unknown,
     }
 }
 
@@ -3183,6 +3409,27 @@ fn handle_event(
                         _ => {}
                     }
                 }
+                Mode::Normal if app.page == Page::PullRequest => match key.code {
+                    KeyCode::Char('q') => return Ok(Action::Quit),
+                    KeyCode::Char('p') | KeyCode::Esc => {
+                        app.page = Page::Diff;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.pr_scroll = (app.pr_scroll + 1).min(app.pr_max_scroll);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.pr_scroll = app.pr_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        app.pr_scroll = (app.pr_scroll + 10).min(app.pr_max_scroll);
+                    }
+                    KeyCode::PageUp => {
+                        app.pr_scroll = app.pr_scroll.saturating_sub(10);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => app.pr_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => app.pr_scroll = app.pr_max_scroll,
+                    _ => {}
+                },
                 // Help overlay is up: any key dismisses it and is otherwise
                 // swallowed, so the binding it names doesn't also fire.
                 Mode::Normal if app.show_help => {
@@ -3209,6 +3456,9 @@ fn handle_event(
                     // cancel, change focus, quit. Esc keeps the chain, since
                     // backing out a layer at a time is exactly what it's for.
                     KeyCode::Char('q') => return Ok(Action::Quit),
+                    KeyCode::Char('p') if app.pull_request.is_some() => {
+                        app.page = Page::PullRequest;
+                    }
                     KeyCode::Esc => {
                         if app.search_query.is_some() {
                             app.clear_search();
@@ -3369,6 +3619,16 @@ fn handle_event(
 }
 
 fn handle_mouse(app: &mut App, m: event::MouseEvent) {
+    if app.page == Page::PullRequest {
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                app.pr_scroll = (app.pr_scroll + 3).min(app.pr_max_scroll)
+            }
+            MouseEventKind::ScrollUp => app.pr_scroll = app.pr_scroll.saturating_sub(3),
+            _ => {}
+        }
+        return;
+    }
     let pos = Position {
         x: m.column,
         y: m.row,
@@ -3502,6 +3762,10 @@ fn watched_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    if app.page == Page::PullRequest {
+        draw_pull_request(frame, app);
+        return;
+    }
     let area = frame.area();
 
     let rows = Layout::default()
@@ -3574,6 +3838,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             format!(" · ▸ focus {}:{}-{}", span.path, span.start, span.end)
         };
         header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
+    }
+    if let Some(pr) = &app.pull_request {
+        header_spans.push(Span::styled(
+            format!(" · PR #{} attached", pr.number),
+            Style::default().fg(theme::TEAL),
+        ));
     }
     // Pending agent notes are invisible once you scroll away from them, and the
     // whole point is that they're waiting on an agent, so keep the count in
@@ -3694,6 +3964,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     "{text} · n next · N prev · / \"{query}\" [{active_match}/{total_matches}]"
                 );
             }
+            if app.pull_request.is_some() {
+                text = format!("{text} · p PR context");
+            }
             Paragraph::new(Line::from(text)).style(Style::default().fg(theme::OVERLAY0))
         }
     };
@@ -3710,6 +3983,198 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     if app.show_help {
         draw_help(frame, frame.area());
     }
+}
+
+fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
+    let Some(pr) = &app.pull_request else {
+        app.page = Page::Diff;
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+
+    let header = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}#{}", pr.repository, pr.number),
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  {}", pr.title),
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+        ]),
+        Line::from(vec![
+            Span::styled(
+                format!("@{}", pr.author.login),
+                Style::default().fg(theme::PEACH),
+            ),
+            Span::styled(
+                format!("  {} → {}  ", pr.base_ref, pr.head_ref),
+                Style::default().fg(theme::SUBTEXT0),
+            ),
+            Span::styled(
+                short_oid(&pr.head_oid),
+                Style::default().fg(theme::OVERLAY0),
+            ),
+        ]),
+    ];
+    frame.render_widget(Paragraph::new(header), rows[0]);
+
+    let lines = pull_request_lines(pr);
+    let inner_width = rows[1].width.saturating_sub(2);
+    let inner_height = rows[1].height.saturating_sub(2) as usize;
+    let visual_rows: usize = lines
+        .iter()
+        .map(|line| wrap::row_count(line, inner_width, 0))
+        .sum();
+    app.pr_max_scroll = visual_rows.saturating_sub(inner_height);
+    app.pr_scroll = app.pr_scroll.min(app.pr_max_scroll);
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::SURFACE1))
+        .title(Span::styled(
+            " PR context ",
+            Style::default().fg(theme::TEAL),
+        ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
+            .wrap(Wrap { trim: false })
+            .scroll((app.pr_scroll.min(u16::MAX as usize) as u16, 0)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("p / esc diff · j k scroll · space page · g G top / bottom · q quit")
+            .style(Style::default().fg(theme::OVERLAY0)),
+        rows[2],
+    );
+}
+
+fn pull_request_lines(pr: &link::PullRequest) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    section_heading(&mut lines, "Description");
+    if pr.body.trim().is_empty() {
+        lines.push(dim_line("No description."));
+    } else {
+        lines.extend(markdown::lines(&pr.body));
+    }
+
+    if !pr.conversation.is_empty() {
+        section_heading(&mut lines, "Conversation");
+        for comment in &pr.conversation {
+            message_header(
+                &mut lines,
+                &comment.author,
+                "commented",
+                Some(&comment.created_at),
+                theme::TEAL,
+            );
+            lines.extend(markdown::lines(&comment.body));
+            lines.push(Line::default());
+        }
+    }
+
+    if !pr.reviews.is_empty() {
+        section_heading(&mut lines, "Reviews");
+        for review in &pr.reviews {
+            let (verb, color) = match review.state {
+                link::ReviewState::Approved => ("approved", theme::GREEN),
+                link::ReviewState::ChangesRequested => ("requested changes", theme::RED),
+                link::ReviewState::Commented => ("reviewed", theme::TEAL),
+                link::ReviewState::Dismissed => ("review dismissed", theme::OVERLAY0),
+                link::ReviewState::Pending => ("review pending", theme::YELLOW),
+                link::ReviewState::Unknown => ("reviewed", theme::SUBTEXT0),
+            };
+            message_header(
+                &mut lines,
+                &review.author,
+                verb,
+                review.submitted_at.as_deref(),
+                color,
+            );
+            if review.body.trim().is_empty() {
+                lines.push(dim_line("No review summary."));
+            } else {
+                lines.extend(markdown::lines(&review.body));
+            }
+            lines.push(Line::default());
+        }
+    }
+    lines
+}
+
+fn section_heading(lines: &mut Vec<Line<'static>>, title: &str) {
+    if !lines.is_empty() {
+        lines.push(Line::default());
+    }
+    lines.push(Line::from(Span::styled(
+        title.to_string(),
+        Style::default()
+            .fg(theme::MAUVE)
+            .add_modifier(Modifier::BOLD),
+    )));
+    lines.push(Line::from(Span::styled(
+        "────────────────────────────────────────",
+        Style::default().fg(theme::SURFACE1),
+    )));
+}
+
+fn message_header(
+    lines: &mut Vec<Line<'static>>,
+    author: &link::Actor,
+    verb: &str,
+    timestamp: Option<&str>,
+    color: ratatui::style::Color,
+) {
+    let when = timestamp.map(short_timestamp).unwrap_or_default();
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("@{}", author.login),
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {verb}"), Style::default().fg(color)),
+        Span::styled(
+            if when.is_empty() {
+                String::new()
+            } else {
+                format!("  {when}")
+            },
+            Style::default().fg(theme::OVERLAY0),
+        ),
+    ]));
+}
+
+fn dim_line(text: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        text.to_string(),
+        Style::default().fg(theme::OVERLAY0),
+    ))
+}
+
+fn short_oid(oid: &str) -> String {
+    oid.chars().take(12).collect()
+}
+
+fn short_timestamp(timestamp: &str) -> String {
+    timestamp
+        .chars()
+        .take(16)
+        .map(|c| if c == 'T' { ' ' } else { c })
+        .collect()
 }
 
 /// The private agent-note modal. Sits at the bottom so it covers as little of
@@ -3827,6 +4292,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("n N", "next / prev match"),
     bind("1-9", "jump to tour step"),
     head("Review"),
+    bind("p", "open the attached PR description and review timeline"),
     bind(
         "c",
         "leave a private note for the local agent · again to edit",
@@ -4556,6 +5022,73 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn pathspec_colon_in_path_without_range() {
         // A trailing colon segment that isn't a number is part of the path.
         assert_eq!(parse_pathspec("weird:name"), ("weird:name", None, None));
+    }
+
+    #[test]
+    fn pr_locator_accepts_url_and_compact_forms() {
+        assert_eq!(
+            parse_pr_locator("https://github.com/cli/cli/pull/14136/").unwrap(),
+            PrLocator {
+                repository: "cli/cli".into(),
+                number: 14136,
+            }
+        );
+        assert_eq!(
+            parse_pr_locator("phinze/recto#7").unwrap(),
+            PrLocator {
+                repository: "phinze/recto".into(),
+                number: 7,
+            }
+        );
+        assert!(parse_pr_locator("14136").is_err());
+    }
+
+    #[test]
+    fn pr_document_keeps_public_review_objects_distinct() {
+        let pr = link::PullRequest {
+            repository: "phinze/recto".into(),
+            number: 7,
+            title: "Whole reviews".into(),
+            body: "## Intent\n\nKeep **everything** together.".into(),
+            author: link::Actor {
+                login: "author".into(),
+                name: None,
+            },
+            base_ref: "main".into(),
+            head_ref: "reviews".into(),
+            head_oid: "1234567890abcdef".into(),
+            url: "https://github.com/phinze/recto/pull/7".into(),
+            conversation: vec![link::ConversationComment {
+                author: link::Actor {
+                    login: "teammate".into(),
+                    name: None,
+                },
+                body: "A conversation comment.".into(),
+                created_at: "2026-08-14T12:00:00Z".into(),
+                url: "https://github.com/phinze/recto/pull/7#issuecomment-1".into(),
+            }],
+            reviews: vec![link::ReviewSummary {
+                author: link::Actor {
+                    login: "reviewer".into(),
+                    name: None,
+                },
+                body: "A review summary.".into(),
+                state: link::ReviewState::ChangesRequested,
+                submitted_at: Some("2026-08-14T13:00:00Z".into()),
+                commit_oid: Some("1234567890abcdef".into()),
+            }],
+        };
+        let text: Vec<String> = pull_request_lines(&pr)
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        assert!(text.iter().any(|line| line == "Description"));
+        assert!(text.iter().any(|line| line == "Conversation"));
+        assert!(text.iter().any(|line| line == "Reviews"));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("@reviewer  requested changes"))
+        );
     }
 
     #[test]

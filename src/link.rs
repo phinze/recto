@@ -36,6 +36,11 @@ pub enum Request {
     Clear,
     /// Liveness check.
     Ping,
+    /// Attach a read-only GitHub pull request snapshot to the review surface.
+    /// Fetching happens in the client process, so the running TUI remains
+    /// network-agnostic and startup stays offline.
+    #[serde(rename = "pr")]
+    AttachPr { pull_request: Box<PullRequest> },
     /// Pin a private note for the local agent to a span, appended to the pending set.
     /// `start`/`end` are new-side line numbers like `Focus`. Unlike `Annotate`
     /// (one tour, replaced wholesale) notes accumulate: each call adds one.
@@ -82,6 +87,58 @@ pub struct AgentNote {
     /// against the diff recto is currently showing.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub snippet: Option<Vec<SnippetRow>>,
+}
+
+/// Read-only GitHub pull request context. These are public review objects, not
+/// the private [`AgentNote`] channel, even when their body/author shapes rhyme.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequest {
+    pub repository: String,
+    pub number: u64,
+    pub title: String,
+    pub body: String,
+    pub author: Actor,
+    pub base_ref: String,
+    pub head_ref: String,
+    pub head_oid: String,
+    pub url: String,
+    pub conversation: Vec<ConversationComment>,
+    pub reviews: Vec<ReviewSummary>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct Actor {
+    pub login: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ConversationComment {
+    pub author: Actor,
+    pub body: String,
+    pub created_at: String,
+    pub url: String,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReviewSummary {
+    pub author: Actor,
+    pub body: String,
+    pub state: ReviewState,
+    pub submitted_at: Option<String>,
+    pub commit_oid: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ReviewState {
+    Approved,
+    ChangesRequested,
+    Commented,
+    Dismissed,
+    Pending,
+    Unknown,
 }
 
 /// One row of a note's snippet, mirroring what the reviewer had on screen:
@@ -152,6 +209,16 @@ pub struct Status {
     /// its old wire name so older companion clients can still discover them.
     #[serde(default)]
     pub pending_comments: usize,
+    /// Public PR snapshot currently attached to the TUI, if any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub pull_request: Option<PullRequestRef>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct PullRequestRef {
+    pub repository: String,
+    pub number: u64,
+    pub head_oid: String,
 }
 
 #[derive(Debug, Clone, Copy, Default, Deserialize, Serialize, PartialEq, Eq)]
@@ -487,6 +554,12 @@ fn handle_while_in_editor(
             });
             resp
         }
+        // Attaching public context only mutates TUI state. Queue it just like a
+        // private note and let it become visible when the editor hands back.
+        Request::AttachPr { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; PR context will open when you return")
+        }
         Request::Clear => {
             if let Some(h) = nvim.as_ref() {
                 drive_nvim_clear(h);
@@ -513,7 +586,7 @@ fn handle_while_in_editor(
             Response::ok_note("recto is in an editor; annotations will apply when you return")
         }
         // Adding a comment is pure state, so queuing loses nothing: it lands
-        // when the loop resumes. This is the `!recto comment …` path out of
+        // when the loop resumes. This is the `!recto note …` path out of
         // neovim, so it has to keep working while we're parked here.
         Request::AgentNote { .. } => {
             queue(tx, request.clone());
@@ -711,6 +784,7 @@ mod tests {
             focus: false,
             annotations: 0,
             pending_comments: 2,
+            pull_request: None,
         });
         let json = serde_json::to_string(&resp).expect("serialize");
         let back: Response = serde_json::from_str(&json).expect("round trip");
@@ -773,6 +847,7 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 pending_comments: 0,
+                pull_request: None,
             },
         );
         let (tx, _rx) = mpsc::channel::<Incoming>();
@@ -816,6 +891,7 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 pending_comments: 0,
+                pull_request: None,
             },
         );
         let (tx, _rx) = mpsc::channel::<Incoming>();
@@ -835,7 +911,7 @@ mod tests {
     }
 
     /// Pin the comment wire shape alongside `annotate`'s: reviewers reach this
-    /// through the CLI, but `!recto comment …` from an editor hand-writes it.
+    /// through the CLI, but `!recto note …` from an editor hand-writes it.
     #[test]
     fn comment_wire_format() {
         let json = r#"{"cmd":"comment","path":"src/main.rs","start":42,"body":"why 3?"}"#;
@@ -932,6 +1008,7 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 pending_comments: 3,
+                pull_request: None,
             },
         );
         let (tx, rx) = mpsc::channel::<Incoming>();

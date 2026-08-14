@@ -45,6 +45,7 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
     recto clear                  # remove the highlight and any annotations
     recto ping                   # is a recto listening here?
+    recto pr OWNER/REPO#NUMBER   # fetch and open public PR context in the TUI
     recto notes                  # collect the private notes the user left for you
 
 PATH is relative to anywhere in the workspace (recto normalizes it to
@@ -53,6 +54,12 @@ post-change file, the ones you'd see in your editor after the edit.
 
 Annotate SPECs are `PATH:LINE=label` or `PATH:START-END=label`. Argument
 order sets the step numbers, and each call replaces the whole set.
+
+`recto pr` is an explicit network boundary. The client fetches the PR through
+`gh`, then attaches a read-only snapshot to the running TUI; recto startup
+stays offline. A full `https://github.com/OWNER/REPO/pull/NUMBER` URL works too.
+The PR overview opens immediately, and the user toggles between it and the diff
+with `p`.
 
 ## Choose the active surface
 
