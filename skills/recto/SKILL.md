@@ -58,8 +58,10 @@ order sets the step numbers, and each call replaces the whole set.
 `recto pr` is an explicit network boundary. The client fetches the PR through
 `gh`, then attaches a read-only snapshot to the running TUI; recto startup
 stays offline. A full `https://github.com/OWNER/REPO/pull/NUMBER` URL works too.
-The PR overview opens immediately, and the user toggles between it and the diff
-with `p`.
+The PR overview opens immediately with its description, timeline, and inline
+review threads. The user toggles between it and the diff with `p`, moves among
+public threads with `t` / `T`, and presses `enter` on an anchored thread in the
+diff to open its full conversation.
 
 ## Choose the active surface
 

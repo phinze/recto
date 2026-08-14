@@ -208,6 +208,7 @@ enum Focus {
 enum Page {
     Diff,
     PullRequest,
+    ReviewThread,
 }
 
 impl Focus {
@@ -605,6 +606,9 @@ struct App {
     pull_request: Option<link::PullRequest>,
     pr_scroll: usize,
     pr_max_scroll: usize,
+    active_thread: Option<usize>,
+    thread_scroll: usize,
+    thread_max_scroll: usize,
     loading: Option<Loading>,
     changes: Vec<FileChange>,
     /// The pristine render as the worker produced it, before annotation note
@@ -724,6 +728,9 @@ impl App {
             pull_request: None,
             pr_scroll: 0,
             pr_max_scroll: 0,
+            active_thread: None,
+            thread_scroll: 0,
+            thread_max_scroll: 0,
             loading: None,
             changes: loaded.changes,
             base_rendered: loaded.rendered.clone(),
@@ -1554,7 +1561,9 @@ impl App {
                 let label = format!("{}#{}", pull_request.repository, pull_request.number);
                 self.pull_request = Some(pull_request);
                 self.pr_scroll = 0;
+                self.active_thread = None;
                 self.page = Page::PullRequest;
+                self.reweave();
                 link::Response::ok_note(format!("opened {label}"))
             }
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
@@ -1683,6 +1692,20 @@ impl App {
                 continue;
             };
             inserts.push((*rows.start(), note_line(i + 1, &a.label)));
+        }
+        if let Some(pr) = &self.pull_request {
+            for (i, thread) in pr.threads.iter().enumerate() {
+                let Some((start, end)) = review_thread_span(thread) else {
+                    continue;
+                };
+                let Some(file_idx) = self.changes.iter().position(|c| c.path == thread.path) else {
+                    continue;
+                };
+                let Some(rows) = rows_for_span(&self.base_line_info, file_idx, start, end) else {
+                    continue;
+                };
+                inserts.push((*rows.start(), review_thread_line(i + 1, thread)));
+            }
         }
         for (i, c) in self.agent_notes.iter().enumerate() {
             let Some(file_idx) = self.changes.iter().position(|ch| ch.path == c.path) else {
@@ -1922,6 +1945,85 @@ impl App {
                 rows_for_span(&self.line_info, file_idx, c.start, c.end)
             })
             .collect()
+    }
+
+    fn review_thread_rows(&self) -> Vec<(usize, std::ops::RangeInclusive<usize>)> {
+        self.pull_request
+            .as_ref()
+            .into_iter()
+            .flat_map(|pr| pr.threads.iter().enumerate())
+            .filter_map(|(i, thread)| {
+                let (start, end) = review_thread_span(thread)?;
+                let file_idx = self.changes.iter().position(|c| c.path == thread.path)?;
+                Some((i, rows_for_span(&self.line_info, file_idx, start, end)?))
+            })
+            .collect()
+    }
+
+    /// Move among threads that still anchor to the new side of this diff.
+    fn cycle_diff_thread(&mut self, delta: isize) {
+        let threads = self.review_thread_rows();
+        if threads.is_empty() {
+            return;
+        }
+        let current = self
+            .active_thread
+            .and_then(|active| threads.iter().position(|(i, _)| *i == active));
+        let next = match (current, delta.is_negative()) {
+            (Some(i), false) => (i + 1) % threads.len(),
+            (Some(i), true) => i.checked_sub(1).unwrap_or(threads.len() - 1),
+            (None, false) => 0,
+            (None, true) => threads.len() - 1,
+        };
+        let (thread_idx, rows) = threads[next].clone();
+        self.active_thread = Some(thread_idx);
+        self.reveal_span(&rows);
+        self.diff_cursor = Some(*rows.start());
+        self.take_diff_focus();
+    }
+
+    /// Move among every public thread in the attached snapshot, including
+    /// outdated and left-side conversations that cannot be pinned in this diff.
+    fn cycle_public_thread(&mut self, delta: isize) -> bool {
+        let Some(len) = self
+            .pull_request
+            .as_ref()
+            .map(|pr| pr.threads.len())
+            .filter(|len| *len > 0)
+        else {
+            return false;
+        };
+        let next = match (self.active_thread.filter(|i| *i < len), delta.is_negative()) {
+            (Some(i), false) => (i + 1) % len,
+            (Some(i), true) => i.checked_sub(1).unwrap_or(len - 1),
+            (None, false) => 0,
+            (None, true) => len - 1,
+        };
+        self.active_thread = Some(next);
+        true
+    }
+
+    fn thread_at_cursor(&self) -> Option<usize> {
+        let (path, line) = self.cursor_target()?;
+        let threads = &self.pull_request.as_ref()?.threads;
+        let contains_cursor = |thread: &link::ReviewThread| {
+            thread.path == path
+                && review_thread_span(thread)
+                    .is_some_and(|(start, end)| (start..=end).contains(&line))
+        };
+        self.active_thread
+            .filter(|i| threads.get(*i).is_some_and(contains_cursor))
+            .or_else(|| threads.iter().position(contains_cursor))
+    }
+
+    fn open_thread_at_cursor(&mut self) -> bool {
+        let Some(thread) = self.thread_at_cursor() else {
+            return false;
+        };
+        self.active_thread = Some(thread);
+        self.thread_scroll = 0;
+        self.page = Page::ReviewThread;
+        true
     }
 
     /// Jump to annotation step `i` (0-based) — the number-key navigation.
@@ -2949,13 +3051,105 @@ struct GhCommit {
     oid: String,
 }
 
+#[derive(Deserialize)]
+struct GhGraphQlResponse {
+    data: GhGraphQlData,
+}
+
+#[derive(Deserialize)]
+struct GhGraphQlData {
+    repository: GhGraphQlRepository,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhGraphQlRepository {
+    pull_request: GhGraphQlPullRequest,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhGraphQlPullRequest {
+    review_threads: GhReviewThreadConnection,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewThreadConnection {
+    page_info: GhPageInfo,
+    nodes: Vec<GhReviewThread>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhPageInfo {
+    has_next_page: bool,
+    end_cursor: Option<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewThread {
+    id: String,
+    is_resolved: bool,
+    is_outdated: bool,
+    path: String,
+    line: Option<u32>,
+    original_line: Option<u32>,
+    start_line: Option<u32>,
+    original_start_line: Option<u32>,
+    diff_side: String,
+    comments: GhReviewCommentConnection,
+}
+
+#[derive(Deserialize)]
+struct GhReviewCommentConnection {
+    nodes: Vec<GhReviewComment>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GhReviewComment {
+    id: String,
+    database_id: Option<u64>,
+    author: Option<GhActor>,
+    body: String,
+    created_at: String,
+    url: String,
+    reply_to: Option<GhNodeRef>,
+}
+
+#[derive(Deserialize)]
+struct GhNodeRef {
+    id: String,
+}
+
+const REVIEW_THREADS_QUERY: &str = r#"
+query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
+  repository(owner: $owner, name: $name) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100, after: $endCursor) {
+        pageInfo { hasNextPage endCursor }
+        nodes {
+          id isResolved isOutdated path line originalLine startLine originalStartLine diffSide
+          comments(first: 100) {
+            nodes { id databaseId author { login } body createdAt url replyTo { id } }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
 fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
     let locator = parse_pr_locator(raw)?;
+    let number = locator.number.to_string();
     let output = Command::new("gh")
         .args([
             "pr",
             "view",
-            &locator.number.to_string(),
+            &number,
             "-R",
             &locator.repository,
             "--json",
@@ -2978,6 +3172,7 @@ fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
     }
     let gh: GhPullRequest = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow!("could not decode gh PR response: {e}"))?;
+    let threads = fetch_review_threads(&locator)?;
     Ok(link::PullRequest {
         repository: locator.repository,
         number: gh.number,
@@ -3009,7 +3204,95 @@ fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
                 commit_oid: review.commit.map(|commit| commit.oid),
             })
             .collect(),
+        threads,
     })
+}
+
+fn fetch_review_threads(locator: &PrLocator) -> Result<Vec<link::ReviewThread>> {
+    let (owner, name) = locator
+        .repository
+        .split_once('/')
+        .expect("validated owner/repository");
+    let mut after = None;
+    let mut threads = Vec::new();
+    loop {
+        let mut command = Command::new("gh");
+        command
+            .args([
+                "api",
+                "graphql",
+                "-f",
+                &format!("query={REVIEW_THREADS_QUERY}"),
+            ])
+            .args(["-f", &format!("owner={owner}")])
+            .args(["-f", &format!("name={name}")])
+            .args(["-F", &format!("number={}", locator.number)]);
+        if let Some(cursor) = &after {
+            command.args(["-f", &format!("endCursor={cursor}")]);
+        }
+        let output = command
+            .output()
+            .map_err(|e| anyhow!("could not run gh: {e}"))?;
+        if !output.status.success() {
+            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+            return Err(anyhow!(
+                "could not fetch review threads for {}#{}: {}",
+                locator.repository,
+                locator.number,
+                if stderr.is_empty() {
+                    "gh failed without an error message"
+                } else {
+                    &stderr
+                }
+            ));
+        }
+        let page: GhGraphQlResponse = serde_json::from_slice(&output.stdout)
+            .map_err(|e| anyhow!("could not decode gh review-thread response: {e}"))?;
+        let connection = page.data.repository.pull_request.review_threads;
+        threads.extend(connection.nodes.into_iter().map(normalize_review_thread));
+        if !connection.page_info.has_next_page {
+            break;
+        }
+        after = connection.page_info.end_cursor;
+        if after.is_none() {
+            return Err(anyhow!(
+                "GitHub reported another thread page without a cursor"
+            ));
+        }
+    }
+    Ok(threads)
+}
+
+fn normalize_review_thread(thread: GhReviewThread) -> link::ReviewThread {
+    link::ReviewThread {
+        id: thread.id,
+        path: thread.path,
+        side: match thread.diff_side.as_str() {
+            "LEFT" => link::DiffSide::Left,
+            "RIGHT" => link::DiffSide::Right,
+            _ => link::DiffSide::Unknown,
+        },
+        line: thread.line,
+        start_line: thread.start_line,
+        original_line: thread.original_line,
+        original_start_line: thread.original_start_line,
+        resolved: thread.is_resolved,
+        outdated: thread.is_outdated,
+        comments: thread
+            .comments
+            .nodes
+            .into_iter()
+            .map(|comment| link::ReviewComment {
+                id: comment.id,
+                database_id: comment.database_id,
+                author: actor_or_ghost(comment.author),
+                body: normalize_github_text(comment.body),
+                created_at: comment.created_at,
+                url: comment.url,
+                reply_to: comment.reply_to.map(|reply| reply.id),
+            })
+            .collect(),
+    }
 }
 
 impl From<GhActor> for link::Actor {
@@ -3414,6 +3697,18 @@ fn handle_event(
                     KeyCode::Char('p') | KeyCode::Esc => {
                         app.page = Page::Diff;
                     }
+                    KeyCode::Char('t') => {
+                        if app.cycle_public_thread(1) {
+                            app.thread_scroll = 0;
+                            app.page = Page::ReviewThread;
+                        }
+                    }
+                    KeyCode::Char('T') => {
+                        if app.cycle_public_thread(-1) {
+                            app.thread_scroll = 0;
+                            app.page = Page::ReviewThread;
+                        }
+                    }
                     KeyCode::Char('j') | KeyCode::Down => {
                         app.pr_scroll = (app.pr_scroll + 1).min(app.pr_max_scroll);
                     }
@@ -3428,6 +3723,34 @@ fn handle_event(
                     }
                     KeyCode::Char('g') | KeyCode::Home => app.pr_scroll = 0,
                     KeyCode::Char('G') | KeyCode::End => app.pr_scroll = app.pr_max_scroll,
+                    _ => {}
+                },
+                Mode::Normal if app.page == Page::ReviewThread => match key.code {
+                    KeyCode::Char('q') => return Ok(Action::Quit),
+                    KeyCode::Esc => app.page = Page::Diff,
+                    KeyCode::Char('p') => app.page = Page::PullRequest,
+                    KeyCode::Char('t') => {
+                        app.cycle_public_thread(1);
+                        app.thread_scroll = 0;
+                    }
+                    KeyCode::Char('T') => {
+                        app.cycle_public_thread(-1);
+                        app.thread_scroll = 0;
+                    }
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.thread_scroll = (app.thread_scroll + 1).min(app.thread_max_scroll);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.thread_scroll = app.thread_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        app.thread_scroll = (app.thread_scroll + 10).min(app.thread_max_scroll);
+                    }
+                    KeyCode::PageUp => {
+                        app.thread_scroll = app.thread_scroll.saturating_sub(10);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => app.thread_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => app.thread_scroll = app.thread_max_scroll,
                     _ => {}
                 },
                 // Help overlay is up: any key dismisses it and is otherwise
@@ -3501,7 +3824,11 @@ fn handle_event(
                     KeyCode::Char('F') => {
                         app.toggle_files();
                     }
-                    KeyCode::Enter => app.jump_to_selected(),
+                    KeyCode::Enter => {
+                        if app.focus != Focus::Diff || !app.open_thread_at_cursor() {
+                            app.jump_to_selected();
+                        }
+                    }
                     KeyCode::Char('j') | KeyCode::Down => match app.focus {
                         Focus::Files if app.show_files => {
                             app.select_next();
@@ -3580,6 +3907,8 @@ fn handle_event(
                     }
                     KeyCode::Char('n') => app.search_next(),
                     KeyCode::Char('N') => app.search_prev(),
+                    KeyCode::Char('t') => app.cycle_diff_thread(1),
+                    KeyCode::Char('T') => app.cycle_diff_thread(-1),
                     KeyCode::Char('c') => {
                         if let Some((path, line)) = app.cursor_target() {
                             // Re-open the note already on this line rather than
@@ -3625,6 +3954,16 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 app.pr_scroll = (app.pr_scroll + 3).min(app.pr_max_scroll)
             }
             MouseEventKind::ScrollUp => app.pr_scroll = app.pr_scroll.saturating_sub(3),
+            _ => {}
+        }
+        return;
+    }
+    if app.page == Page::ReviewThread {
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                app.thread_scroll = (app.thread_scroll + 3).min(app.thread_max_scroll)
+            }
+            MouseEventKind::ScrollUp => app.thread_scroll = app.thread_scroll.saturating_sub(3),
             _ => {}
         }
         return;
@@ -3762,9 +4101,16 @@ fn watched_dirs(root: &Path) -> Vec<PathBuf> {
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
-    if app.page == Page::PullRequest {
-        draw_pull_request(frame, app);
-        return;
+    match app.page {
+        Page::PullRequest => {
+            draw_pull_request(frame, app);
+            return;
+        }
+        Page::ReviewThread => {
+            draw_review_thread(frame, app);
+            return;
+        }
+        Page::Diff => {}
     }
     let area = frame.area();
 
@@ -3964,8 +4310,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
                     "{text} · n next · N prev · / \"{query}\" [{active_match}/{total_matches}]"
                 );
             }
-            if app.pull_request.is_some() {
+            if let Some(pr) = &app.pull_request {
                 text = format!("{text} · p PR context");
+                if !pr.threads.is_empty() {
+                    text = format!("{text} · t T review thread");
+                }
             }
             Paragraph::new(Line::from(text)).style(Style::default().fg(theme::OVERLAY0))
         }
@@ -4056,7 +4405,7 @@ fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
         rows[1],
     );
     frame.render_widget(
-        Paragraph::new("p / esc diff · j k scroll · space page · g G top / bottom · q quit")
+        Paragraph::new("p/esc diff · t/T threads · j/k scroll · g/G ends · q quit")
             .style(Style::default().fg(theme::OVERLAY0)),
         rows[2],
     );
@@ -4112,7 +4461,142 @@ fn pull_request_lines(pr: &link::PullRequest) -> Vec<Line<'static>> {
             lines.push(Line::default());
         }
     }
+    if !pr.threads.is_empty() {
+        section_heading(&mut lines, "Review threads");
+        for (i, thread) in pr.threads.iter().enumerate() {
+            thread_heading(&mut lines, i + 1, thread);
+            lines.extend(review_thread_lines(thread));
+            lines.push(Line::default());
+        }
+    }
     lines
+}
+
+fn draw_review_thread(frame: &mut ratatui::Frame, app: &mut App) {
+    let Some((pr, thread_idx, thread)) = app.pull_request.as_ref().and_then(|pr| {
+        let i = app.active_thread?;
+        Some((pr, i, pr.threads.get(i)?))
+    }) else {
+        app.page = Page::Diff;
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(2),
+            Constraint::Min(0),
+            Constraint::Length(1),
+        ])
+        .split(frame.area());
+    let state = if thread.outdated {
+        "outdated"
+    } else if thread.resolved {
+        "resolved"
+    } else {
+        "open"
+    };
+    let header = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}#{}", pr.repository, pr.number),
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  thread {}/{}", thread_idx + 1, pr.threads.len()),
+                Style::default().fg(theme::TEAL),
+            ),
+            Span::styled(format!("  {state}"), Style::default().fg(theme::SUBTEXT0)),
+        ]),
+        Line::from(Span::styled(
+            thread_anchor_label(thread),
+            Style::default().fg(theme::TEXT),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(header), rows[0]);
+
+    let lines = review_thread_lines(thread);
+    let inner_width = rows[1].width.saturating_sub(4);
+    let inner_height = rows[1].height.saturating_sub(2) as usize;
+    let visual_rows: usize = lines
+        .iter()
+        .map(|line| wrap::row_count(line, inner_width, 0))
+        .sum();
+    app.thread_max_scroll = visual_rows.saturating_sub(inner_height);
+    app.thread_scroll = app.thread_scroll.min(app.thread_max_scroll);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::TEAL))
+        .title(Span::styled(
+            " Review conversation ",
+            Style::default().fg(theme::TEAL),
+        ));
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
+            .wrap(Wrap { trim: false })
+            .scroll((app.thread_scroll.min(u16::MAX as usize) as u16, 0)),
+        rows[1],
+    );
+    frame.render_widget(
+        Paragraph::new("esc diff · t/T threads · j/k scroll · p PR · q quit")
+            .style(Style::default().fg(theme::OVERLAY0)),
+        rows[2],
+    );
+}
+
+fn review_thread_lines(thread: &link::ReviewThread) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    for (i, comment) in thread.comments.iter().enumerate() {
+        message_header(
+            &mut lines,
+            &comment.author,
+            if i == 0 { "commented" } else { "replied" },
+            Some(&comment.created_at),
+            theme::TEAL,
+        );
+        lines.extend(markdown::lines(&comment.body));
+        if i + 1 < thread.comments.len() {
+            lines.push(Line::default());
+        }
+    }
+    if lines.is_empty() {
+        lines.push(dim_line("No comments in this thread."));
+    }
+    lines
+}
+
+fn thread_heading(lines: &mut Vec<Line<'static>>, n: usize, thread: &link::ReviewThread) {
+    let state = if thread.outdated {
+        "outdated"
+    } else if thread.resolved {
+        "resolved"
+    } else {
+        "open"
+    };
+    lines.push(Line::from(vec![
+        Span::styled(
+            format!("Thread {n}"),
+            Style::default()
+                .fg(theme::TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  {}  {state}", thread_anchor_label(thread)),
+            Style::default().fg(theme::SUBTEXT0),
+        ),
+    ]));
+}
+
+fn thread_anchor_label(thread: &link::ReviewThread) -> String {
+    let line = thread.line.or(thread.original_line);
+    let start = thread.start_line.or(thread.original_start_line);
+    match (start, line) {
+        (Some(start), Some(end)) if start < end => format!("{}:{start}-{end}", thread.path),
+        (_, Some(line)) => format!("{}:{line}", thread.path),
+        _ => thread.path.clone(),
+    }
 }
 
 fn section_heading(lines: &mut Vec<Line<'static>>, title: &str) {
@@ -4293,6 +4777,8 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("1-9", "jump to tour step"),
     head("Review"),
     bind("p", "open the attached PR description and review timeline"),
+    bind("t T", "next / prev public review thread"),
+    bind("enter", "open the public thread anchored at the cursor"),
     bind(
         "c",
         "leave a private note for the local agent · again to edit",
@@ -4670,11 +5156,13 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // pops above the standing landmarks.
     let ann_rows = app.annotation_rows();
     let ann_bar = theme::blend(theme::MAUVE, theme::BASE, 0.45);
-    // Pending comments get the same treatment in peach. They outrank the tour
+    // Pending agent notes get the same treatment in peach. They outrank the tour
     // in the gutter: the agent's map is scenery, my undelivered notes are the
     // thing still waiting on someone.
     let agent_note_rows = app.agent_note_rows();
     let comment_bar = theme::blend(theme::PEACH, theme::BASE, 0.45);
+    let review_thread_rows = app.review_thread_rows();
+    let thread_bar = theme::blend(theme::TEAL, theme::BASE, 0.45);
     let cursor = app.diff_cursor;
     // Begin at the indexed source line and skip any continuation rows above
     // the visual scroll offset. Per-frame wrapping stays bounded by the
@@ -4706,6 +5194,9 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         let focused = focus_rows.as_ref().is_some_and(|r| r.contains(&line_idx));
         let annotated = ann_rows.iter().any(|r| r.contains(&line_idx));
         let commented = agent_note_rows.iter().any(|r| r.contains(&line_idx));
+        let threaded = review_thread_rows
+            .iter()
+            .any(|(_, rows)| rows.contains(&line_idx));
         // Markers apply per visual row, so the flash wash and the bar colors
         // run down every continuation of a wrapped line. Both bar kinds claim
         // the same gutter column; the cursor wins outright on its line rather
@@ -4728,6 +5219,8 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
                 apply_gutter_bar(&mut row, focus_bar);
             } else if commented {
                 apply_gutter_bar(&mut row, comment_bar);
+            } else if threaded {
+                apply_gutter_bar(&mut row, thread_bar);
             } else if annotated {
                 apply_gutter_bar(&mut row, ann_bar);
             }
@@ -4859,6 +5352,54 @@ fn note_line(n: usize, label: &str) -> Line<'static> {
                 .fg(theme::TEXT)
                 .add_modifier(Modifier::ITALIC),
         ),
+    ])
+    .style(Style::default().bg(theme::SURFACE0))
+}
+
+fn review_thread_span(thread: &link::ReviewThread) -> Option<(u32, u32)> {
+    if thread.side != link::DiffSide::Right || thread.outdated {
+        return None;
+    }
+    let end = thread.line?;
+    Some((thread.start_line.unwrap_or(end).min(end), end))
+}
+
+fn review_thread_line(n: usize, thread: &link::ReviewThread) -> Line<'static> {
+    let first = thread.comments.first();
+    let author = first
+        .map(|comment| format!("@{}", comment.author.login))
+        .unwrap_or_else(|| "review thread".into());
+    let preview = first
+        .and_then(|comment| {
+            markdown::lines(&comment.body)
+                .into_iter()
+                .find(|line| line.width() > 0)
+                .map(|line| line.to_string())
+        })
+        .unwrap_or_default();
+    let state = if thread.resolved { " · resolved" } else { "" };
+    let replies = thread.comments.len().saturating_sub(1);
+    let replies = if replies == 0 {
+        String::new()
+    } else {
+        format!(
+            " · {replies} repl{}",
+            if replies == 1 { "y" } else { "ies" }
+        )
+    };
+    Line::from(vec![
+        Span::styled(" ╭─ ", Style::default().fg(theme::OVERLAY0)),
+        Span::styled(
+            format!("◉{n}"),
+            Style::default()
+                .fg(theme::TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!(" {author}{replies}{state} "),
+            Style::default().fg(theme::SUBTEXT0),
+        ),
+        Span::styled(preview, Style::default().fg(theme::TEXT)),
     ])
     .style(Style::default().bg(theme::SURFACE0))
 }
@@ -5077,6 +5618,29 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 submitted_at: Some("2026-08-14T13:00:00Z".into()),
                 commit_oid: Some("1234567890abcdef".into()),
             }],
+            threads: vec![link::ReviewThread {
+                id: "thread-1".into(),
+                path: "src/main.rs".into(),
+                side: link::DiffSide::Right,
+                line: Some(42),
+                start_line: None,
+                original_line: Some(40),
+                original_start_line: None,
+                resolved: false,
+                outdated: false,
+                comments: vec![link::ReviewComment {
+                    id: "comment-1".into(),
+                    database_id: Some(1),
+                    author: link::Actor {
+                        login: "reviewer".into(),
+                        name: None,
+                    },
+                    body: "An inline review comment.".into(),
+                    created_at: "2026-08-14T13:01:00Z".into(),
+                    url: "https://github.com/phinze/recto/pull/7#discussion_r1".into(),
+                    reply_to: None,
+                }],
+            }],
         };
         let text: Vec<String> = pull_request_lines(&pr)
             .iter()
@@ -5085,10 +5649,38 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert!(text.iter().any(|line| line == "Description"));
         assert!(text.iter().any(|line| line == "Conversation"));
         assert!(text.iter().any(|line| line == "Reviews"));
+        assert!(text.iter().any(|line| line == "Review threads"));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Thread 1  src/main.rs:42  open"))
+        );
         assert!(
             text.iter()
                 .any(|line| line.contains("@reviewer  requested changes"))
         );
+    }
+
+    #[test]
+    fn only_current_new_side_review_threads_anchor_in_the_diff() {
+        let mut thread = link::ReviewThread {
+            id: "thread-1".into(),
+            path: "src/main.rs".into(),
+            side: link::DiffSide::Right,
+            line: Some(45),
+            start_line: Some(42),
+            original_line: Some(40),
+            original_start_line: Some(38),
+            resolved: false,
+            outdated: false,
+            comments: Vec::new(),
+        };
+        assert_eq!(review_thread_span(&thread), Some((42, 45)));
+
+        thread.side = link::DiffSide::Left;
+        assert_eq!(review_thread_span(&thread), None);
+        thread.side = link::DiffSide::Right;
+        thread.outdated = true;
+        assert_eq!(review_thread_span(&thread), None);
     }
 
     #[test]

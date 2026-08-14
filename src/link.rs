@@ -104,6 +104,8 @@ pub struct PullRequest {
     pub url: String,
     pub conversation: Vec<ConversationComment>,
     pub reviews: Vec<ReviewSummary>,
+    #[serde(default)]
+    pub threads: Vec<ReviewThread>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -128,6 +130,39 @@ pub struct ReviewSummary {
     pub state: ReviewState,
     pub submitted_at: Option<String>,
     pub commit_oid: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReviewThread {
+    pub id: String,
+    pub path: String,
+    pub side: DiffSide,
+    pub line: Option<u32>,
+    pub start_line: Option<u32>,
+    pub original_line: Option<u32>,
+    pub original_start_line: Option<u32>,
+    pub resolved: bool,
+    pub outdated: bool,
+    pub comments: Vec<ReviewComment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct ReviewComment {
+    pub id: String,
+    pub database_id: Option<u64>,
+    pub author: Actor,
+    pub body: String,
+    pub created_at: String,
+    pub url: String,
+    pub reply_to: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum DiffSide {
+    Left,
+    Right,
+    Unknown,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
