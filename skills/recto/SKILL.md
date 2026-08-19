@@ -69,7 +69,8 @@ diff to open its full conversation.
 Published threads, shared review drafts, and private agent notes also appear as
 typed child rows beneath their changed file in the file pane. Moving onto a
 child with `j` / `k` reveals its anchor in the diff. `enter` opens a published
-conversation or the matching draft/note editor.
+conversation or the matching draft/note editor. A double click opens the same
+objects directly from either their file-pane row or their inline diff content.
 
 ## Co-author a public review draft
 

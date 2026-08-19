@@ -64,6 +64,7 @@ use crate::highlight::{Highlighter, expand_tabs, ext_for_path};
 const SCROLLOFF: u16 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
+const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_MS: u128 = 80;
 /// How long the arrival flash takes to fade after a focus span lands.
@@ -283,6 +284,32 @@ enum FileReviewObject {
     PublishedThread(usize),
     SharedDraft(u64),
     AgentNote(usize),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReviewClickSurface {
+    Files,
+    Diff,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ReviewClick {
+    object: FileReviewObject,
+    surface: ReviewClickSurface,
+    at: Instant,
+}
+
+fn is_review_double_click(
+    previous: Option<ReviewClick>,
+    object: FileReviewObject,
+    surface: ReviewClickSurface,
+    now: Instant,
+) -> bool {
+    previous.is_some_and(|click| {
+        click.object == object
+            && click.surface == surface
+            && now.duration_since(click.at) <= DOUBLE_CLICK_WINDOW
+    })
 }
 
 /// Directory component of a change path, or `None` for a root-level file.
@@ -707,6 +734,10 @@ struct App {
     rendered: Vec<Line<'static>>,
     file_starts: Vec<u16>,
     line_info: Vec<LineInfo>,
+    /// Review object owning each woven render row. Base diff rows and tour
+    /// annotations carry `None`; inline thread/draft/note rows retain their
+    /// semantic identity so mouse gestures survive wrapping.
+    rendered_review_objects: Vec<Option<FileReviewObject>>,
     file_stats: Vec<(u32, u32)>,
     /// Top of the diff viewport in visual-row coordinates. In wrap mode the
     /// display-row index maps this back to a source line and continuation row.
@@ -751,6 +782,9 @@ struct App {
     /// here, `e` goes here" marker. Cleared on reload since the index is
     /// position-based, not path-resolved.
     diff_cursor: Option<usize>,
+    /// First half of a possible review-object double click. Stored by semantic
+    /// object and pane rather than coordinate so redraws cannot retarget it.
+    last_review_click: Option<ReviewClick>,
     /// Resolved visibility for each side pane. Derived from `files_vis` /
     /// `commits_vis` plus the current change counts via `resolve_panes`; the
     /// draw and key-handling paths read these bools directly.
@@ -804,6 +838,7 @@ impl App {
         let worker = spawn_worker(backend.clone(), hl);
         let file_rows = build_file_rows(&loaded.changes);
         let display_rows = DisplayRowIndex::build(&loaded.rendered, &loaded.line_info, 0);
+        let rendered_review_objects = vec![None; loaded.rendered.len()];
         let mut file_state = ListState::default();
         file_state.select(first_file_row(&file_rows));
         let mut app = Self {
@@ -831,6 +866,7 @@ impl App {
             rendered: loaded.rendered,
             file_starts: loaded.file_starts,
             line_info: loaded.line_info,
+            rendered_review_objects,
             file_stats: loaded.file_stats,
             scroll: 0,
             h_scroll: 0,
@@ -857,6 +893,7 @@ impl App {
             review_draft_comments: Vec::new(),
             next_review_draft_id: 1,
             diff_cursor: None,
+            last_review_click: None,
             show_files: false,
             show_commits: false,
             files_vis: PaneVis::Auto,
@@ -1383,6 +1420,7 @@ impl App {
         // The cursor is a raw source-line index into the old render; it can't
         // survive a reshuffle, so drop it rather than point it at a stale line.
         self.diff_cursor = None;
+        self.last_review_click = None;
         if let Scope::Range(base) = &scope
             && let Some(i) = self.bases.iter().position(|b| b == base)
         {
@@ -1672,18 +1710,19 @@ impl App {
         };
         match row {
             FileRow::File(_) => self.jump_to_selected(),
-            FileRow::ReviewObject {
-                object: FileReviewObject::PublishedThread(i),
-                ..
-            } => {
+            FileRow::ReviewObject { object, .. } => self.activate_review_object(object),
+            FileRow::Dir(_) => {}
+        }
+    }
+
+    fn activate_review_object(&mut self, object: FileReviewObject) {
+        match object {
+            FileReviewObject::PublishedThread(i) => {
                 self.active_thread = Some(i);
                 self.thread_scroll = 0;
                 self.page = Page::ReviewThread;
             }
-            FileRow::ReviewObject {
-                object: FileReviewObject::SharedDraft(id),
-                ..
-            } => {
+            FileReviewObject::SharedDraft(id) => {
                 let Some(comment) = self
                     .review_draft_comments
                     .iter()
@@ -1702,10 +1741,7 @@ impl App {
                     editing: Some(ComposerEdit::ReviewComment(id)),
                 });
             }
-            FileRow::ReviewObject {
-                object: FileReviewObject::AgentNote(i),
-                ..
-            } => {
+            FileReviewObject::AgentNote(i) => {
                 let Some(note) = self.agent_notes.get(i) else {
                     return;
                 };
@@ -1720,7 +1756,57 @@ impl App {
                     editing: Some(ComposerEdit::AgentNote(i)),
                 });
             }
-            FileRow::Dir(_) => {}
+        }
+    }
+
+    /// Resolve either a woven inline row or a real diff line carrying a review
+    /// anchor to the object a double click should open.
+    fn review_object_at_rendered_row(&self, row: usize) -> Option<FileReviewObject> {
+        if let Some(object) = self.rendered_review_objects.get(row).copied().flatten() {
+            return Some(object);
+        }
+
+        let (file_idx, line) = self.line_info.get(row).copied().flatten()?;
+        let path = &self.changes.get(file_idx)?.path;
+        let threads = self
+            .pull_request
+            .as_ref()
+            .map_or(&[][..], |pr| pr.threads.as_slice());
+        let contains = |thread: &link::ReviewThread| {
+            thread.path == *path
+                && review_thread_span(thread)
+                    .is_some_and(|(start, end)| (start..=end).contains(&line))
+        };
+        if let Some(i) = self
+            .active_thread
+            .filter(|i| threads.get(*i).is_some_and(contains))
+            .or_else(|| threads.iter().position(contains))
+        {
+            return Some(FileReviewObject::PublishedThread(i));
+        }
+        if let Some(comment) = self
+            .review_draft_comments
+            .iter()
+            .find(|comment| comment.path == *path && (comment.start..=comment.end).contains(&line))
+        {
+            return Some(FileReviewObject::SharedDraft(comment.id));
+        }
+        self.agent_notes
+            .iter()
+            .position(|note| note.path == *path && (note.start..=note.end).contains(&line))
+            .map(FileReviewObject::AgentNote)
+    }
+
+    fn review_object_click(&mut self, object: FileReviewObject, surface: ReviewClickSurface) {
+        let now = Instant::now();
+        let double = is_review_double_click(self.last_review_click, object, surface, now);
+        self.last_review_click = (!double).then_some(ReviewClick {
+            object,
+            surface,
+            at: now,
+        });
+        if double {
+            self.activate_review_object(object);
         }
     }
 
@@ -1956,7 +2042,7 @@ impl App {
     /// (scroll, search, clicks) sees one consistent rendered stream.
     fn reweave(&mut self) {
         self.rebuild_file_rows();
-        let mut inserts: Vec<(usize, Line<'static>)> = Vec::new();
+        let mut inserts: Vec<(usize, Line<'static>, Option<FileReviewObject>)> = Vec::new();
         for (i, a) in self.annotations.iter().enumerate() {
             let Some(file_idx) = self.changes.iter().position(|c| c.path == a.path) else {
                 continue;
@@ -1964,7 +2050,7 @@ impl App {
             let Some(rows) = rows_for_span(&self.base_line_info, file_idx, a.start, a.end) else {
                 continue;
             };
-            inserts.push((*rows.start(), note_line(i + 1, &a.label)));
+            inserts.push((*rows.start(), note_line(i + 1, &a.label), None));
         }
         if let Some(pr) = &self.pull_request {
             for (i, thread) in pr.threads.iter().enumerate() {
@@ -1977,7 +2063,11 @@ impl App {
                 let Some(rows) = rows_for_span(&self.base_line_info, file_idx, start, end) else {
                     continue;
                 };
-                inserts.push((*rows.start(), review_thread_line(i + 1, thread)));
+                inserts.push((
+                    *rows.start(),
+                    review_thread_line(i + 1, thread),
+                    Some(FileReviewObject::PublishedThread(i)),
+                ));
             }
         }
         for (i, comment) in self.review_draft_comments.iter().enumerate() {
@@ -1993,6 +2083,7 @@ impl App {
                 inserts.push((
                     *rows.start(),
                     review_draft_line(i + 1, comment, line, j == 0),
+                    Some(FileReviewObject::SharedDraft(comment.id)),
                 ));
             }
         }
@@ -2006,43 +2097,53 @@ impl App {
             // A comment body can be several lines; each gets its own row so a
             // long note stays readable instead of being truncated to a preview.
             for (j, text) in c.body.lines().enumerate() {
-                inserts.push((*rows.start(), agent_note_line(i + 1, text, j == 0)));
+                inserts.push((
+                    *rows.start(),
+                    agent_note_line(i + 1, text, j == 0),
+                    Some(FileReviewObject::AgentNote(i)),
+                ));
             }
         }
         if inserts.is_empty() {
             self.rendered = self.base_rendered.clone();
             self.file_starts = self.base_file_starts.clone();
             self.line_info = self.base_line_info.clone();
+            self.rendered_review_objects = vec![None; self.rendered.len()];
             self.rebuild_display_rows();
             return;
         }
         // Stable by insertion row, so steps pinned to the same row keep their
         // numbering order.
-        inserts.sort_by_key(|(row, _)| *row);
+        inserts.sort_by_key(|(row, _, _)| *row);
         self.file_starts = self
             .base_file_starts
             .iter()
             .map(|&start| {
                 let shift = inserts
                     .iter()
-                    .filter(|(row, _)| *row <= start as usize)
+                    .filter(|(row, _, _)| *row <= start as usize)
                     .count();
                 start.saturating_add(shift as u16)
             })
             .collect();
         let mut rendered = Vec::with_capacity(self.base_rendered.len() + inserts.len());
         let mut line_info = Vec::with_capacity(self.base_line_info.len() + inserts.len());
+        let mut rendered_review_objects =
+            Vec::with_capacity(self.base_rendered.len() + inserts.len());
         let mut pending = inserts.into_iter().peekable();
         for (idx, line) in self.base_rendered.iter().enumerate() {
-            while let Some((_, note)) = pending.next_if(|(row, _)| *row == idx) {
+            while let Some((_, note, object)) = pending.next_if(|(row, _, _)| *row == idx) {
                 rendered.push(note);
                 line_info.push(None);
+                rendered_review_objects.push(object);
             }
             rendered.push(line.clone());
             line_info.push(self.base_line_info.get(idx).copied().flatten());
+            rendered_review_objects.push(None);
         }
         self.rendered = rendered;
         self.line_info = line_info;
+        self.rendered_review_objects = rendered_review_objects;
         self.rebuild_display_rows();
     }
 
@@ -4463,6 +4564,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     let in_commits = app.commits_area.contains(pos);
     match m.kind {
         MouseEventKind::ScrollDown => {
+            app.last_review_click = None;
             if in_files {
                 app.focus = Focus::Files;
                 app.select_next();
@@ -4476,6 +4578,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             }
         }
         MouseEventKind::ScrollUp => {
+            app.last_review_click = None;
             if in_files {
                 app.focus = Focus::Files;
                 app.select_prev();
@@ -4496,9 +4599,22 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                     let row = (m.row - inner_y) as usize + app.file_state.offset();
                     // Header rows aren't selectable; clicking one is a no-op.
                     if app.file_rows.get(row).is_some_and(file_row_selectable) {
+                        let object = match app.file_rows.get(row) {
+                            Some(FileRow::ReviewObject { object, .. }) => Some(*object),
+                            _ => None,
+                        };
                         app.file_state.select(Some(row));
                         app.jump_to_selected();
+                        if let Some(object) = object {
+                            app.review_object_click(object, ReviewClickSurface::Files);
+                        } else {
+                            app.last_review_click = None;
+                        }
+                    } else {
+                        app.last_review_click = None;
                     }
+                } else {
+                    app.last_review_click = None;
                 }
             } else if in_diff {
                 app.focus = Focus::Diff;
@@ -4506,9 +4622,20 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 // drawing, so continuation rows select their owning source line.
                 let row = (m.row - app.diff_content_area.y) as usize;
                 if let Some(src) = app.source_line_at_row(app.scroll.saturating_add(row)) {
-                    app.diff_cursor = Some(src);
+                    let object = app.review_object_at_rendered_row(src);
+                    if app.line_info.get(src).copied().flatten().is_some() {
+                        app.diff_cursor = Some(src);
+                    }
+                    if let Some(object) = object {
+                        app.review_object_click(object, ReviewClickSurface::Diff);
+                    } else {
+                        app.last_review_click = None;
+                    }
+                } else {
+                    app.last_review_click = None;
                 }
             } else if in_commits {
+                app.last_review_click = None;
                 app.focus = Focus::Commits;
                 let inner_y = app.commits_area.y.saturating_add(1);
                 if m.row >= inner_y {
@@ -4525,6 +4652,8 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                         }
                     }
                 }
+            } else {
+                app.last_review_click = None;
             }
         }
         _ => {}
@@ -5287,6 +5416,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("p", "open the attached PR description and review timeline"),
     bind("t T", "next / prev public review thread"),
     bind("enter", "open the public thread anchored at the cursor"),
+    bind("double click", "open a review object in files or diff"),
     bind("c", "create / edit a shared public review draft"),
     bind("n", "leave a private note for the local agent"),
     bind(
@@ -6824,6 +6954,41 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn review_double_click_requires_the_same_object_and_pane() {
+        let at = Instant::now();
+        let click = ReviewClick {
+            object: FileReviewObject::SharedDraft(7),
+            surface: ReviewClickSurface::Diff,
+            at,
+        };
+
+        assert!(is_review_double_click(
+            Some(click),
+            FileReviewObject::SharedDraft(7),
+            ReviewClickSurface::Diff,
+            at + Duration::from_millis(250),
+        ));
+        assert!(!is_review_double_click(
+            Some(click),
+            FileReviewObject::SharedDraft(8),
+            ReviewClickSurface::Diff,
+            at + Duration::from_millis(250),
+        ));
+        assert!(!is_review_double_click(
+            Some(click),
+            FileReviewObject::SharedDraft(7),
+            ReviewClickSurface::Files,
+            at + Duration::from_millis(250),
+        ));
+        assert!(!is_review_double_click(
+            Some(click),
+            FileReviewObject::SharedDraft(7),
+            ReviewClickSurface::Diff,
+            at + DOUBLE_CLICK_WINDOW + Duration::from_millis(1),
+        ));
     }
 
     #[test]
