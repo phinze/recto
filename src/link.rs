@@ -17,6 +17,8 @@ use std::time::Duration;
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 
+pub use crate::backend::repository_root as workspace_root;
+
 /// A command from a companion session. JSON-tagged on the wire so the
 /// vocabulary can grow (tour manifests, etc.) without breaking older clients.
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -490,20 +492,6 @@ impl EditorLink {
     fn is_active(&self) -> bool {
         self.active.load(Ordering::SeqCst)
     }
-}
-
-/// Walk up from `start` looking for `.jj/` (preferred) then `.git/`, mirroring
-/// `detect_backend`. The directory we land on is the workspace identity both
-/// server and client hash to agree on a socket path.
-pub fn workspace_root(start: &Path) -> Option<PathBuf> {
-    let mut dir = Some(start);
-    while let Some(d) = dir {
-        if d.join(".jj").is_dir() || d.join(".git").exists() {
-            return Some(d.to_path_buf());
-        }
-        dir = d.parent();
-    }
-    None
 }
 
 /// Socket path for a workspace root. A readable basename aids debugging; the

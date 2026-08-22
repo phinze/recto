@@ -101,6 +101,9 @@ pub struct FileChange {
 }
 
 pub trait Backend: Send + Sync {
+    /// Canonical repository root. Backend commands and every path exposed to
+    /// the UI are anchored here, regardless of the directory recto started in.
+    fn root(&self) -> &Path;
     /// Which VCS this backend speaks: `"jj"` or `"git"`. Reported in the
     /// status payload so a companion session knows the model it's driving.
     fn kind(&self) -> &'static str;
@@ -127,36 +130,52 @@ pub trait Backend: Send + Sync {
     fn file_content(&self, rev: &str, path: &str) -> Result<String>;
 }
 
-/// Walk up from cwd looking for `.jj/` (preferred) then `.git/`.
-/// jj wins on colocated repos since it's the source of truth for working-copy state.
-pub fn detect_backend() -> Result<Arc<dyn Backend>> {
-    let cwd = std::env::current_dir().context("could not read current directory")?;
-    let mut dir: Option<&Path> = Some(&cwd);
+/// Walk up from `start` looking for the nearest jj or git repository root.
+pub fn repository_root(start: &Path) -> Option<PathBuf> {
+    let mut dir = Some(start);
     while let Some(d) = dir {
-        if d.join(".jj").is_dir() {
-            return Ok(Arc::new(JjBackend::new()));
-        }
-        if d.join(".git").exists() {
-            return Ok(Arc::new(GitBackend::new()));
+        if d.join(".jj").is_dir() || d.join(".git").exists() {
+            return Some(d.canonicalize().unwrap_or_else(|_| d.to_path_buf()));
         }
         dir = d.parent();
     }
-    Err(anyhow!(
-        "not inside a jj or git repository (looked from {})",
-        cwd.display()
-    ))
+    None
 }
 
-pub struct JjBackend;
+/// Detect from cwd. jj wins on colocated repos since it's the source of truth
+/// for working-copy state.
+pub fn detect_backend() -> Result<Arc<dyn Backend>> {
+    let cwd = std::env::current_dir().context("could not read current directory")?;
+    detect_backend_from(&cwd).ok_or_else(|| {
+        anyhow!(
+            "not inside a jj or git repository (looked from {})",
+            cwd.display()
+        )
+    })
+}
+
+fn detect_backend_from(start: &Path) -> Option<Arc<dyn Backend>> {
+    let root = repository_root(start)?;
+    if root.join(".jj").is_dir() {
+        Some(Arc::new(JjBackend::new(root)))
+    } else {
+        Some(Arc::new(GitBackend::new(root)))
+    }
+}
+
+pub struct JjBackend {
+    repo_root: PathBuf,
+}
 
 impl JjBackend {
-    pub fn new() -> Self {
-        Self
+    pub fn new(repo_root: PathBuf) -> Self {
+        Self { repo_root }
     }
 
     fn run(&self, args: &[&str]) -> Result<String> {
         let output = Command::new("jj")
             .args(args)
+            .current_dir(&self.repo_root)
             .output()
             .with_context(|| format!("failed to spawn `jj {}`", args.join(" ")))?;
         if !output.status.success() {
@@ -206,6 +225,10 @@ impl JjBackend {
 }
 
 impl Backend for JjBackend {
+    fn root(&self) -> &Path {
+        &self.repo_root
+    }
+
     fn kind(&self) -> &'static str {
         "jj"
     }
@@ -380,8 +403,7 @@ pub struct GitBackend {
 }
 
 impl GitBackend {
-    pub fn new() -> Self {
-        let repo_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
+    pub fn new(repo_root: PathBuf) -> Self {
         Self { repo_root }
     }
 
@@ -414,9 +436,42 @@ impl GitBackend {
             Base::MergeBase { against } => format!("{}...HEAD", Self::diff_arg(against)),
         }
     }
+
+    /// Commit to pass to `git diff` for a range. A merge-base label such as
+    /// `main...HEAD` names the right history relationship for display, but
+    /// passing it directly would stop at HEAD and omit working-tree edits.
+    fn range_base(&self, base: &Base) -> Result<String> {
+        match base {
+            Base::Revision(r) => Ok(r.clone()),
+            Base::MergeBase { against } => self
+                .run(&["merge-base", &against.anchor_ref(), "HEAD"])
+                .map(|s| s.trim().to_string()),
+        }
+    }
+
+    fn trunk_ref(&self) -> Option<String> {
+        ["main", "master"]
+            .into_iter()
+            .find(|r| self.ref_exists(r))
+            .map(str::to_string)
+            .or_else(|| {
+                self.run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"])
+                    .ok()
+                    .map(|s| s.trim().to_string())
+                    .filter(|s| !s.is_empty())
+            })
+    }
+
+    fn ref_exists(&self, rev: &str) -> bool {
+        self.run(&["rev-parse", "--verify", "--quiet", rev]).is_ok()
+    }
 }
 
 impl Backend for GitBackend {
+    fn root(&self) -> &Path {
+        &self.repo_root
+    }
+
     fn kind(&self) -> &'static str {
         "git"
     }
@@ -442,7 +497,7 @@ impl Backend for GitBackend {
         let arg;
         let cmd = match scope {
             Scope::Range(base) => {
-                arg = Self::diff_arg(base);
+                arg = self.range_base(base)?;
                 let mut c = vec!["diff", "--name-status"];
                 if ignore_ws {
                     c.push("-w");
@@ -467,7 +522,7 @@ impl Backend for GitBackend {
         let arg;
         let cmd = match scope {
             Scope::Range(base) => {
-                arg = Self::diff_arg(base);
+                arg = self.range_base(base)?;
                 let mut c = vec!["diff"];
                 if ignore_ws {
                     c.push("-w");
@@ -514,14 +569,14 @@ impl Backend for GitBackend {
 
         // Whichever of main/master this repo actually uses, so the trunk
         // landmark points somewhere real instead of guessing.
-        let trunk_ref = ["main", "master"]
-            .into_iter()
-            .find(|r| self.run(&["rev-parse", "--verify", "--quiet", r]).is_ok());
+        let trunk_ref = self.trunk_ref();
         let trunk_id = trunk_ref
+            .as_deref()
             .and_then(|r| self.run(&["rev-parse", r]).ok())
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
         let fork_id = trunk_ref
+            .as_deref()
             .and_then(|r| self.run(&["merge-base", r, "HEAD"]).ok())
             .map(|s| s.trim().to_string())
             .unwrap_or_default();
@@ -565,15 +620,22 @@ impl Backend for GitBackend {
 
     fn default_bases(&self) -> Vec<Base> {
         // Branch point leads, matching the jj backend.
-        vec![
+        let trunk = self.trunk_ref().unwrap_or_else(|| "HEAD".into());
+        let mut bases = vec![
             Base::MergeBase {
-                against: Box::new(Base::Revision("main".into())),
+                against: Box::new(Base::Revision(trunk.clone())),
             },
             Base::Revision("HEAD".into()),
-            Base::Revision("main".into()),
-            Base::Revision("master".into()),
-            Base::Revision("HEAD~1".into()),
-        ]
+        ];
+        for rev in [trunk.as_str(), "main", "master", "HEAD~1"] {
+            if rev != "HEAD"
+                && self.ref_exists(rev)
+                && !bases.iter().any(|base| base.anchor_ref() == rev)
+            {
+                bases.push(Base::Revision(rev.into()));
+            }
+        }
+        bases
     }
 
     fn file_content(&self, rev: &str, path: &str) -> Result<String> {
@@ -753,6 +815,43 @@ fn parse_git_name_status(line: &str) -> Option<FileChange> {
 mod tests {
     use super::*;
 
+    struct TempRepo(PathBuf);
+
+    impl TempRepo {
+        fn new(name: &str) -> Self {
+            let nonce = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0);
+            let root = std::env::temp_dir().join(format!(
+                "recto-backend-{name}-{}-{nonce}",
+                std::process::id()
+            ));
+            std::fs::create_dir_all(&root).expect("create temp repository");
+            Self(root)
+        }
+
+        fn run(&self, program: &str, args: &[&str]) {
+            let output = Command::new(program)
+                .args(args)
+                .current_dir(&self.0)
+                .output()
+                .expect("run repository command");
+            assert!(
+                output.status.success(),
+                "{program} {} failed: {}",
+                args.join(" "),
+                String::from_utf8_lossy(&output.stderr)
+            );
+        }
+    }
+
+    impl Drop for TempRepo {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.0);
+        }
+    }
+
     #[test]
     fn refs_drop_head_and_its_arrow_form() {
         assert_eq!(parse_refs("HEAD -> main, origin/main", ','), vec!["main"]);
@@ -789,7 +888,7 @@ mod tests {
 
     #[test]
     fn jj_base_display_names_the_landmarks() {
-        let jj = JjBackend::new();
+        let jj = JjBackend::new(PathBuf::from("."));
         let fork = Base::MergeBase {
             against: Box::new(Base::Revision("trunk()".into())),
         };
@@ -798,5 +897,48 @@ mod tests {
         // Anything we have no name for falls through as itself rather than
         // becoming a lie.
         assert_eq!(jj.base_display(&Base::Revision("abc123".into())), "abc123");
+    }
+
+    #[test]
+    fn jj_backend_reports_root_relative_paths_from_a_nested_start() {
+        let repo = TempRepo::new("jj-root");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        let nested = repo.0.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("main.rs"), "fn main() {}\n").unwrap();
+
+        let backend = detect_backend_from(&nested).expect("detect nested jj repo");
+        assert_eq!(backend.kind(), "jj");
+        assert_eq!(backend.root(), repo.0.canonicalize().unwrap());
+        let changes = backend
+            .list_changes(&Scope::Range(Base::Revision("root()".into())), false)
+            .unwrap();
+        assert!(changes.iter().any(|change| change.path == "src/main.rs"));
+        assert!(changes.iter().all(|change| !change.path.starts_with("../")));
+    }
+
+    #[test]
+    fn git_backend_uses_the_real_trunk_and_includes_working_tree_edits() {
+        let repo = TempRepo::new("git-master");
+        repo.run("git", &["init", "-b", "master"]);
+        repo.run("git", &["config", "user.name", "Recto Test"]);
+        repo.run("git", &["config", "user.email", "recto@example.invalid"]);
+        let nested = repo.0.join("src");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::fs::write(nested.join("main.rs"), "fn main() {}\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "initial"]);
+        std::fs::write(nested.join("main.rs"), "fn main() { println!(\"hi\"); }\n").unwrap();
+
+        let backend = detect_backend_from(&nested).expect("detect nested git repo");
+        assert_eq!(backend.kind(), "git");
+        assert_eq!(backend.root(), repo.0.canonicalize().unwrap());
+        let base = backend.default_bases().remove(0);
+        assert_eq!(backend.base_label(&base), "master...HEAD");
+        let changes = backend
+            .list_changes(&Scope::Range(base), false)
+            .expect("load working tree against branch point");
+        assert_eq!(changes.len(), 1);
+        assert_eq!(changes[0].path, "src/main.rs");
     }
 }

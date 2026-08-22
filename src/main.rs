@@ -1878,11 +1878,7 @@ impl App {
             Cursor::All => "range",
             Cursor::Rev(_) => "rev",
         };
-        let workspace_root = std::env::current_dir()
-            .ok()
-            .and_then(|cwd| link::workspace_root(&cwd))
-            .map(|r| r.to_string_lossy().into_owned())
-            .unwrap_or_default();
+        let workspace_root = self.backend.root().to_string_lossy().into_owned();
         link::Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
@@ -3343,6 +3339,10 @@ fn main() -> Result<()> {
 
     let backend = detect_backend().unwrap_or_else(|e| {
         eprintln!("recto: {e}");
+        std::process::exit(2);
+    });
+    std::env::set_current_dir(backend.root()).unwrap_or_else(|e| {
+        eprintln!("recto: repository root {}: {e}", backend.root().display());
         std::process::exit(2);
     });
     let hl = Highlighter::new();
@@ -6283,6 +6283,10 @@ mod tests {
     }
 
     impl Backend for TestBackend {
+        fn root(&self) -> &Path {
+            Path::new(".")
+        }
+
         fn kind(&self) -> &'static str {
             "test"
         }
