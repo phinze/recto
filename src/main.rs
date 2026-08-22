@@ -78,12 +78,12 @@ const FOCUS_PULSE_PERIOD: Duration = Duration::from_millis(2200);
 const FOCUS_PULSE_DEPTH: f32 = 0.55;
 const TAB_WIDTH: usize = 4;
 
-/// What the worker is asked to render: a scope plus the whitespace toggle.
-/// Carried through the channel (not kept as separate app state) so a toggle
-/// that leaves the scope unchanged still supersedes an in-flight load — the
-/// staleness check in `poll_load` compares the whole request.
+/// What the worker is asked to render. The generation distinguishes repeated
+/// loads of the same scope, so an older response can never masquerade as the
+/// newest request after the view cycles away and back.
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct DiffRequest {
+    generation: u64,
     scope: Scope,
     ignore_ws: bool,
 }
@@ -100,11 +100,21 @@ struct Worker {
 }
 
 fn spawn_worker(backend: Arc<dyn Backend>, hl: Highlighter) -> Worker {
+    spawn_worker_with(move |req| load_diff(&*backend, &hl, req))
+}
+
+fn spawn_worker_with(load: impl Fn(&DiffRequest) -> Result<LoadedDiff> + Send + 'static) -> Worker {
     let (request_tx, request_rx) = mpsc::channel::<DiffRequest>();
     let (response_tx, response_rx) = mpsc::channel::<(DiffRequest, Result<LoadedDiff>)>();
     std::thread::spawn(move || {
-        while let Ok(req) = request_rx.recv() {
-            let result = load_diff(&*backend, &hl, &req);
+        while let Ok(mut req) = request_rx.recv() {
+            // Only the newest queued view can still reach the screen. An
+            // in-flight load cannot be cancelled, but work that piled up
+            // behind it can be collapsed before another expensive render.
+            for newer in request_rx.try_iter() {
+                req = newer;
+            }
+            let result = load(&req);
             if response_tx.send((req, result)).is_err() {
                 break;
             }
@@ -723,7 +733,10 @@ struct App {
     active_thread: Option<usize>,
     thread_scroll: usize,
     thread_max_scroll: usize,
+    next_load_generation: u64,
     loading: Option<Loading>,
+    reload_pending: bool,
+    load_error: Option<String>,
     changes: Vec<FileChange>,
     /// The pristine render as the worker produced it, before annotation note
     /// rows are woven in. `reweave` rebuilds the viewed copies below from
@@ -830,6 +843,7 @@ impl App {
         };
         let fixed_bases = bases.len();
         let initial_req = DiffRequest {
+            generation: 0,
             scope: Scope::Range(bases[base_idx].clone()),
             ignore_ws: false,
         };
@@ -858,7 +872,10 @@ impl App {
             active_thread: None,
             thread_scroll: 0,
             thread_max_scroll: 0,
+            next_load_generation: 1,
             loading: None,
+            reload_pending: false,
+            load_error: None,
             changes: loaded.changes,
             base_rendered: loaded.rendered.clone(),
             base_file_starts: loaded.file_starts.clone(),
@@ -1052,21 +1069,10 @@ impl App {
             }
         };
         self.base_idx = idx;
-        let scope = Scope::Range(base);
-        let label = self.scope_label(&scope);
-        let request = DiffRequest {
-            scope,
-            ignore_ws: self.ignore_ws,
-        };
-        let _ = self.worker.request_tx.send(request.clone());
         // Cursor follows the new range — old rev indices won't map to the
         // freshly-loaded revs, so the only safe landing is the overview.
         self.cursor = Cursor::All;
-        self.loading = Some(Loading {
-            request,
-            label,
-            started: Instant::now(),
-        });
+        self.request_scope(Scope::Range(base));
     }
 
     /// Advance the rev cursor: `All → rev[0] → … → rev[N-1] → All`. No-op if
@@ -1350,25 +1356,39 @@ impl App {
     }
 
     fn request_current_scope(&mut self) {
-        let scope = self.scope();
+        self.request_scope(self.scope());
+    }
+
+    fn request_scope(&mut self, scope: Scope) {
         let label = self.scope_label(&scope);
         let request = DiffRequest {
+            generation: self.next_load_generation,
             scope,
             ignore_ws: self.ignore_ws,
         };
-        let _ = self.worker.request_tx.send(request.clone());
-        self.loading = Some(Loading {
-            request,
-            label,
-            started: Instant::now(),
-        });
+        self.next_load_generation = self.next_load_generation.wrapping_add(1);
+        self.load_error = None;
+        match self.worker.request_tx.send(request.clone()) {
+            Ok(()) => {
+                self.loading = Some(Loading {
+                    request,
+                    label,
+                    started: Instant::now(),
+                });
+            }
+            Err(_) => {
+                self.loading = None;
+                self.load_error = Some("diff loader stopped unexpectedly".into());
+            }
+        }
     }
 
-    /// Request a fresh load of the current scope (file watcher). No-op while
-    /// a load is already in flight — the in-flight one will reflect whatever's
-    /// on disk by the time it completes.
+    /// Request a fresh load of the current scope (file watcher). If work is
+    /// already in flight, remember that the filesystem changed and reload once
+    /// more after the newest requested view settles.
     fn request_reload(&mut self) -> bool {
         if self.loading.is_some() {
+            self.reload_pending = true;
             return false;
         }
         self.request_current_scope();
@@ -1383,16 +1403,20 @@ impl App {
             let Some(loading) = self.loading.as_ref() else {
                 continue;
             };
-            if req != loading.request {
+            if req.generation != loading.request.generation {
                 continue;
             }
             changed = true;
             match result {
                 Ok(loaded) => self.apply_loaded(req.scope, loaded),
-                Err(_) => {
-                    // TODO: surface error somewhere. For now: silently clear.
+                Err(error) => {
                     self.loading = None;
+                    self.load_error = Some(error.to_string());
                 }
+            }
+            if self.reload_pending {
+                self.reload_pending = false;
+                self.request_current_scope();
             }
         }
         changed
@@ -4791,6 +4815,11 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             format!(" · {} loading {}", SPINNER_FRAMES[frame_idx], loading.label),
             Style::default().fg(theme::TEAL),
         ));
+    } else if let Some(error) = &app.load_error {
+        header_spans.push(Span::styled(
+            format!(" · reload failed: {error}"),
+            Style::default().fg(theme::RED),
+        ));
     }
     if let Some(span) = &app.focus_span {
         let label = if span.start == span.end {
@@ -6237,6 +6266,147 @@ fn pane_block(title: &str, focused: bool, terminal_focused: bool) -> Block<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+
+    struct TestBackend {
+        loads: AtomicUsize,
+        fail: AtomicBool,
+    }
+
+    impl TestBackend {
+        fn new() -> Self {
+            Self {
+                loads: AtomicUsize::new(0),
+                fail: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl Backend for TestBackend {
+        fn kind(&self) -> &'static str {
+            "test"
+        }
+
+        fn base_label(&self, _base: &Base) -> String {
+            "base".into()
+        }
+
+        fn base_display(&self, _base: &Base) -> String {
+            "base".into()
+        }
+
+        fn list_changes(&self, _scope: &Scope, _ignore_ws: bool) -> Result<Vec<FileChange>> {
+            self.loads.fetch_add(1, Ordering::SeqCst);
+            if self.fail.load(Ordering::SeqCst) {
+                Err(anyhow!("synthetic load failure"))
+            } else {
+                Ok(Vec::new())
+            }
+        }
+
+        fn unified_diff(&self, _scope: &Scope, _ignore_ws: bool) -> Result<String> {
+            Ok(String::new())
+        }
+
+        fn list_revs(&self, _base: &Base) -> Result<Vec<Rev>> {
+            Ok(Vec::new())
+        }
+
+        fn default_bases(&self) -> Vec<Base> {
+            vec![Base::Revision("base".into())]
+        }
+
+        fn file_content(&self, _rev: &str, _path: &str) -> Result<String> {
+            Ok(String::new())
+        }
+    }
+
+    fn test_request(generation: u64) -> DiffRequest {
+        DiffRequest {
+            generation,
+            scope: Scope::Range(Base::Revision("base".into())),
+            ignore_ws: false,
+        }
+    }
+
+    fn settle_load(app: &mut App) {
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while app.loading.is_some() {
+            app.poll_load();
+            assert!(Instant::now() < deadline, "loader did not settle");
+            std::thread::yield_now();
+        }
+    }
+
+    #[test]
+    fn worker_skips_superseded_queued_loads() {
+        let calls = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let seen = calls.clone();
+        let (started_tx, started_rx) = mpsc::channel();
+        let (release_tx, release_rx) = mpsc::channel();
+        let worker = spawn_worker_with(move |req| {
+            seen.lock().unwrap().push(req.generation);
+            started_tx.send(req.generation).unwrap();
+            if req.generation == 1 {
+                release_rx.recv().unwrap();
+            }
+            Err(anyhow!("synthetic load result"))
+        });
+
+        worker.request_tx.send(test_request(1)).unwrap();
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 1);
+        worker.request_tx.send(test_request(2)).unwrap();
+        worker.request_tx.send(test_request(3)).unwrap();
+        release_tx.send(()).unwrap();
+
+        assert_eq!(
+            worker
+                .response_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .0
+                .generation,
+            1
+        );
+        assert_eq!(started_rx.recv_timeout(Duration::from_secs(2)).unwrap(), 3);
+        assert_eq!(
+            worker
+                .response_rx
+                .recv_timeout(Duration::from_secs(2))
+                .unwrap()
+                .0
+                .generation,
+            3
+        );
+        assert_eq!(*calls.lock().unwrap(), vec![1, 3]);
+    }
+
+    #[test]
+    fn filesystem_change_during_load_gets_a_followup_load() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, false).unwrap();
+
+        app.request_current_scope();
+        assert!(!app.request_reload());
+        assert!(app.reload_pending);
+        settle_load(&mut app);
+
+        assert_eq!(backend.loads.load(Ordering::SeqCst), 3);
+        assert!(!app.reload_pending);
+        assert!(app.load_error.is_none());
+    }
+
+    #[test]
+    fn background_load_failure_stays_visible() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, false).unwrap();
+        backend.fail.store(true, Ordering::SeqCst);
+
+        app.request_current_scope();
+        settle_load(&mut app);
+
+        assert_eq!(app.load_error.as_deref(), Some("synthetic load failure"));
+    }
 
     const GO_SAMPLE: &str = r#"package x
 
