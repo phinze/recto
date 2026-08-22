@@ -923,6 +923,7 @@ mod tests {
         repo.run("git", &["init", "-b", "master"]);
         repo.run("git", &["config", "user.name", "Recto Test"]);
         repo.run("git", &["config", "user.email", "recto@example.invalid"]);
+        repo.run("git", &["config", "commit.gpgsign", "false"]);
         let nested = repo.0.join("src");
         std::fs::create_dir_all(&nested).unwrap();
         std::fs::write(nested.join("main.rs"), "fn main() {}\n").unwrap();

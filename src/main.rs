@@ -1,16 +1,18 @@
 mod backend;
+mod diff;
 mod funcname;
+mod github;
 mod graph;
 mod highlight;
 mod link;
 mod markdown;
 mod theme;
+mod watch;
 mod wrap;
 
-use std::collections::HashMap;
 use std::io::{self, stdout};
 use std::ops::Range;
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::process::Command;
 use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
@@ -36,22 +38,15 @@ use ratatui::{
     widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Wrap},
 };
 
-use notify::{EventKind, RecursiveMode, Watcher};
-use serde::Deserialize;
-use similar::{ChangeTag, TextDiff};
-
 use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope, detect_backend};
-
-type LineInfo = Option<(usize, u32)>;
-
-/// Resolves a repo-relative path to its post-image content. Routed by scope
-/// in `load_diff` and consumed by the hunk-header augmenter in `render_diff`.
-type FetchContent<'a> = dyn Fn(&str) -> Option<String> + 'a;
+use crate::diff::{FetchContent, LineInfo, file_row_line, render_diff, sticky_line};
+#[cfg(test)]
+use crate::diff::{Gutter, augment_hunk_header, diff_body_line, hunk_header, parse_hunk_starts};
 
 struct LoadedDiff {
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
-    file_starts: Vec<u16>,
+    file_starts: Vec<usize>,
     line_info: Vec<LineInfo>,
     /// Added/removed line counts per file, parallel to `changes`.
     file_stats: Vec<(u32, u32)>,
@@ -59,7 +54,7 @@ struct LoadedDiff {
     /// refresh the rev list — selecting a rev shouldn't redraw the strip.
     revs: Option<Vec<Rev>>,
 }
-use crate::highlight::{Highlighter, expand_tabs, ext_for_path};
+use crate::highlight::{Highlighter, ext_for_path};
 
 const SCROLLOFF: u16 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
@@ -76,8 +71,6 @@ const FOCUS_FLASH_ALPHA: f32 = 0.35;
 const FOCUS_PULSE_PERIOD: Duration = Duration::from_millis(2200);
 /// How far the pulse dims the bar toward the background at its low point.
 const FOCUS_PULSE_DEPTH: f32 = 0.55;
-const TAB_WIDTH: usize = 4;
-
 /// What the worker is asked to render. The generation distinguishes repeated
 /// loads of the same scope, so an older response can never masquerade as the
 /// newest request after the view cycles away and back.
@@ -325,11 +318,6 @@ fn is_review_double_click(
 /// Directory component of a change path, or `None` for a root-level file.
 fn parent_dir(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(dir, _)| dir)
-}
-
-/// Final path component, the name shown in a file row.
-fn basename(path: &str) -> &str {
-    path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
 
 /// Walk changes in stream order, emitting a `Dir` header each time the parent
@@ -742,10 +730,10 @@ struct App {
     /// rows are woven in. `reweave` rebuilds the viewed copies below from
     /// these whenever the diff or the annotation set changes.
     base_rendered: Vec<Line<'static>>,
-    base_file_starts: Vec<u16>,
+    base_file_starts: Vec<usize>,
     base_line_info: Vec<LineInfo>,
     rendered: Vec<Line<'static>>,
-    file_starts: Vec<u16>,
+    file_starts: Vec<usize>,
     line_info: Vec<LineInfo>,
     /// Review object owning each woven render row. Base diff rows and tour
     /// annotations carry `None`; inline thread/draft/note rows retain their
@@ -1478,9 +1466,7 @@ impl App {
         if let Some(i) = new_idx
             && let Some(&offset) = self.file_starts.get(i)
         {
-            self.scroll = self
-                .display_row_of_line(offset as usize)
-                .min(self.max_scroll());
+            self.scroll = self.display_row_of_line(offset).min(self.max_scroll());
         } else {
             self.scroll = 0;
         }
@@ -1676,9 +1662,7 @@ impl App {
         match row {
             FileRow::File(i) => {
                 if let Some(&offset) = self.file_starts.get(i) {
-                    self.scroll = self
-                        .display_row_of_line(offset as usize)
-                        .min(self.max_scroll());
+                    self.scroll = self.display_row_of_line(offset).min(self.max_scroll());
                     self.h_scroll = 0;
                 }
             }
@@ -1848,7 +1832,7 @@ impl App {
     /// Renamed/Copied (the jj summary path is not a clean filename).
     fn edit_target(&self) -> Option<(String, u32)> {
         let start = match self.focus {
-            Focus::Files => *self.file_starts.get(self.selected_change()?)? as usize,
+            Focus::Files => *self.file_starts.get(self.selected_change()?)?,
             // A click-placed cursor wins over the top-of-viewport fallback.
             Focus::Diff => self
                 .diff_cursor
@@ -2013,9 +1997,7 @@ impl App {
 
     fn scroll_to_file(&mut self, file_idx: usize) {
         if let Some(&offset) = self.file_starts.get(file_idx) {
-            self.scroll = self
-                .display_row_of_line(offset as usize)
-                .min(self.max_scroll());
+            self.scroll = self.display_row_of_line(offset).min(self.max_scroll());
             self.h_scroll = 0;
         }
         self.select_change(file_idx);
@@ -2139,11 +2121,8 @@ impl App {
             .base_file_starts
             .iter()
             .map(|&start| {
-                let shift = inserts
-                    .iter()
-                    .filter(|(row, _, _)| *row <= start as usize)
-                    .count();
-                start.saturating_add(shift as u16)
+                let shift = inserts.iter().filter(|(row, _, _)| *row <= start).count();
+                start.saturating_add(shift)
             })
             .collect();
         let mut rendered = Vec::with_capacity(self.base_rendered.len() + inserts.len());
@@ -2652,7 +2631,7 @@ impl App {
             .iter()
             .enumerate()
             .rev()
-            .find(|&(_, &start)| start as usize <= source_line)
+            .find(|&(_, &start)| start <= source_line)
             .map(|(i, _)| i)
     }
 
@@ -2663,662 +2642,6 @@ impl App {
             self.h_scroll = 0;
         }
         self.scroll = self.display_row_of_line(top_line).min(self.max_scroll());
-    }
-}
-
-/// Output of `render_diff`: pre-styled lines plus the parallel metadata the
-/// UI uses to map cursor position back to a file/line and to surface stats.
-struct RenderedDiff {
-    lines: Vec<Line<'static>>,
-    file_starts: Vec<u16>,
-    line_info: Vec<LineInfo>,
-    file_stats: Vec<(u32, u32)>,
-}
-
-/// A `-` or `+` body row queued for batch flushing. We hold them so we can
-/// pair adjacent minuses and pluses index-for-index and compute a word-level
-/// refinement for each pair before emitting the rendered lines.
-struct PendingBody {
-    line: String,
-    is_plus: bool,
-    old_no: Option<u32>,
-    new_no: Option<u32>,
-    info: LineInfo,
-}
-
-/// Byte ranges (on the tab-expanded body) marking diverging spans within a
-/// refined `-`/`+` row.
-type RefineRanges = Vec<(usize, usize)>;
-
-/// Width of the old/new line-number columns. Bundled together so the gutter
-/// geometry travels as one value through the render pipeline.
-#[derive(Clone, Copy)]
-struct Gutter {
-    old_w: usize,
-    new_w: usize,
-}
-
-fn render_diff(
-    diff: &str,
-    changes: &[FileChange],
-    hl: &Highlighter,
-    fetch_content: &FetchContent,
-) -> RenderedDiff {
-    let path_to_idx: HashMap<&str, usize> = changes
-        .iter()
-        .enumerate()
-        .map(|(i, c)| (c.path.as_str(), i))
-        .collect();
-
-    let gutter = gutter_widths(diff);
-    let file_stats = compute_file_stats(diff, &path_to_idx, changes.len());
-
-    let mut rendered: Vec<Line<'static>> = Vec::new();
-    let mut line_info: Vec<LineInfo> = Vec::new();
-    let mut file_starts: Vec<u16> = vec![0; changes.len()];
-    let mut in_metadata = false;
-    let mut current_ext = String::new();
-    let mut current_file: Option<usize> = None;
-    // Post-image content of the current file, fetched once on `diff --git` and
-    // reused for every hunk header in the file. The fetcher routes by scope:
-    // disk for Range (cheap, accurate for jj `@`), backend for Rev.
-    let mut current_content: Option<String> = None;
-    let mut new_line: u32 = 0;
-    let mut old_line: u32 = 0;
-    let mut pending: Vec<PendingBody> = Vec::new();
-
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ")
-            && let Some((_, b)) = rest.split_once(" b/")
-        {
-            flush_pending(
-                &mut pending,
-                &mut rendered,
-                &mut line_info,
-                &current_ext,
-                hl,
-                gutter,
-            );
-            let idx = path_to_idx.get(b).copied();
-            let status = idx.map(|i| changes[i].status);
-            let stats = idx
-                .and_then(|i| file_stats.get(i).copied())
-                .unwrap_or((0, 0));
-            let line_no = rendered.len().min(u16::MAX as usize) as u16;
-            if let Some(i) = idx {
-                file_starts[i] = line_no;
-            }
-            rendered.push(file_separator(b, status, stats));
-            line_info.push(None);
-            in_metadata = true;
-            current_ext = ext_for_path(b).to_string();
-            current_file = idx;
-            current_content = fetch_content(b);
-            new_line = 0;
-            old_line = 0;
-            continue;
-        }
-        // Every hunk header re-seeds the line counters — not just the first.
-        // Gating this on `in_metadata` (true only until a file's first `@@`)
-        // meant later hunks fell through to the body path and the counter kept
-        // climbing from the previous hunk, so their gutter numbers and
-        // `line_info` were wrong. Flush first: a hunk boundary ends any pending
-        // +/- group from the hunk before it.
-        if line.starts_with("@@") {
-            in_metadata = false;
-            flush_pending(
-                &mut pending,
-                &mut rendered,
-                &mut line_info,
-                &current_ext,
-                hl,
-                gutter,
-            );
-            let (o, n) = parse_hunk_starts(line).unwrap_or((1, 1));
-            old_line = o;
-            new_line = n;
-            let augmented = augment_hunk_header(line, &current_ext, current_content.as_deref(), n);
-            rendered.push(hunk_header(&augmented));
-            line_info.push(None);
-            continue;
-        }
-        if in_metadata {
-            continue;
-        }
-        let first = line.chars().next();
-        match first {
-            Some('+') | Some('-') => {
-                let is_plus = first == Some('+');
-                let (old_no, new_no) = if is_plus {
-                    (None, Some(new_line))
-                } else {
-                    (Some(old_line), None)
-                };
-                let info = current_file.map(|f| (f, new_line));
-                pending.push(PendingBody {
-                    line: line.to_string(),
-                    is_plus,
-                    old_no,
-                    new_no,
-                    info,
-                });
-                if is_plus {
-                    new_line += 1;
-                } else {
-                    old_line += 1;
-                }
-            }
-            _ => {
-                flush_pending(
-                    &mut pending,
-                    &mut rendered,
-                    &mut line_info,
-                    &current_ext,
-                    hl,
-                    gutter,
-                );
-                let (old_no, new_no) = match first {
-                    Some(' ') => (Some(old_line), Some(new_line)),
-                    _ => (None, None),
-                };
-                rendered.push(diff_body_line(
-                    line,
-                    &current_ext,
-                    hl,
-                    old_no,
-                    new_no,
-                    gutter,
-                    None,
-                ));
-                let info = match first {
-                    Some(' ') => current_file.map(|f| (f, new_line)),
-                    _ => None,
-                };
-                line_info.push(info);
-                if matches!(first, Some(' ')) {
-                    new_line += 1;
-                    old_line += 1;
-                }
-            }
-        }
-    }
-
-    flush_pending(
-        &mut pending,
-        &mut rendered,
-        &mut line_info,
-        &current_ext,
-        hl,
-        gutter,
-    );
-
-    RenderedDiff {
-        lines: rendered,
-        file_starts,
-        line_info,
-        file_stats,
-    }
-}
-
-/// Single-pass count of `+`/`-` body lines per file. We need this up front so
-/// the file separator can carry its stats when first emitted; recomputing on
-/// the fly would mean either deferring the separator (which scrambles output
-/// order) or patching it after the fact (which is fiddlier than a tiny scan).
-fn compute_file_stats(diff: &str, path_to_idx: &HashMap<&str, usize>, n: usize) -> Vec<(u32, u32)> {
-    let mut stats = vec![(0u32, 0u32); n];
-    let mut current: Option<usize> = None;
-    let mut in_metadata = false;
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ")
-            && let Some((_, b)) = rest.split_once(" b/")
-        {
-            current = path_to_idx.get(b).copied();
-            in_metadata = true;
-            continue;
-        }
-        if in_metadata {
-            if line.starts_with("@@") {
-                in_metadata = false;
-            }
-            continue;
-        }
-        if let Some(i) = current {
-            match line.chars().next() {
-                Some('+') => stats[i].0 = stats[i].0.saturating_add(1),
-                Some('-') => stats[i].1 = stats[i].1.saturating_add(1),
-                _ => {}
-            }
-        }
-    }
-    stats
-}
-
-/// Pair adjacent minus/plus rows and compute per-row character ranges that
-/// changed. Rows past the shorter side stay unrefined and fall back to the
-/// row tint. The pairing is positional, not similarity-matched: it's the
-/// shape unified diff produces and lines up well with what humans expect when
-/// reviewing an edit.
-fn flush_pending(
-    pending: &mut Vec<PendingBody>,
-    rendered: &mut Vec<Line<'static>>,
-    line_info: &mut Vec<LineInfo>,
-    ext: &str,
-    hl: &Highlighter,
-    gutter: Gutter,
-) {
-    if pending.is_empty() {
-        return;
-    }
-    let minus_idx: Vec<usize> = pending
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| !p.is_plus)
-        .map(|(i, _)| i)
-        .collect();
-    let plus_idx: Vec<usize> = pending
-        .iter()
-        .enumerate()
-        .filter(|(_, p)| p.is_plus)
-        .map(|(i, _)| i)
-        .collect();
-    let pair_count = minus_idx.len().min(plus_idx.len());
-
-    let mut refines: Vec<Option<RefineRanges>> = (0..pending.len()).map(|_| None).collect();
-    for k in 0..pair_count {
-        let m_i = minus_idx[k];
-        let p_i = plus_idx[k];
-        let m_exp = expand_tabs(&pending[m_i].line[1..], TAB_WIDTH);
-        let p_exp = expand_tabs(&pending[p_i].line[1..], TAB_WIDTH);
-        if let Some((m_r, p_r)) = refine_word_diff(&m_exp, &p_exp) {
-            refines[m_i] = Some(m_r);
-            refines[p_i] = Some(p_r);
-        }
-    }
-
-    for (i, row) in std::mem::take(pending).into_iter().enumerate() {
-        let r = refines[i].as_deref();
-        rendered.push(diff_body_line(
-            &row.line, ext, hl, row.old_no, row.new_no, gutter, r,
-        ));
-        line_info.push(row.info);
-    }
-}
-
-/// Word-level diff between two body strings (already tab-expanded). Returns
-/// byte-range lists for the minus side and plus side identifying spans that
-/// were deleted or inserted. Returns `None` when the lines are too dissimilar
-/// to refine meaningfully — at that point the whole-row tint communicates
-/// "replaced" better than a forest of refinement spans would.
-fn refine_word_diff(minus: &str, plus: &str) -> Option<(RefineRanges, RefineRanges)> {
-    if minus.is_empty() || plus.is_empty() {
-        return None;
-    }
-    let diff = TextDiff::from_words(minus, plus);
-    let mut m_ranges = Vec::new();
-    let mut p_ranges = Vec::new();
-    let mut m_pos = 0usize;
-    let mut p_pos = 0usize;
-    let mut changed_m = 0usize;
-
-    for change in diff.iter_all_changes() {
-        let len = change.value().len();
-        match change.tag() {
-            ChangeTag::Equal => {
-                m_pos += len;
-                p_pos += len;
-            }
-            ChangeTag::Delete => {
-                m_ranges.push((m_pos, m_pos + len));
-                m_pos += len;
-                changed_m += len;
-            }
-            ChangeTag::Insert => {
-                p_ranges.push((p_pos, p_pos + len));
-                p_pos += len;
-            }
-        }
-    }
-
-    let m_total = minus.len();
-    if m_total == 0 {
-        return None;
-    }
-    if (changed_m as f64) / (m_total as f64) > 0.7 {
-        return None;
-    }
-    Some((m_ranges, p_ranges))
-}
-
-/// Slice each syntax-highlighted span at the byte boundaries of `ranges`, and
-/// paint the refined background on the slices that fall inside a range. Spans
-/// outside all ranges pass through unchanged.
-fn apply_refines(
-    spans: Vec<Span<'static>>,
-    ranges: &[(usize, usize)],
-    refined_bg: Color,
-) -> Vec<Span<'static>> {
-    if ranges.is_empty() {
-        return spans;
-    }
-    let mut out: Vec<Span<'static>> = Vec::with_capacity(spans.len());
-    let mut pos = 0usize;
-    for span in spans {
-        let content = span.content.clone().into_owned();
-        let len = content.len();
-        let span_start = pos;
-        let span_end = pos + len;
-
-        let mut bounds: Vec<usize> = vec![span_start, span_end];
-        for &(s, e) in ranges {
-            if s < span_end && e > span_start {
-                bounds.push(s.max(span_start));
-                bounds.push(e.min(span_end));
-            }
-        }
-        bounds.sort();
-        bounds.dedup();
-
-        for w in bounds.windows(2) {
-            let (a, b) = (w[0], w[1]);
-            if a == b {
-                continue;
-            }
-            let chunk = &content[a - span_start..b - span_start];
-            let in_range = ranges.iter().any(|(s, e)| *s <= a && b <= *e);
-            let mut style = span.style;
-            if in_range {
-                style = style.bg(refined_bg);
-            }
-            out.push(Span::styled(chunk.to_string(), style));
-        }
-
-        pos = span_end;
-    }
-    out
-}
-
-/// If a `@@` header has no trailing function-context text (jj's diff doesn't
-/// emit one), synthesize one for known languages so the hunk reads with the
-/// same scope cue git users get for free.
-fn augment_hunk_header(line: &str, ext: &str, content: Option<&str>, new_start: u32) -> String {
-    let Some(after_open) = line.strip_prefix("@@") else {
-        return line.to_string();
-    };
-    let Some(close_off) = after_open.find("@@") else {
-        return line.to_string();
-    };
-    let range_end = 2 + close_off + 2;
-    if !line[range_end..].trim().is_empty() {
-        return line.to_string();
-    }
-    let Some(content) = content else {
-        return line.to_string();
-    };
-    let ctx = match ext {
-        "go" => funcname::go_enclosing(content, new_start),
-        _ => None,
-    };
-    match ctx {
-        Some(c) => format!("{}{}", &line[..range_end], c),
-        None => line.to_string(),
-    }
-}
-
-fn parse_hunk_starts(line: &str) -> Option<(u32, u32)> {
-    let mut old = None;
-    let mut new = None;
-    for tok in line.split_whitespace() {
-        if let Some(rest) = tok.strip_prefix('-') {
-            old = rest.split(',').next().and_then(|s| s.parse().ok());
-        } else if let Some(rest) = tok.strip_prefix('+') {
-            new = rest.split(',').next().and_then(|s| s.parse().ok());
-        }
-        // The two range tokens come right after the opening `@@`; stop once we
-        // have both so a section heading like `... @@ return -1` can't clobber
-        // them with a stray +/- token.
-        if old.is_some() && new.is_some() {
-            break;
-        }
-    }
-    Some((old?, new?))
-}
-
-/// Scan hunk headers to size the old/new line-number columns. Empty diff
-/// collapses to single-digit columns so we still draw a sensible gutter.
-fn gutter_widths(diff: &str) -> Gutter {
-    let mut max_old = 0u32;
-    let mut max_new = 0u32;
-    for line in diff.lines() {
-        if !line.starts_with("@@") {
-            continue;
-        }
-        for tok in line.split_whitespace() {
-            let (target, rest) = if let Some(r) = tok.strip_prefix('-') {
-                (&mut max_old, r)
-            } else if let Some(r) = tok.strip_prefix('+') {
-                (&mut max_new, r)
-            } else {
-                continue;
-            };
-            let mut parts = rest.split(',');
-            let start: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(0);
-            let count: u32 = parts.next().and_then(|s| s.parse().ok()).unwrap_or(1);
-            let end = start.saturating_add(count.saturating_sub(1));
-            *target = (*target).max(end);
-        }
-    }
-    Gutter {
-        old_w: digits(max_old),
-        new_w: digits(max_new),
-    }
-}
-
-fn digits(n: u32) -> usize {
-    if n == 0 { 1 } else { (n.ilog10() + 1) as usize }
-}
-
-/// Render the `@@ -a,b +c,d @@` range bright teal and the trailing function
-/// context (if git's funcname patterns surfaced one) in dim italic, so the
-/// scope of a hunk reads at a glance without competing with the line numbers
-/// for attention.
-fn hunk_header(line: &str) -> Line<'static> {
-    let range_style = Style::default()
-        .fg(theme::TEAL)
-        .add_modifier(Modifier::BOLD);
-    if let Some(after_open) = line.strip_prefix("@@")
-        && let Some(close_off) = after_open.find("@@")
-    {
-        let range_end = 2 + close_off + 2;
-        let range = &line[..range_end];
-        let context = line[range_end..].trim_end();
-        let mut spans = vec![Span::styled(range.to_string(), range_style)];
-        if !context.is_empty() {
-            spans.push(Span::styled(
-                context.to_string(),
-                Style::default()
-                    .fg(theme::OVERLAY0)
-                    .add_modifier(Modifier::ITALIC),
-            ));
-        }
-        return Line::from(spans);
-    }
-    Line::from(Span::styled(line.to_string(), range_style))
-}
-
-fn diff_body_line(
-    line: &str,
-    ext: &str,
-    hl: &Highlighter,
-    old_no: Option<u32>,
-    new_no: Option<u32>,
-    gutter: Gutter,
-    refines: Option<&[(usize, usize)]>,
-) -> Line<'static> {
-    let Gutter { old_w, new_w } = gutter;
-    let (body, marker_span, line_bg, refined_bg) = if let Some(rest) = line.strip_prefix('+') {
-        (
-            rest,
-            Span::styled("▎", Style::default().fg(theme::GREEN)),
-            Some(theme::ADDED_BG),
-            Some(theme::ADDED_REFINED_BG),
-        )
-    } else if let Some(rest) = line.strip_prefix('-') {
-        (
-            rest,
-            Span::styled("▎", Style::default().fg(theme::RED)),
-            Some(theme::REMOVED_BG),
-            Some(theme::REMOVED_REFINED_BG),
-        )
-    } else if let Some(rest) = line.strip_prefix(' ') {
-        (rest, Span::raw(" "), None, None)
-    } else if line.starts_with('\\') {
-        let pad = " ".repeat(old_w + new_w + 5);
-        return Line::from(Span::styled(
-            format!("{pad}{line}"),
-            Style::default()
-                .fg(theme::OVERLAY0)
-                .add_modifier(Modifier::ITALIC),
-        ));
-    } else {
-        return Line::from(line.to_string());
-    };
-
-    let old_text = match old_no {
-        Some(n) => format!(" {:>w$} ", n, w = old_w),
-        None => " ".repeat(old_w + 2),
-    };
-    let new_text = match new_no {
-        Some(n) => format!("{:>w$} ", n, w = new_w),
-        None => " ".repeat(new_w + 1),
-    };
-
-    let gutter_style = Style::default().fg(theme::OVERLAY0);
-    let mut spans = vec![
-        Span::styled(old_text, gutter_style),
-        Span::styled(new_text, gutter_style),
-        marker_span,
-        Span::raw(" "),
-    ];
-
-    let body = expand_tabs(body, TAB_WIDTH);
-    let body_spans = hl.line_spans(&body, ext);
-    let body_spans = match (refines, refined_bg) {
-        (Some(ranges), Some(bg)) if !ranges.is_empty() => apply_refines(body_spans, ranges, bg),
-        _ => body_spans,
-    };
-    spans.extend(body_spans);
-
-    let mut result = Line::from(spans);
-    if let Some(bg) = line_bg {
-        result = result.style(Style::default().bg(bg));
-    }
-    result
-}
-
-fn file_separator(path: &str, status: Option<FileStatus>, stats: (u32, u32)) -> Line<'static> {
-    let glyph = status.map_or(' ', |s| s.glyph());
-    let color = status.map_or(theme::SUBTEXT0, status_color);
-    let mut spans = vec![
-        Span::styled("── ", Style::default().fg(theme::SURFACE1)),
-        Span::styled(
-            format!("{glyph} "),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            path.to_string(),
-            Style::default()
-                .fg(theme::TEXT)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    spans.extend(stats_spans(stats));
-    spans.push(Span::styled(
-        " ──────────────────────────────────────────────",
-        Style::default().fg(theme::SURFACE1),
-    ));
-    Line::from(spans)
-}
-
-/// `+N -M` formatted spans, leading with a space so callers can drop them
-/// inline next to a filename. Returns an empty vec when both counts are zero
-/// so pure renames/copies don't pick up `+0 -0` noise.
-fn stats_spans(stats: (u32, u32)) -> Vec<Span<'static>> {
-    let (add, del) = stats;
-    if add == 0 && del == 0 {
-        return Vec::new();
-    }
-    vec![
-        Span::raw(" "),
-        Span::styled(format!("+{add}"), Style::default().fg(theme::GREEN)),
-        Span::raw(" "),
-        Span::styled(format!("-{del}"), Style::default().fg(theme::RED)),
-    ]
-}
-
-/// One file row in the grouped file pane: a one-space indent, the colored
-/// status glyph, the basename, and `+N -M` stats pushed to the right edge.
-/// Stats are dropped when both counts are zero so pure renames stay clean.
-fn file_row_line(change: &FileChange, stats: (u32, u32), width: u16) -> ListItem<'static> {
-    let color = status_color(change.status);
-    let name = basename(&change.path).to_string();
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{} ", change.status.glyph()),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(name.clone(), Style::default().fg(theme::TEXT)),
-    ];
-
-    let (add, del) = stats;
-    if add > 0 || del > 0 {
-        // " M " indent+glyph is 3 cols; pad the gap so stats hug the right edge,
-        // keeping at least one space when the name would otherwise collide.
-        let left_width = 3 + name.chars().count();
-        let stats_width = format!("+{add} -{del}").chars().count();
-        let pad = (width as usize)
-            .saturating_sub(left_width + stats_width)
-            .max(1);
-        spans.push(Span::raw(" ".repeat(pad)));
-        spans.push(Span::styled(
-            format!("+{add}"),
-            Style::default().fg(theme::GREEN),
-        ));
-        spans.push(Span::raw(" "));
-        spans.push(Span::styled(
-            format!("-{del}"),
-            Style::default().fg(theme::RED),
-        ));
-    }
-
-    ListItem::new(Line::from(spans))
-}
-
-fn sticky_line(change: &FileChange, stats: (u32, u32)) -> Line<'static> {
-    let color = status_color(change.status);
-    let mut spans = vec![
-        Span::raw(" "),
-        Span::styled(
-            format!("{} ", change.status.glyph()),
-            Style::default().fg(color).add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(
-            change.path.clone(),
-            Style::default()
-                .fg(theme::TEXT)
-                .add_modifier(Modifier::BOLD),
-        ),
-    ];
-    spans.extend(stats_spans(stats));
-    Line::from(spans).style(Style::default().bg(theme::SURFACE0))
-}
-
-fn status_color(status: FileStatus) -> Color {
-    match status {
-        FileStatus::Added => theme::GREEN,
-        FileStatus::Deleted => theme::RED,
-        FileStatus::Modified => theme::YELLOW,
-        FileStatus::Renamed | FileStatus::Copied => theme::TEAL,
     }
 }
 
@@ -3433,7 +2756,7 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
         ClientCommand::Ping => Ok(link::Request::Ping),
         ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
-            pull_request: Box::new(fetch_pull_request(locator)?),
+            pull_request: Box::new(github::fetch_pull_request(locator)?),
         }),
         ClientCommand::Clear => Ok(link::Request::Clear),
         ClientCommand::Focus { pathspec } => {
@@ -3516,378 +2839,6 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 body: body.to_string(),
             })
         }
-    }
-}
-
-#[derive(Debug, PartialEq, Eq)]
-struct PrLocator {
-    repository: String,
-    number: u64,
-}
-
-fn parse_pr_locator(raw: &str) -> Result<PrLocator> {
-    let raw = raw.trim().trim_end_matches('/');
-    let path = raw
-        .strip_prefix("https://github.com/")
-        .or_else(|| raw.strip_prefix("http://github.com/"))
-        .unwrap_or(raw);
-    if let Some((repository, number)) = path.split_once('#') {
-        validate_repository(repository)?;
-        return Ok(PrLocator {
-            repository: repository.to_string(),
-            number: number
-                .parse()
-                .map_err(|_| anyhow!("invalid PR number in `{raw}`"))?,
-        });
-    }
-    let parts: Vec<&str> = path.split('/').collect();
-    if let [owner, repo, "pull", number] = parts.as_slice() {
-        let repository = format!("{owner}/{repo}");
-        validate_repository(&repository)?;
-        return Ok(PrLocator {
-            repository,
-            number: number
-                .parse()
-                .map_err(|_| anyhow!("invalid PR number in `{raw}`"))?,
-        });
-    }
-    Err(anyhow!(
-        "PR locator must be a GitHub pull URL or OWNER/REPO#NUMBER: `{raw}`"
-    ))
-}
-
-fn validate_repository(repository: &str) -> Result<()> {
-    let mut parts = repository.split('/');
-    if parts.next().is_some_and(|s| !s.is_empty())
-        && parts.next().is_some_and(|s| !s.is_empty())
-        && parts.next().is_none()
-    {
-        Ok(())
-    } else {
-        Err(anyhow!("invalid GitHub repository `{repository}`"))
-    }
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhPullRequest {
-    number: u64,
-    title: String,
-    body: String,
-    author: Option<GhActor>,
-    base_ref_name: String,
-    head_ref_name: String,
-    head_ref_oid: String,
-    url: String,
-    comments: Vec<GhConversationComment>,
-    reviews: Vec<GhReviewSummary>,
-}
-
-#[derive(Deserialize)]
-struct GhActor {
-    login: String,
-    #[serde(default)]
-    name: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhConversationComment {
-    author: Option<GhActor>,
-    body: String,
-    created_at: String,
-    url: String,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhReviewSummary {
-    author: Option<GhActor>,
-    body: String,
-    state: String,
-    #[serde(default)]
-    submitted_at: Option<String>,
-    #[serde(default)]
-    commit: Option<GhCommit>,
-}
-
-#[derive(Deserialize)]
-struct GhCommit {
-    oid: String,
-}
-
-#[derive(Deserialize)]
-struct GhGraphQlResponse {
-    data: GhGraphQlData,
-}
-
-#[derive(Deserialize)]
-struct GhGraphQlData {
-    repository: GhGraphQlRepository,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhGraphQlRepository {
-    pull_request: GhGraphQlPullRequest,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhGraphQlPullRequest {
-    review_threads: GhReviewThreadConnection,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhReviewThreadConnection {
-    page_info: GhPageInfo,
-    nodes: Vec<GhReviewThread>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhPageInfo {
-    has_next_page: bool,
-    end_cursor: Option<String>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhReviewThread {
-    id: String,
-    is_resolved: bool,
-    is_outdated: bool,
-    path: String,
-    line: Option<u32>,
-    original_line: Option<u32>,
-    start_line: Option<u32>,
-    original_start_line: Option<u32>,
-    diff_side: String,
-    comments: GhReviewCommentConnection,
-}
-
-#[derive(Deserialize)]
-struct GhReviewCommentConnection {
-    nodes: Vec<GhReviewComment>,
-}
-
-#[derive(Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct GhReviewComment {
-    id: String,
-    database_id: Option<u64>,
-    author: Option<GhActor>,
-    body: String,
-    created_at: String,
-    url: String,
-    reply_to: Option<GhNodeRef>,
-}
-
-#[derive(Deserialize)]
-struct GhNodeRef {
-    id: String,
-}
-
-const REVIEW_THREADS_QUERY: &str = r#"
-query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
-  repository(owner: $owner, name: $name) {
-    pullRequest(number: $number) {
-      reviewThreads(first: 100, after: $endCursor) {
-        pageInfo { hasNextPage endCursor }
-        nodes {
-          id isResolved isOutdated path line originalLine startLine originalStartLine diffSide
-          comments(first: 100) {
-            nodes { id databaseId author { login } body createdAt url replyTo { id } }
-          }
-        }
-      }
-    }
-  }
-}
-"#;
-
-fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
-    let locator = parse_pr_locator(raw)?;
-    let number = locator.number.to_string();
-    let output = Command::new("gh")
-        .args([
-            "pr",
-            "view",
-            &number,
-            "-R",
-            &locator.repository,
-            "--json",
-            "number,title,body,author,baseRefName,headRefName,headRefOid,url,comments,reviews",
-        ])
-        .output()
-        .map_err(|e| anyhow!("could not run gh: {e}"))?;
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-        return Err(anyhow!(
-            "could not fetch {}/#{}: {}",
-            locator.repository,
-            locator.number,
-            if stderr.is_empty() {
-                "gh failed without an error message"
-            } else {
-                &stderr
-            }
-        ));
-    }
-    let gh: GhPullRequest = serde_json::from_slice(&output.stdout)
-        .map_err(|e| anyhow!("could not decode gh PR response: {e}"))?;
-    let threads = fetch_review_threads(&locator)?;
-    Ok(link::PullRequest {
-        repository: locator.repository,
-        number: gh.number,
-        title: gh.title,
-        body: normalize_github_text(gh.body),
-        author: actor_or_ghost(gh.author),
-        base_ref: gh.base_ref_name,
-        head_ref: gh.head_ref_name,
-        head_oid: gh.head_ref_oid,
-        url: gh.url,
-        conversation: gh
-            .comments
-            .into_iter()
-            .map(|comment| link::ConversationComment {
-                author: actor_or_ghost(comment.author),
-                body: normalize_github_text(comment.body),
-                created_at: comment.created_at,
-                url: comment.url,
-            })
-            .collect(),
-        reviews: gh
-            .reviews
-            .into_iter()
-            .map(|review| link::ReviewSummary {
-                author: actor_or_ghost(review.author),
-                body: normalize_github_text(review.body),
-                state: parse_review_state(&review.state),
-                submitted_at: review.submitted_at,
-                commit_oid: review.commit.map(|commit| commit.oid),
-            })
-            .collect(),
-        threads,
-    })
-}
-
-fn fetch_review_threads(locator: &PrLocator) -> Result<Vec<link::ReviewThread>> {
-    let (owner, name) = locator
-        .repository
-        .split_once('/')
-        .expect("validated owner/repository");
-    let mut after = None;
-    let mut threads = Vec::new();
-    loop {
-        let mut command = Command::new("gh");
-        command
-            .args([
-                "api",
-                "graphql",
-                "-f",
-                &format!("query={REVIEW_THREADS_QUERY}"),
-            ])
-            .args(["-f", &format!("owner={owner}")])
-            .args(["-f", &format!("name={name}")])
-            .args(["-F", &format!("number={}", locator.number)]);
-        if let Some(cursor) = &after {
-            command.args(["-f", &format!("endCursor={cursor}")]);
-        }
-        let output = command
-            .output()
-            .map_err(|e| anyhow!("could not run gh: {e}"))?;
-        if !output.status.success() {
-            let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
-            return Err(anyhow!(
-                "could not fetch review threads for {}#{}: {}",
-                locator.repository,
-                locator.number,
-                if stderr.is_empty() {
-                    "gh failed without an error message"
-                } else {
-                    &stderr
-                }
-            ));
-        }
-        let page: GhGraphQlResponse = serde_json::from_slice(&output.stdout)
-            .map_err(|e| anyhow!("could not decode gh review-thread response: {e}"))?;
-        let connection = page.data.repository.pull_request.review_threads;
-        threads.extend(connection.nodes.into_iter().map(normalize_review_thread));
-        if !connection.page_info.has_next_page {
-            break;
-        }
-        after = connection.page_info.end_cursor;
-        if after.is_none() {
-            return Err(anyhow!(
-                "GitHub reported another thread page without a cursor"
-            ));
-        }
-    }
-    Ok(threads)
-}
-
-fn normalize_review_thread(thread: GhReviewThread) -> link::ReviewThread {
-    link::ReviewThread {
-        id: thread.id,
-        path: thread.path,
-        side: match thread.diff_side.as_str() {
-            "LEFT" => link::DiffSide::Left,
-            "RIGHT" => link::DiffSide::Right,
-            _ => link::DiffSide::Unknown,
-        },
-        line: thread.line,
-        start_line: thread.start_line,
-        original_line: thread.original_line,
-        original_start_line: thread.original_start_line,
-        resolved: thread.is_resolved,
-        outdated: thread.is_outdated,
-        comments: thread
-            .comments
-            .nodes
-            .into_iter()
-            .map(|comment| link::ReviewComment {
-                id: comment.id,
-                database_id: comment.database_id,
-                author: actor_or_ghost(comment.author),
-                body: normalize_github_text(comment.body),
-                created_at: comment.created_at,
-                url: comment.url,
-                reply_to: comment.reply_to.map(|reply| reply.id),
-            })
-            .collect(),
-    }
-}
-
-impl From<GhActor> for link::Actor {
-    fn from(actor: GhActor) -> Self {
-        Self {
-            login: actor.login,
-            name: actor.name,
-        }
-    }
-}
-
-fn actor_or_ghost(actor: Option<GhActor>) -> link::Actor {
-    actor.map(Into::into).unwrap_or_else(|| link::Actor {
-        login: "ghost".into(),
-        name: None,
-    })
-}
-
-fn normalize_github_text(text: String) -> String {
-    text.replace("\r\n", "\n")
-}
-
-fn parse_review_state(state: &str) -> link::ReviewState {
-    match state {
-        "APPROVED" => link::ReviewState::Approved,
-        "CHANGES_REQUESTED" => link::ReviewState::ChangesRequested,
-        "COMMENTED" => link::ReviewState::Commented,
-        "DISMISSED" => link::ReviewState::Dismissed,
-        "PENDING" => link::ReviewState::Pending,
-        _ => link::ReviewState::Unknown,
     }
 }
 
@@ -4067,15 +3018,16 @@ enum Action {
 }
 
 fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
-    let (tx, rx) = mpsc::channel::<()>();
+    let (tx, rx) = mpsc::channel::<notify::Event>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res
-            && is_interesting_event(&event)
+            && watch::is_interesting(&event)
         {
-            let _ = tx.send(());
+            let _ = tx.send(event);
         }
     })?;
-    watch_tree_pruned(&mut watcher, Path::new("."));
+    let mut watch_tree = watch::WatchTree::new(".");
+    watch_tree.refresh(&mut watcher);
 
     // Agent link: companion sessions reach us over a per-workspace socket.
     // A bind failure shouldn't sink the TUI — the link is best-effort.
@@ -4100,8 +3052,13 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
             }
         }
 
-        while rx.try_recv().is_ok() {
+        let mut refresh_watches = false;
+        while let Ok(event) = rx.try_recv() {
             pending_reload = Some(Instant::now());
+            refresh_watches |= watch::may_add_directories(&event);
+        }
+        if refresh_watches {
+            watch_tree.refresh(&mut watcher);
         }
         if let Some(t) = pending_reload
             && t.elapsed() >= RELOAD_DEBOUNCE
@@ -4682,61 +3639,6 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         _ => {}
     }
-}
-
-fn is_interesting_event(event: &notify::Event) -> bool {
-    matches!(
-        event.kind,
-        EventKind::Create(_) | EventKind::Modify(_) | EventKind::Remove(_)
-    )
-}
-
-/// Register a non-recursive inotify watch per source directory under `root`.
-/// We do the walk ourselves (instead of `RecursiveMode::Recursive`) so we can
-/// honor `.gitignore` / `.ignore` / `core.excludesFile` — and so we can prune
-/// only the VCS/direnv metadata dirs rather than every dotted directory.
-///
-/// The `WalkBuilder` default `hidden(true)` would skip *all* dotfiles, which
-/// silently drops live-reload for tracked files under `.github`, `.cargo`, and
-/// friends — the "missed a dotted file" bug. Instead we keep the gitignore
-/// filters on (they already prune `.direnv`, `target`, etc. here) and turn
-/// `hidden` off, adding an explicit override for the metadata dirs no
-/// `.gitignore` lists: `.git` and `.jj`. Otherwise a `.direnv` full of vendored
-/// nixpkgs trees blows past `fs.inotify.max_user_watches` at startup;
-/// `follow_links(false)` keeps us out of `/nix/store` reachable from
-/// `.direnv/flake-inputs/...source` symlinks.
-fn watch_tree_pruned(watcher: &mut impl Watcher, root: &Path) {
-    for dir in watched_dirs(root) {
-        // One bad directory (permission, ENOSPC) shouldn't take down the whole
-        // watcher. We just lose live-reload for that subtree.
-        let _ = watcher.watch(&dir, RecursiveMode::NonRecursive);
-    }
-}
-
-/// The directories under `root` we register watches on: every tracked directory
-/// except the VCS/direnv metadata dirs. Split out from [`watch_tree_pruned`] so
-/// the pruning rules can be exercised without a live `Watcher`.
-fn watched_dirs(root: &Path) -> Vec<PathBuf> {
-    let mut overrides = ignore::overrides::OverrideBuilder::new(root);
-    // `!` inverts gitignore sense in an `Override`, so each entry *ignores* that
-    // dir. `.git`/`.jj` aren't gitignored (each VCS ignores its own metadata
-    // implicitly); `.direnv` is belt-and-suspenders since repos gitignore it.
-    for dir in [".git", ".jj", ".direnv"] {
-        overrides
-            .add(&format!("!{dir}/"))
-            .expect("static override glob is valid");
-    }
-    let overrides = overrides.build().expect("static overrides build");
-
-    ignore::WalkBuilder::new(root)
-        .follow_links(false)
-        .hidden(false)
-        .overrides(overrides)
-        .build()
-        .flatten()
-        .filter(|entry| entry.file_type().is_some_and(|ft| ft.is_dir()))
-        .map(|entry| entry.path().to_path_buf())
-        .collect()
 }
 
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
@@ -6486,25 +5388,6 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     }
 
     #[test]
-    fn pr_locator_accepts_url_and_compact_forms() {
-        assert_eq!(
-            parse_pr_locator("https://github.com/cli/cli/pull/14136/").unwrap(),
-            PrLocator {
-                repository: "cli/cli".into(),
-                number: 14136,
-            }
-        );
-        assert_eq!(
-            parse_pr_locator("phinze/recto#7").unwrap(),
-            PrLocator {
-                repository: "phinze/recto".into(),
-                number: 7,
-            }
-        );
-        assert!(parse_pr_locator("14136").is_err());
-    }
-
-    #[test]
     fn pr_document_keeps_public_review_objects_distinct() {
         let pr = link::PullRequest {
             repository: "phinze/recto".into(),
@@ -7231,67 +6114,5 @@ index 1111111..2222222 100644
             "second hunk should be numbered 110..=113; line_info = {:?}",
             rd.line_info
         );
-    }
-
-    /// A throwaway directory tree, removed on drop. Avoids a `tempfile`
-    /// dev-dependency for the one test that needs a real filesystem.
-    struct TempTree(PathBuf);
-
-    impl TempTree {
-        fn new(dirs: &[&str]) -> Self {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let root = std::env::temp_dir().join(format!("recto-watched-dirs-{nonce}"));
-            for d in dirs {
-                std::fs::create_dir_all(root.join(d)).expect("create temp subtree");
-            }
-            Self(root)
-        }
-    }
-
-    impl Drop for TempTree {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
-
-    #[test]
-    fn watched_dirs_keeps_dotted_content_but_prunes_metadata() {
-        let tree = TempTree::new(&[
-            "src",
-            ".github/workflows",
-            ".git/objects",
-            ".jj",
-            ".direnv/flake-inputs",
-        ]);
-        let root = &tree.0;
-
-        let watched: std::collections::HashSet<PathBuf> = watched_dirs(root)
-            .into_iter()
-            .map(|p| p.strip_prefix(root).unwrap_or(&p).to_path_buf())
-            .collect();
-
-        // The regression fix: dotted directories with tracked content are
-        // watched, so edits under them still trigger live-reload.
-        assert!(watched.contains(Path::new("src")), "watched = {watched:?}");
-        assert!(
-            watched.contains(Path::new(".github")),
-            "watched = {watched:?}"
-        );
-        assert!(
-            watched.contains(Path::new(".github/workflows")),
-            "watched = {watched:?}"
-        );
-
-        // The metadata dirs stay pruned (and so do their subtrees) so we don't
-        // blow past the inotify watch budget.
-        for pruned in [".git", ".git/objects", ".jj", ".direnv"] {
-            assert!(
-                !watched.contains(Path::new(pruned)),
-                "{pruned} should be pruned; watched = {watched:?}"
-            );
-        }
     }
 }

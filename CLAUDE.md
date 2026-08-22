@@ -30,25 +30,18 @@ The originating sketch lives in memex:
 That doc is the source of truth for *why* this exists; this file is
 the source of truth for *how it's built*.
 
-## v0 Scope
+## Current Shape
 
-Smallest thing that proves the architecture:
+Recto opens a jj or Git repository at its canonical root and shows the full
+range from a readable base such as the branch point. The main diff has syntax
+and word-level highlighting, wrapping, search, mouse and keyboard navigation,
+and live reload. Files and revisions appear in optional navigator panes.
 
-1. Open a jj (or git) repo, show a left-pane file tree of changes
-   against `@-` (jj) or merge-base (git). Right pane: concatenated
-   unified diffs.
-2. `j/k` to scroll, `tab` to focus the tree, `enter` to jump to a
-   file's diff in the main pane.
-3. `b` to change base. Originally a blind rotation through a fixed list;
-   now it opens a pick mode inside the rev panel, starting on the current
-   base, with landmarks (trunk, branch point, bookmarks) labelled so the
-   choice is made by reading rather than by cycling and seeing where you
-   land. Header shows the current revision/base in words.
-4. `e` to open the file under cursor at the right line in `$EDITOR`,
-   come back cleanly.
-
-Explicit non-goals for v0: watch mode, search, syntax highlighting,
-tmux/agent integration. Those layer in once the v0 loop feels right.
+The editor handoff and workspace socket make Recto a shared review surface for
+the user and a companion agent. Either side can focus code, the agent can lay
+down an annotated tour, and the user can leave private agent notes or co-author
+a durable local GitHub review draft. Public PR descriptions and conversations
+can be attached as read-only context.
 
 ## Stack
 
@@ -60,31 +53,25 @@ tmux/agent integration. Those layer in once the v0 loop feels right.
   through `snapshot_workspace` is exactly the lumen trap.
 - **anyhow** + **color-eyre** — error handling. anyhow in library
   code, color-eyre installed at `main` for nicer panics/reports.
-- `gix` and `similar` deliberately not pulled in for v0. We can swap
-  the git backend to gix later if subprocess perf becomes a problem,
-  and `similar` for richer intra-line diffing only when the rendering
-  shape asks for it.
+- **similar** — word-level refinement inside paired removed and added lines.
+- `gix` remains deliberately absent. The Git CLI is sufficient until measured
+  subprocess cost says otherwise.
 
 ## Architecture
 
-The shape will emerge as we build, but the tension points we already
-know:
+The main tension points are:
 
 - **Backend trait.** `JjBackend` is primary; `GitBackend` is fallback.
-  Detection: `.jj/` present → jj (regardless of `.git/` colocation,
-  since on colocated repos jj is the source of truth for working-copy
-  state). `.git/` only → git. Each backend exposes:
-  `list_changes(base) -> Vec<FileChange>`,
-  `unified_diff(base, path) -> String`,
-  `available_bases() -> Vec<Base>`.
+  Detection prefers `.jj/` over a colocated `.git/`. Each backend owns a
+  canonical repository root and exposes change summaries, unified diffs,
+  revision history, default bases, and historical file content.
 - **Base abstraction.** `Base` is an enum, jj-shaped:
   `Revision(String)` for revsets like `@-`, `trunk()`, plus a few
   named conveniences. Git's HEAD / index / working-tree / merge-base
   map onto the same enum via `Revision("HEAD")`, `Revision("@")`,
   etc., so the UI cycle logic doesn't branch on backend.
-- **Tree pane.** Real tree with collapse/expand, not a flat list.
-  Build a `FileTree` from path components; render hand-rolled at first
-  (avoid `ratatui-tree-widget` until we know we need it).
+- **File navigator.** Files are grouped under directory headings, with public
+  threads, shared drafts, and private notes nested under their file.
 - **Editor handoff.** `disable_raw_mode` + leave alternate screen,
   spawn `$EDITOR +<line> <path>`, re-enter on return. SIGWINCH
   between handoff and return needs handling.
@@ -105,6 +92,7 @@ cargo run
 # Format / lint
 cargo fmt
 cargo clippy -- -D warnings
+cargo test
 ```
 
 ## Conventions

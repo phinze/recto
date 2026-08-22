@@ -10,13 +10,15 @@ changes that an AI agent just wrote in a sibling tmux pane, inside a
 jj workspace, with the diff updating live as the agent saves. Recto
 exists to be that tool, for me.
 
-jj is primary; git fallback is planned. Keybindings and shape will
-shift as the tool finds itself.
+jj is primary, with a working Git fallback. Recto now has live reload,
+revision and file navigation, search, syntax and word-level highlighting,
+editor handoff, companion-agent focus and notes, and local GitHub review
+drafts. Keybindings and shape will keep shifting as the tool finds itself.
 
 ## Status
 
-v0, in motion. See `CLAUDE.md` for the architecture sketch and what's
-landed.
+In active use and still moving. See `CLAUDE.md` for the current architecture
+and development conventions.
 
 ## License
 
