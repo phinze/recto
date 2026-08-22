@@ -37,6 +37,12 @@
           # is the flake input itself, so shipping never touches a hash again.
           cargoLock.lockFile = ./Cargo.lock;
 
+          # Repository integration tests exercise both supported backends.
+          nativeCheckInputs = with pkgs; [
+            git
+            jujutsu
+          ];
+
           meta = {
             description = "jj-first terminal diff viewer for reviewing agent-authored changes";
             homepage = "https://github.com/phinze/recto";
