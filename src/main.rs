@@ -284,6 +284,7 @@ enum FileRow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileReviewObject {
+    TourStop(usize),
     PublishedThread(usize),
     SharedDraft(u64),
     AgentNote(usize),
@@ -340,6 +341,7 @@ fn build_file_rows(changes: &[FileChange]) -> Vec<FileRow> {
 
 fn build_review_file_rows(
     changes: &[FileChange],
+    annotations: &[Annotation],
     threads: &[link::ReviewThread],
     drafts: &[link::DraftReviewComment],
     agent_notes: &[AgentNote],
@@ -355,6 +357,16 @@ fn build_review_file_rows(
             continue;
         };
         let path = &changes[file_idx].path;
+        rows.extend(
+            annotations
+                .iter()
+                .enumerate()
+                .filter(|(_, annotation)| annotation.path == *path)
+                .map(|(i, _)| FileRow::ReviewObject {
+                    file_idx,
+                    object: FileReviewObject::TourStop(i),
+                }),
+        );
         rows.extend(
             threads
                 .iter()
@@ -1591,6 +1603,7 @@ impl App {
             .map_or(&[][..], |pr| pr.threads.as_slice());
         let rows = build_review_file_rows(
             &self.changes,
+            &self.annotations,
             threads,
             &self.review_draft_comments,
             &self.agent_notes,
@@ -1673,6 +1686,10 @@ impl App {
 
     fn reveal_file_review_object(&mut self, object: FileReviewObject) {
         let anchor = match object {
+            FileReviewObject::TourStop(i) => self
+                .annotations
+                .get(i)
+                .map(|annotation| (annotation.path.clone(), annotation.start, annotation.end)),
             FileReviewObject::PublishedThread(i) => {
                 self.active_thread = Some(i);
                 self.pull_request
@@ -1725,6 +1742,10 @@ impl App {
 
     fn activate_review_object(&mut self, object: FileReviewObject) {
         match object {
+            FileReviewObject::TourStop(_) => {
+                self.reveal_file_review_object(object);
+                self.take_diff_focus();
+            }
             FileReviewObject::PublishedThread(i) => {
                 self.active_thread = Some(i);
                 self.thread_scroll = 0;
@@ -1791,6 +1812,11 @@ impl App {
             .or_else(|| threads.iter().position(contains))
         {
             return Some(FileReviewObject::PublishedThread(i));
+        }
+        if let Some(i) = self.annotations.iter().position(|annotation| {
+            annotation.path == *path && (annotation.start..=annotation.end).contains(&line)
+        }) {
+            return Some(FileReviewObject::TourStop(i));
         }
         if let Some(comment) = self
             .review_draft_comments
@@ -2052,7 +2078,11 @@ impl App {
             let Some(rows) = rows_for_span(&self.base_line_info, file_idx, a.start, a.end) else {
                 continue;
             };
-            inserts.push((*rows.start(), note_line(i + 1, &a.label), None));
+            inserts.push((
+                *rows.start(),
+                note_line(i + 1, &a.label),
+                Some(FileReviewObject::TourStop(i)),
+            ));
         }
         if let Some(pr) = &self.pull_request {
             for (i, thread) in pr.threads.iter().enumerate() {
@@ -4466,6 +4496,22 @@ fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 
 fn file_review_object_line(app: &App, object: FileReviewObject) -> ListItem<'static> {
     let spans = match object {
+        FileReviewObject::TourStop(i) => {
+            let label = app
+                .annotations
+                .get(i)
+                .map_or("tour stop", |annotation| annotation.label.as_str());
+            vec![
+                Span::raw("  "),
+                Span::styled(
+                    badge(i + 1),
+                    Style::default()
+                        .fg(theme::MAUVE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(format!(" {label}"), Style::default().fg(theme::SUBTEXT0)),
+            ]
+        }
         FileReviewObject::PublishedThread(i) => {
             let thread = app.pull_request.as_ref().and_then(|pr| pr.threads.get(i));
             let author = thread
@@ -4966,14 +5012,27 @@ fn body_text(line: &Line<'static>) -> String {
 }
 
 /// Circled-digit badges for steps 1–9, the keyboard-reachable ones; later
-/// steps fall back to plain `n.`.
+/// steps continue with compact spreadsheet-style letters (A..Z, AA..).
 const STEP_BADGES: [&str; 9] = ["①", "②", "③", "④", "⑤", "⑥", "⑦", "⑧", "⑨"];
 
 fn badge(n: usize) -> String {
     STEP_BADGES
         .get(n - 1)
         .map(|s| (*s).to_string())
-        .unwrap_or_else(|| format!("{n}."))
+        .unwrap_or_else(|| letter_badge(n))
+}
+
+fn letter_badge(n: usize) -> String {
+    let mut index = n.saturating_sub(10);
+    let mut chars = Vec::new();
+    loop {
+        chars.push((b'A' + (index % 26) as u8) as char);
+        if index < 26 {
+            break;
+        }
+        index = index / 26 - 1;
+    }
+    chars.into_iter().rev().collect()
 }
 
 /// Render an annotation as a note row — `╭─ ① label`, tinted like a review
@@ -5089,7 +5148,7 @@ fn agent_note_badge(n: usize) -> String {
     COMMENT_BADGES
         .get(n - 1)
         .map(|s| (*s).to_string())
-        .unwrap_or_else(|| format!("{n}."))
+        .unwrap_or_else(|| letter_badge(n))
 }
 
 /// Render one row of a pending comment — `╭─ ❶ body`, peach against the tour's
@@ -5974,6 +6033,12 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     #[test]
     fn review_objects_nest_under_their_file_without_losing_type() {
         let changes = [change("src/main.rs"), change("src/link.rs")];
+        let annotations = [Annotation {
+            path: "src/link.rs".into(),
+            start: 42,
+            end: 42,
+            label: "Follow the request".into(),
+        }];
         let threads = [link::ReviewThread {
             id: "thread-1".into(),
             path: "src/link.rs".into(),
@@ -6002,11 +6067,15 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         }];
 
         assert_eq!(
-            build_review_file_rows(&changes, &threads, &drafts, &notes),
+            build_review_file_rows(&changes, &annotations, &threads, &drafts, &notes),
             vec![
                 FileRow::Dir("src/".into()),
                 FileRow::File(0),
                 FileRow::File(1),
+                FileRow::ReviewObject {
+                    file_idx: 1,
+                    object: FileReviewObject::TourStop(0),
+                },
                 FileRow::ReviewObject {
                     file_idx: 1,
                     object: FileReviewObject::PublishedThread(0),
@@ -6021,6 +6090,14 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 },
             ]
         );
+    }
+
+    #[test]
+    fn badges_continue_with_letters_after_the_number_keys() {
+        assert_eq!(badge(9), "⑨");
+        assert_eq!(badge(10), "A");
+        assert_eq!(agent_note_badge(35), "Z");
+        assert_eq!(agent_note_badge(36), "AA");
     }
 
     #[test]
