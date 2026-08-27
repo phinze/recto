@@ -202,6 +202,9 @@ enum ClientCommand {
     /// Show the session-durable local review draft as JSON. Unlike `notes`, this is a
     /// non-consuming read and may be called throughout co-authoring.
     Review,
+    /// Add, revise, or delete the shared top-level review body. An empty BODY
+    /// deletes the draft.
+    ReviewBody { body: String },
     /// Add or revise a shared public review comment. Without --id, INPUT is
     /// `path:LINE=body` or `path:START-END=body`. With --id, INPUT is the new
     /// body; an empty body deletes that draft.
@@ -421,12 +424,14 @@ enum Mode {
 enum ComposerKind {
     AgentNote,
     ReviewComment,
+    ReviewBody,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ComposerEdit {
     AgentNote(usize),
     ReviewComment(u64),
+    ReviewBody,
 }
 
 /// A private agent note being written. The anchor is captured when the modal opens rather
@@ -435,8 +440,7 @@ enum ComposerEdit {
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct NoteDraft {
     kind: ComposerKind,
-    path: String,
-    line: u32,
+    anchor: Option<(String, u32)>,
     body: String,
     /// Caret position as a character index into `body`.
     caret: usize,
@@ -789,6 +793,9 @@ struct App {
     /// are local draft content, distinct from both published PR threads and
     /// drain-on-read private notes.
     review_draft_comments: Vec<link::DraftReviewComment>,
+    /// Optional top-level body for the same shared review draft. Unlike inline
+    /// comments it has no file anchor and is authored from the PR overview.
+    review_draft_body: Option<link::DraftReviewBody>,
     next_review_draft_id: u64,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
@@ -908,6 +915,7 @@ impl App {
             annotations: Vec::new(),
             agent_notes: Vec::new(),
             review_draft_comments: Vec::new(),
+            review_draft_body: None,
             next_review_draft_id: 1,
             diff_cursor: None,
             last_review_click: None,
@@ -1762,8 +1770,7 @@ impl App {
                 let body = comment.body.clone();
                 self.mode = Mode::NoteInput(NoteDraft {
                     kind: ComposerKind::ReviewComment,
-                    path: comment.path.clone(),
-                    line: comment.start,
+                    anchor: Some((comment.path.clone(), comment.start)),
                     caret: body.chars().count(),
                     body,
                     error: None,
@@ -1777,8 +1784,7 @@ impl App {
                 let body = note.body.clone();
                 self.mode = Mode::NoteInput(NoteDraft {
                     kind: ComposerKind::AgentNote,
-                    path: note.path.clone(),
-                    line: note.start,
+                    anchor: Some((note.path.clone(), note.start)),
                     caret: body.chars().count(),
                     body,
                     error: None,
@@ -1903,6 +1909,7 @@ impl App {
             annotations: self.annotations.len(),
             pending_comments: self.agent_notes.len(),
             draft_comments: self.review_draft_comments.len(),
+            draft_body: self.review_draft_body.is_some(),
             pull_request: self.pull_request.as_ref().map(|pr| link::PullRequestRef {
                 repository: pr.repository.clone(),
                 number: pr.number,
@@ -1917,7 +1924,7 @@ impl App {
             link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::AttachPr { pull_request } => {
                 let pull_request = *pull_request;
-                if !self.review_draft_comments.is_empty()
+                if (self.review_draft_body.is_some() || !self.review_draft_comments.is_empty())
                     && self.pull_request.as_ref().is_some_and(|current| {
                         current.repository != pull_request.repository
                             || current.number != pull_request.number
@@ -1957,6 +1964,9 @@ impl App {
             } => self.add_agent_note(&path, start, end, body),
             link::Request::AgentNotes => self.drain_agent_notes(),
             link::Request::ReviewDraft => self.review_draft_response(),
+            link::Request::ReviewDraftBody { body } => {
+                self.set_review_draft_body(body, link::DraftEditor::Agent)
+            }
             link::Request::ReviewDraftComment {
                 id,
                 path,
@@ -2314,8 +2324,23 @@ impl App {
                 number: pr.number,
                 head_oid: pr.head_oid.clone(),
             },
+            body: self.review_draft_body.clone(),
             comments: self.review_draft_comments.clone(),
         })
+    }
+
+    fn set_review_draft_body(
+        &mut self,
+        body: String,
+        last_editor: link::DraftEditor,
+    ) -> link::Response {
+        if self.pull_request.is_none() {
+            return link::Response::err("attach a pull request before drafting a review");
+        }
+        let body = body.trim().to_string();
+        self.review_draft_body =
+            (!body.is_empty()).then_some(link::DraftReviewBody { body, last_editor });
+        self.review_draft_response()
     }
 
     fn add_review_draft_comment(
@@ -2825,6 +2850,9 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         }
         ClientCommand::Notes => Ok(link::Request::AgentNotes),
         ClientCommand::Review => Ok(link::Request::ReviewDraft),
+        ClientCommand::ReviewBody { body } => {
+            Ok(link::Request::ReviewDraftBody { body: body.clone() })
+        }
         ClientCommand::ReviewComment {
             id: Some(id),
             input,
@@ -3192,7 +3220,11 @@ fn handle_event(
                                 }
                                 (ComposerKind::AgentNote, None) if body.is_empty() => None,
                                 (ComposerKind::AgentNote, None) => {
-                                    Some(app.add_agent_note(&draft.path, draft.line, None, body))
+                                    let (path, line) = draft
+                                        .anchor
+                                        .as_ref()
+                                        .expect("agent note composer has an anchor");
+                                    Some(app.add_agent_note(path, *line, None, body))
                                 }
                                 (
                                     ComposerKind::ReviewComment,
@@ -3204,13 +3236,20 @@ fn handle_event(
                                 )),
                                 (ComposerKind::ReviewComment, None) if body.is_empty() => None,
                                 (ComposerKind::ReviewComment, None) => {
+                                    let (path, line) = draft
+                                        .anchor
+                                        .as_ref()
+                                        .expect("review comment composer has an anchor");
                                     Some(app.add_review_draft_comment(
-                                        &draft.path,
-                                        draft.line,
+                                        path,
+                                        *line,
                                         None,
                                         body,
                                         link::DraftEditor::User,
                                     ))
+                                }
+                                (ComposerKind::ReviewBody, _) => {
+                                    Some(app.set_review_draft_body(body, link::DraftEditor::User))
                                 }
                                 _ => Some(link::Response::err(
                                     "the comment being edited changed unexpectedly",
@@ -3269,6 +3308,25 @@ fn handle_event(
                     KeyCode::Char('q') => return Ok(Action::Quit),
                     KeyCode::Char('p') | KeyCode::Esc => {
                         app.page = Page::Diff;
+                    }
+                    KeyCode::Char('c') => {
+                        let body = app
+                            .review_draft_body
+                            .as_ref()
+                            .map(|draft| draft.body.clone())
+                            .unwrap_or_default();
+                        app.mode = Mode::NoteInput(NoteDraft {
+                            kind: ComposerKind::ReviewBody,
+                            anchor: None,
+                            caret: body.chars().count(),
+                            body,
+                            error: None,
+                            editing: app
+                                .review_draft_body
+                                .as_ref()
+                                .map(|_| ComposerEdit::ReviewBody),
+                        });
+                        mode = app.mode.clone();
                     }
                     KeyCode::Char('t') => {
                         if app.cycle_public_thread(1) {
@@ -3496,8 +3554,7 @@ fn handle_event(
                                 .unwrap_or_default();
                             app.mode = Mode::NoteInput(NoteDraft {
                                 kind: ComposerKind::AgentNote,
-                                path,
-                                line,
+                                anchor: Some((path, line)),
                                 caret: body.chars().count(),
                                 body,
                                 error: None,
@@ -3515,8 +3572,7 @@ fn handle_event(
                                 .unwrap_or_default();
                             app.mode = Mode::NoteInput(NoteDraft {
                                 kind: ComposerKind::ReviewComment,
-                                path,
-                                line,
+                                anchor: Some((path, line)),
                                 caret: body.chars().count(),
                                 body,
                                 error: None,
@@ -3675,6 +3731,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     match app.page {
         Page::PullRequest => {
             draw_pull_request(frame, app);
+            if let Mode::NoteInput(draft) = app.mode.clone() {
+                app.note_wrap_width = draw_note_input(frame, frame.area(), &draft);
+            }
             return;
         }
         Page::ReviewThread => {
@@ -3780,13 +3839,18 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             Style::default().fg(theme::PEACH),
         ));
     }
-    if !app.review_draft_comments.is_empty() {
+    if app.review_draft_body.is_some() || !app.review_draft_comments.is_empty() {
         let n = app.review_draft_comments.len();
-        header_spans.push(Span::styled(
-            format!(
-                " · ✎ {n} shared review draft{}",
+        let label = match (app.review_draft_body.is_some(), n) {
+            (true, 0) => "review body".to_string(),
+            (true, n) => format!(
+                "review body + {n} inline comment{}",
                 if n == 1 { "" } else { "s" }
             ),
+            (false, n) => format!("{n} inline comment{}", if n == 1 { "" } else { "s" }),
+        };
+        header_spans.push(Span::styled(
+            format!(" · ✎ shared {label}"),
             Style::default().fg(theme::YELLOW),
         ));
     }
@@ -3969,7 +4033,7 @@ fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
     ];
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    let lines = pull_request_lines(pr);
+    let lines = pull_request_lines(pr, app.review_draft_body.as_ref());
     let inner_width = rows[1].width.saturating_sub(2);
     let inner_height = rows[1].height.saturating_sub(2) as usize;
     let visual_rows: usize = lines
@@ -3994,19 +4058,39 @@ fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
         rows[1],
     );
     frame.render_widget(
-        Paragraph::new("p/esc diff · t/T threads · j/k scroll · g/G ends · q quit")
+        Paragraph::new("p/esc diff · c review body · t/T threads · j/k scroll · g/G ends · q quit")
             .style(Style::default().fg(theme::OVERLAY0)),
         rows[2],
     );
 }
 
-fn pull_request_lines(pr: &link::PullRequest) -> Vec<Line<'static>> {
+fn pull_request_lines(
+    pr: &link::PullRequest,
+    draft_body: Option<&link::DraftReviewBody>,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     section_heading(&mut lines, "Description");
     if pr.body.trim().is_empty() {
         lines.push(dim_line("No description."));
     } else {
         lines.extend(markdown::lines(&pr.body));
+    }
+
+    section_heading(&mut lines, "Shared review draft");
+    if let Some(draft) = draft_body {
+        let editor = match draft.last_editor {
+            link::DraftEditor::User => "you last edited",
+            link::DraftEditor::Agent => "agent last edited",
+        };
+        lines.push(Line::from(Span::styled(
+            editor,
+            Style::default().fg(theme::YELLOW),
+        )));
+        lines.extend(markdown::lines(&draft.body));
+    } else {
+        lines.push(dim_line(
+            "No top-level review drafted. Press c to start one.",
+        ));
     }
 
     if !pr.conversation.is_empty() {
@@ -4298,17 +4382,31 @@ fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) ->
             theme::YELLOW,
             " enter stage shared draft · shift-enter newline · esc cancel ".to_string(),
         ),
+        (None, ComposerKind::ReviewBody, Some(_)) => (
+            theme::YELLOW,
+            " enter save review body · empty to delete · esc cancel ".to_string(),
+        ),
+        (None, ComposerKind::ReviewBody, None) => (
+            theme::YELLOW,
+            " enter stage review body · shift-enter newline · esc cancel ".to_string(),
+        ),
     };
     let verb = match (draft.kind, draft.editing.is_some()) {
         (ComposerKind::AgentNote, true) => "editing agent note on",
         (ComposerKind::AgentNote, false) => "note for agent on",
         (ComposerKind::ReviewComment, true) => "editing shared review draft on",
         (ComposerKind::ReviewComment, false) => "shared review draft on",
+        (ComposerKind::ReviewBody, true) => "editing shared top-level review",
+        (ComposerKind::ReviewBody, false) => "shared top-level review",
+    };
+    let title = match &draft.anchor {
+        Some((path, line)) => format!(" {verb} {path}:{line} "),
+        None => format!(" {verb} "),
     };
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(accent))
-        .title(format!(" {verb} {}:{} ", draft.path, draft.line))
+        .title(title)
         .title_style(Style::default().fg(accent).add_modifier(Modifier::BOLD))
         .title_bottom(Span::styled(hint, Style::default().fg(theme::OVERLAY0)))
         .style(Style::default().bg(theme::BASE));
@@ -5457,6 +5555,20 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     }
 
     #[test]
+    fn review_body_command_preserves_markdown() {
+        let request = build_request(&ClientCommand::ReviewBody {
+            body: "## Summary\n\nLooks good.".into(),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            request,
+            link::Request::ReviewDraftBody { body }
+                if body == "## Summary\n\nLooks good."
+        ));
+    }
+
+    #[test]
     fn pr_document_keeps_public_review_objects_distinct() {
         let pr = link::PullRequest {
             repository: "phinze/recto".into(),
@@ -5514,11 +5626,20 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 }],
             }],
         };
-        let text: Vec<String> = pull_request_lines(&pr)
+        let review_body = link::DraftReviewBody {
+            body: "The shared top-level review.".into(),
+            last_editor: link::DraftEditor::Agent,
+        };
+        let text: Vec<String> = pull_request_lines(&pr, Some(&review_body))
             .iter()
             .map(Line::to_string)
             .collect();
         assert!(text.iter().any(|line| line == "Description"));
+        assert!(text.iter().any(|line| line == "Shared review draft"));
+        assert!(
+            text.iter()
+                .any(|line| line == "The shared top-level review.")
+        );
         assert!(text.iter().any(|line| line == "Conversation"));
         assert!(text.iter().any(|line| line == "Reviews"));
         assert!(text.iter().any(|line| line == "Review threads"));
@@ -5598,8 +5719,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn draft() -> NoteDraft {
         NoteDraft {
             kind: ComposerKind::AgentNote,
-            path: "src/main.rs".into(),
-            line: 42,
+            anchor: Some(("src/main.rs".into(), 42)),
             body: String::new(),
             caret: 0,
             error: None,

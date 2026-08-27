@@ -62,6 +62,10 @@ pub enum Request {
     /// Read the shared, local-only review draft without consuming it.
     #[serde(rename = "review")]
     ReviewDraft,
+    /// Create, revise, or delete the shared top-level review body. An empty
+    /// body deletes the draft.
+    #[serde(rename = "review-body")]
+    ReviewDraftBody { body: String },
     /// Create, revise, or delete one shared inline review comment. New comments
     /// carry an anchor and no id; revisions carry the stable id. An empty body
     /// deletes an existing draft.
@@ -114,7 +118,15 @@ pub struct AgentNote {
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReviewDraft {
     pub pull_request: PullRequestRef,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub body: Option<DraftReviewBody>,
     pub comments: Vec<DraftReviewComment>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct DraftReviewBody {
+    pub body: String,
+    pub last_editor: DraftEditor,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -294,6 +306,9 @@ pub struct Status {
     /// Durable public review comments currently being co-authored locally.
     #[serde(default)]
     pub draft_comments: usize,
+    /// Whether the durable public review has a top-level body draft.
+    #[serde(default)]
+    pub draft_body: bool,
     /// Public PR snapshot currently attached to the TUI, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequestRef>,
@@ -680,7 +695,7 @@ fn handle_while_in_editor(
         Request::ReviewDraft => {
             Response::err("recto is in an editor; leave it before reading the review draft")
         }
-        Request::ReviewDraftComment { .. } => {
+        Request::ReviewDraftBody { .. } | Request::ReviewDraftComment { .. } => {
             queue(tx, request.clone());
             Response::ok_note(
                 "recto is in an editor; the shared draft update will land when you return",
@@ -886,6 +901,12 @@ mod tests {
             serde_json::from_str::<Request>(r#"{"cmd":"review"}"#),
             Ok(Request::ReviewDraft)
         ));
+        assert!(matches!(
+            serde_json::from_str::<Request>(
+                r#"{"cmd":"review-body","body":"The overall review."}"#
+            ),
+            Ok(Request::ReviewDraftBody { body }) if body == "The overall review."
+        ));
     }
 
     #[test]
@@ -896,6 +917,10 @@ mod tests {
                 number: 7,
                 head_oid: "abc123".into(),
             },
+            body: Some(DraftReviewBody {
+                body: "The overall review.".into(),
+                last_editor: DraftEditor::User,
+            }),
             comments: vec![DraftReviewComment {
                 id: 1,
                 path: "src/main.rs".into(),
@@ -908,6 +933,7 @@ mod tests {
         let json = serde_json::to_string(&response).expect("serialize");
         let back: Response = serde_json::from_str(&json).expect("round trip");
         let draft = back.review_draft.expect("review draft present");
+        assert_eq!(draft.body.expect("review body").body, "The overall review.");
         assert_eq!(draft.comments[0].id, 1);
         assert_eq!(draft.comments[0].last_editor, DraftEditor::Agent);
     }
@@ -931,6 +957,7 @@ mod tests {
             annotations: 0,
             pending_comments: 2,
             draft_comments: 0,
+            draft_body: false,
             pull_request: None,
         });
         let json = serde_json::to_string(&resp).expect("serialize");
@@ -940,6 +967,7 @@ mod tests {
         assert_eq!(status.base, "@-");
         assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
         assert_eq!(status.pending_comments, 2);
+        assert!(!status.draft_body);
         assert_eq!(status.surface, Surface::Recto);
         assert_eq!(
             status.capabilities.focus,
@@ -996,6 +1024,7 @@ mod tests {
                 annotations: 0,
                 pending_comments: 0,
                 draft_comments: 0,
+                draft_body: false,
                 pull_request: None,
             },
         );
@@ -1041,6 +1070,7 @@ mod tests {
                 annotations: 0,
                 pending_comments: 0,
                 draft_comments: 0,
+                draft_body: false,
                 pull_request: None,
             },
         );
@@ -1159,6 +1189,7 @@ mod tests {
                 annotations: 0,
                 pending_comments: 3,
                 draft_comments: 0,
+                draft_body: false,
                 pull_request: None,
             },
         );

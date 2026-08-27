@@ -48,6 +48,7 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto pr OWNER/REPO#NUMBER   # fetch and open public PR context in the TUI
     recto notes                  # collect the private notes the user left for you
     recto review                 # peek at the shared, local-only review draft
+    recto review-body BODY       # create, revise, or delete the top-level body
     recto review-comment PATH:LINE=BODY
     recto review-comment --id ID BODY
 
@@ -66,19 +67,24 @@ review threads. The user toggles between it and the diff with `p`, moves among
 public threads with `t` / `T`, and presses `enter` on an anchored thread in the
 diff to open its full conversation.
 
-Published threads, shared review drafts, and private agent notes also appear as
-typed child rows beneath their changed file in the file pane. Moving onto a
-child with `j` / `k` reveals its anchor in the diff. `enter` opens a published
-conversation or the matching draft/note editor. A double click opens the same
+Tour stops, published threads, shared review drafts, and private agent notes
+also appear as typed child rows beneath their changed file in the file pane.
+Moving onto a child with `j` / `k` reveals its anchor in the diff. `enter`
+opens a published conversation or the matching draft/note editor; on a tour
+stop it returns focus to the revealed span. A double click opens the same
 objects directly from either their file-pane row or their inline diff content.
 
 ## Co-author a public review draft
 
-Shared review comments are durable local drafts, not published GitHub content
-and not drain-on-read agent notes. The user stages or edits one with `c` on a
-diff line. Read the whole shared draft with `recto review`; this is a peek, so
-calling it repeatedly never consumes anything. Each comment has a stable `id`
-and a `last_editor` field.
+The top-level review body and inline review comments are durable local drafts,
+not published GitHub content and not drain-on-read agent notes. The user stages
+or edits the body with `c` on the PR overview, and an inline comment with `c`
+on a diff line. Read the whole shared draft with `recto review`; this is a
+peek, so calling it repeatedly never consumes anything. The body and each
+comment carry a `last_editor` field, and inline comments also have stable ids.
+
+Revise the top-level body with `recto review-body 'new Markdown'`. Passing an
+empty body deletes it. The command returns the updated full draft as JSON.
 
 Revise the same comment with `recto review-comment --id ID 'new Markdown'`.
 Create one from the companion side with
@@ -238,7 +244,8 @@ It looks like:
       "focus": false,
       "annotations": 0,
       "pending_comments": 2,
-      "draft_comments": 1
+      "draft_comments": 1,
+      "draft_body": true
     }
 
 The `files` array is always the changed-path list in the diff recto currently
@@ -256,3 +263,7 @@ entirely, which reads as zero.
 `draft_comments` counts the session-durable public review comments being
 co-authored locally. It is safe to follow a nonzero count with `recto review`:
 that command only peeks and can never remove draft content.
+
+`draft_body` reports whether the same shared review has a top-level body. Like
+`draft_comments`, `true` is a reason to peek with `recto review`, never to
+publish or delete anything by assumption.
