@@ -418,6 +418,7 @@ enum Mode {
     Normal,
     SearchInput { query: String },
     NoteInput(NoteDraft),
+    QuitConfirm,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3304,8 +3305,12 @@ fn handle_event(
                         _ => {}
                     }
                 }
+                Mode::QuitConfirm => match key.code {
+                    KeyCode::Char('q') | KeyCode::Char('y') => return Ok(Action::Quit),
+                    _ => app.mode = Mode::Normal,
+                },
                 Mode::Normal if app.page == Page::PullRequest => match key.code {
-                    KeyCode::Char('q') => return Ok(Action::Quit),
+                    KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Char('p') | KeyCode::Esc => {
                         app.page = Page::Diff;
                     }
@@ -3357,7 +3362,7 @@ fn handle_event(
                     _ => {}
                 },
                 Mode::Normal if app.page == Page::ReviewThread => match key.code {
-                    KeyCode::Char('q') => return Ok(Action::Quit),
+                    KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Esc => app.page = Page::Diff,
                     KeyCode::Char('p') => app.page = Page::PullRequest,
                     KeyCode::Char('t') => {
@@ -3404,12 +3409,11 @@ fn handle_event(
                 },
                 Mode::Normal => match key.code {
                     KeyCode::Char('?') => app.show_help = true,
-                    // `q` quits, which is what the footer has been promising
-                    // in every state. It used to share Esc's peel-one-layer
-                    // chain, so leaving the rev panel took three presses:
-                    // cancel, change focus, quit. Esc keeps the chain, since
-                    // backing out a layer at a time is exactly what it's for.
-                    KeyCode::Char('q') => return Ok(Action::Quit),
+                    // `q` starts the same quit confirmation from every page.
+                    // Esc keeps its peel-one-layer chain, since backing out a
+                    // layer at a time is exactly what it's for; only its final
+                    // exit step reaches the confirmation.
+                    KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Char('p') if app.pull_request.is_some() => {
                         app.page = Page::PullRequest;
                     }
@@ -3424,7 +3428,7 @@ fn handle_event(
                         } else if app.focus == Focus::Commits {
                             app.focus = Focus::Diff;
                         } else {
-                            return Ok(Action::Quit);
+                            app.mode = Mode::QuitConfirm;
                         }
                     }
                     KeyCode::Tab => {
@@ -3731,13 +3735,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     match app.page {
         Page::PullRequest => {
             draw_pull_request(frame, app);
-            if let Mode::NoteInput(draft) = app.mode.clone() {
-                app.note_wrap_width = draw_note_input(frame, frame.area(), &draft);
-            }
+            draw_mode_overlay(frame, app);
             return;
         }
         Page::ReviewThread => {
             draw_review_thread(frame, app);
+            draw_mode_overlay(frame, app);
             return;
         }
         Page::Diff => {}
@@ -3978,12 +3981,19 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
     }
 
-    if let Mode::NoteInput(draft) = app.mode.clone() {
-        app.note_wrap_width = draw_note_input(frame, frame.area(), &draft);
-    }
-
     if app.show_help {
         draw_help(frame, frame.area());
+    }
+    draw_mode_overlay(frame, app);
+}
+
+fn draw_mode_overlay(frame: &mut ratatui::Frame, app: &mut App) {
+    match app.mode.clone() {
+        Mode::NoteInput(draft) => {
+            app.note_wrap_width = draw_note_input(frame, frame.area(), &draft);
+        }
+        Mode::QuitConfirm => draw_quit_confirm(frame, frame.area(), app),
+        Mode::Normal | Mode::SearchInput { .. } => {}
     }
 }
 
@@ -4334,6 +4344,89 @@ fn short_timestamp(timestamp: &str) -> String {
         .collect()
 }
 
+fn quit_loss_summary(
+    agent_notes: usize,
+    review_body: bool,
+    inline_comments: usize,
+) -> Option<String> {
+    let mut content = Vec::new();
+    if agent_notes > 0 {
+        content.push(format!(
+            "{agent_notes} pending agent note{}",
+            if agent_notes == 1 { "" } else { "s" }
+        ));
+    }
+    if review_body {
+        content.push("the shared review body".to_string());
+    }
+    if inline_comments > 0 {
+        content.push(format!(
+            "{inline_comments} inline review comment{}",
+            if inline_comments == 1 { "" } else { "s" }
+        ));
+    }
+    let joined = match content.as_slice() {
+        [] => return None,
+        [one] => one.clone(),
+        [one, two] => format!("{one} and {two}"),
+        _ => {
+            let last = content.pop().expect("non-empty quit warning");
+            format!("{}, and {last}", content.join(", "))
+        }
+    };
+    Some(format!("Closing will discard {joined}."))
+}
+
+fn draw_quit_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
+    let width = (area.width * 3 / 4).clamp(44, 90).min(area.width);
+    let height = 7.min(area.height);
+    let popup = Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    };
+    let warning = quit_loss_summary(
+        app.agent_notes.len(),
+        app.review_draft_body.is_some(),
+        app.review_draft_comments.len(),
+    )
+    .unwrap_or_else(|| "The current review session will close.".into());
+    let lines = vec![
+        Line::from(Span::styled(warning, Style::default().fg(theme::TEXT))),
+        Line::default(),
+        Line::from(vec![
+            Span::styled(
+                "q / y",
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" quit  ·  ", Style::default().fg(theme::SUBTEXT0)),
+            Span::styled(
+                "any other key",
+                Style::default()
+                    .fg(theme::GREEN)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(" keep reviewing", Style::default().fg(theme::SUBTEXT0)),
+        ]),
+    ];
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(theme::RED))
+        .title(" Quit recto? ")
+        .title_style(Style::default().fg(theme::RED).add_modifier(Modifier::BOLD))
+        .padding(ratatui::widgets::Padding::uniform(1))
+        .style(Style::default().bg(theme::BASE));
+
+    frame.render_widget(Clear, popup);
+    frame.render_widget(
+        Paragraph::new(lines)
+            .block(block)
+            .wrap(Wrap { trim: false }),
+        popup,
+    );
+}
+
 /// The inline-comment composer. Sits at the bottom so it covers as little of
 /// the diff as possible: the draft is about a line you want to keep reading.
 /// Returns the column count the body was wrapped to, which key handling needs
@@ -4492,7 +4585,8 @@ const HELP_ROWS: &[HelpRow] = &[
     head("Other"),
     bind("e", "edit file at line in $EDITOR"),
     bind("?", "toggle this help"),
-    bind("q  esc", "quit / dismiss"),
+    bind("q", "confirm quit"),
+    bind("esc", "dismiss or step back"),
 ];
 
 /// Centered keybinding reference. Drawn over everything when `show_help` is on;
@@ -5566,6 +5660,21 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             link::Request::ReviewDraftBody { body }
                 if body == "## Summary\n\nLooks good."
         ));
+    }
+
+    #[test]
+    fn quit_warning_names_every_session_only_draft() {
+        assert_eq!(quit_loss_summary(0, false, 0), None);
+        assert_eq!(
+            quit_loss_summary(1, false, 0).as_deref(),
+            Some("Closing will discard 1 pending agent note.")
+        );
+        assert_eq!(
+            quit_loss_summary(2, true, 3).as_deref(),
+            Some(
+                "Closing will discard 2 pending agent notes, the shared review body, and 3 inline review comments."
+            )
+        );
     }
 
     #[test]
