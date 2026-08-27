@@ -5,19 +5,26 @@
 //! take over: textwrap (UAX #14 line breaking, display-width aware) decides
 //! where to break, and we split the styled spans at those offsets ourselves,
 //! prepending a continuation prefix that mirrors the gutter — blank
-//! line-number columns plus the row's own `▎` marker — so the color line
-//! runs unbroken down a wrapped row.
+//! line-number columns plus the row's own `▎` marker — followed by a dim `↪ `
+//! cue. The color line runs unbroken down a wrapped row while the cue makes it
+//! clear that the row is a visual continuation, not another diff line.
 
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use textwrap::core::display_width;
+
+use crate::theme;
 
 /// How many leading spans form the gutter on a body row, fixed by
 /// `diff_body_line`: old line number, new line number, marker, separator
 /// space. Rows with `line_info` set always have this shape.
 const GUTTER_SPANS: usize = 4;
+const CONTINUATION: &str = "↪ ";
+const CONTINUATION_WIDTH: usize = 2;
 
 /// Continuation prefix for a body row: the line-number columns blanked (width
-/// and style preserved), the marker and its trailing space carried as-is.
+/// and style preserved), the marker and its trailing space carried as-is,
+/// then a dim wrap cue and one column of breathing room.
 /// Returns an empty prefix for lines without the gutter shape. Build this from
 /// the pristine rendered line, not a search-highlighted clone — match
 /// highlighting re-splits spans and would break the positional assumption.
@@ -31,6 +38,7 @@ pub fn gutter_prefix(line: &Line<'static>) -> Vec<Span<'static>> {
         blank(&line.spans[1]),
         line.spans[2].clone(),
         line.spans[3].clone(),
+        Span::styled(CONTINUATION, Style::default().fg(theme::OVERLAY0)),
     ]
 }
 
@@ -86,7 +94,8 @@ pub fn row_count(line: &Line<'static>, width: u16, prefix_width: usize) -> usize
     break_ranges(&text, width, prefix_width).len().max(1)
 }
 
-/// Display width of a body row's gutter prefix without building the spans.
+/// Display width of a body row's gutter and continuation cue without building
+/// the spans.
 pub fn gutter_prefix_width(line: &Line<'static>) -> usize {
     if line.spans.len() < GUTTER_SPANS {
         return 0;
@@ -94,7 +103,8 @@ pub fn gutter_prefix_width(line: &Line<'static>) -> usize {
     line.spans[..GUTTER_SPANS]
         .iter()
         .map(|s| display_width(&s.content))
-        .sum()
+        .sum::<usize>()
+        + CONTINUATION_WIDTH
 }
 
 /// Byte ranges of `text` for each visual row: textwrap picks the break
@@ -190,7 +200,8 @@ mod tests {
         let rows = wrap_line(&line, 20, &gutter_prefix(&line));
         assert!(rows.len() > 1, "expected a wrap, got {rows:?}");
         // Every row fits, and every continuation starts with the blanked
-        // gutter and carries the marker in the same column.
+        // gutter, carries the marker in the same column, then shows the wrap
+        // cue before its content.
         for (i, row) in rows.iter().enumerate() {
             let text = row_text(row);
             assert!(display_width(&text) <= 20, "row {i} too wide: {text:?}");
@@ -200,6 +211,7 @@ mod tests {
                     "row {i} missing hanging gutter: {text:?}"
                 );
                 assert_eq!(row.spans[2].content, "▎");
+                assert_eq!(row.spans[4].content, CONTINUATION);
             }
         }
     }
@@ -209,7 +221,7 @@ mod tests {
         let line = body_line("first second third fourth fifth sixth");
         let rows = wrap_line(&line, 18, &gutter_prefix(&line));
         for row in &rows[1..] {
-            let body: String = row.spans[4..].iter().map(|s| s.content.as_ref()).collect();
+            let body: String = row.spans[5..].iter().map(|s| s.content.as_ref()).collect();
             assert!(!body.is_empty());
             assert_eq!(
                 row.spans.last().unwrap().style,
