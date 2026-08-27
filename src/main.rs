@@ -875,7 +875,7 @@ impl App {
             file_stats: loaded.file_stats,
             scroll: 0,
             h_scroll: 0,
-            wrap: false,
+            wrap: true,
             display_rows,
             diff_viewport: 0,
             // Overwritten below once resolve_panes settles which panes are up.
@@ -5300,6 +5300,16 @@ mod tests {
         assert_eq!(backend.loads.load(Ordering::SeqCst), 3);
         assert!(!app.reload_pending);
         assert!(app.load_error.is_none());
+    }
+
+    #[test]
+    fn reader_wraps_by_default_and_toggle_unwraps() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, false).unwrap();
+
+        assert!(app.wrap);
+        app.toggle_wrap();
+        assert!(!app.wrap);
     }
 
     #[test]
