@@ -160,11 +160,6 @@ struct Cli {
     #[arg(long, value_name = "REVSET")]
     base: Option<String>,
 
-    /// PR review mode: start with the merge-base against trunk, so the diff
-    /// shows what's on this branch and nothing upstream. Overridden by --base.
-    #[arg(long)]
-    pr: bool,
-
     /// Run as if started from this directory. Matches jj's `-R`.
     #[arg(short = 'R', long, value_name = "PATH")]
     repository: Option<std::path::PathBuf>,
@@ -827,12 +822,7 @@ struct App {
 }
 
 impl App {
-    fn load(
-        backend: Arc<dyn Backend>,
-        hl: Highlighter,
-        initial: Option<String>,
-        pr: bool,
-    ) -> Result<Self> {
+    fn load(backend: Arc<dyn Backend>, hl: Highlighter, initial: Option<String>) -> Result<Self> {
         let mut bases = backend.default_bases();
         let base_idx = if let Some(r) = initial {
             if let Some(i) = bases.iter().position(|b| backend.base_label(b) == r) {
@@ -841,11 +831,6 @@ impl App {
                 bases.insert(0, Base::Revision(r));
                 0
             }
-        } else if pr {
-            bases
-                .iter()
-                .position(|b| matches!(b, Base::MergeBase { .. }))
-                .ok_or_else(|| anyhow!("--pr: no merge-base configured for this backend"))?
         } else {
             0
         };
@@ -2725,7 +2710,7 @@ fn main() -> Result<()> {
         std::process::exit(2);
     });
     let hl = Highlighter::new();
-    let mut app = App::load(backend, hl, cli.base, cli.pr).unwrap_or_else(|e| {
+    let mut app = App::load(backend, hl, cli.base).unwrap_or_else(|e| {
         eprintln!("recto: {e}");
         std::process::exit(2);
     });
@@ -5541,7 +5526,7 @@ mod tests {
     #[test]
     fn filesystem_change_during_load_gets_a_followup_load() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend.clone(), Highlighter::new(), None, false).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None).unwrap();
 
         app.request_current_scope();
         assert!(!app.request_reload());
@@ -5556,7 +5541,7 @@ mod tests {
     #[test]
     fn reader_wraps_by_default_and_toggle_unwraps() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend, Highlighter::new(), None, false).unwrap();
+        let mut app = App::load(backend, Highlighter::new(), None).unwrap();
 
         assert!(app.wrap);
         app.toggle_wrap();
@@ -5566,7 +5551,7 @@ mod tests {
     #[test]
     fn background_load_failure_stays_visible() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend.clone(), Highlighter::new(), None, false).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None).unwrap();
         backend.fail.store(true, Ordering::SeqCst);
 
         app.request_current_scope();
