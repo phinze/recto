@@ -4,10 +4,11 @@
 //! and dropping the marker/bar color column on every wrapped row. Here we
 //! take over: textwrap (UAX #14 line breaking, display-width aware) decides
 //! where to break, and we split the styled spans at those offsets ourselves,
-//! prepending a continuation prefix that mirrors the gutter — blank
-//! line-number columns plus the row's own `▎` marker — followed by a dim `↪ `
-//! cue. The color line runs unbroken down a wrapped row while the cue makes it
-//! clear that the row is a visual continuation, not another diff line.
+//! prepending a continuation prefix that mirrors the source row — blank
+//! line-number columns plus a diff row's `▎` marker, or a note row's `│`
+//! connector and blank badge — followed by a dim `↪ ` cue. The color line runs
+//! unbroken down a wrapped row while the cue makes it clear that the row is a
+//! visual continuation, not another source row.
 
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
@@ -19,6 +20,7 @@ use crate::theme;
 /// `diff_body_line`: old line number, new line number, marker, separator
 /// space. Rows with `line_info` set always have this shape.
 const GUTTER_SPANS: usize = 4;
+const NOTE_SPANS: usize = 3;
 const CONTINUATION: &str = "↪ ";
 const CONTINUATION_WIDTH: usize = 2;
 
@@ -38,6 +40,24 @@ pub fn gutter_prefix(line: &Line<'static>) -> Vec<Span<'static>> {
         blank(&line.spans[1]),
         line.spans[2].clone(),
         line.spans[3].clone(),
+        Span::styled(CONTINUATION, Style::default().fg(theme::OVERLAY0)),
+    ]
+}
+
+/// Continuation prefix for woven tour/review note rows. Their first three
+/// spans are the box rule, badge, and the leading space before the body. Carry
+/// the vertical rule, blank the badge, and put the same wrap cue at the body's
+/// original start so prose hangs beneath itself instead of flowing to column 0.
+pub fn note_prefix(line: &Line<'static>) -> Vec<Span<'static>> {
+    if line.spans.len() < NOTE_SPANS || !matches!(line.spans[0].content.as_ref(), " ╭─ " | " │  ")
+    {
+        return Vec::new();
+    }
+    let blank = |s: &Span<'static>| Span::styled(" ".repeat(display_width(&s.content)), s.style);
+    vec![
+        Span::styled(" │  ", line.spans[0].style),
+        blank(&line.spans[1]),
+        Span::styled(" ", line.spans[2].style),
         Span::styled(CONTINUATION, Style::default().fg(theme::OVERLAY0)),
     ]
 }
@@ -105,6 +125,14 @@ pub fn gutter_prefix_width(line: &Line<'static>) -> usize {
         .map(|s| display_width(&s.content))
         .sum::<usize>()
         + CONTINUATION_WIDTH
+}
+
+/// Display width of a woven note row's continuation prefix.
+pub fn note_prefix_width(line: &Line<'static>) -> usize {
+    note_prefix(line)
+        .iter()
+        .map(|s| display_width(&s.content))
+        .sum()
 }
 
 /// Byte ranges of `text` for each visual row: textwrap picks the break
@@ -182,6 +210,14 @@ mod tests {
         ])
     }
 
+    fn note_line(content: &str) -> Line<'static> {
+        Line::from(vec![
+            Span::styled(" ╭─ ", Style::default().fg(Color::DarkGray)),
+            Span::styled("①", Style::default().fg(Color::Magenta)),
+            Span::styled(format!(" {content}"), Style::default().fg(Color::White)),
+        ])
+    }
+
     fn row_text(line: &Line<'_>) -> String {
         line.spans.iter().map(|s| s.content.as_ref()).collect()
     }
@@ -214,6 +250,28 @@ mod tests {
                 assert_eq!(row.spans[4].content, CONTINUATION);
             }
         }
+    }
+
+    #[test]
+    fn note_continuations_keep_the_rule_cue_and_final_character() {
+        let line = note_line("alpha beta gamma delta epsilon!");
+        let prefix = note_prefix(&line);
+        let rows = wrap_line(&line, 18, &prefix);
+
+        assert!(rows.len() > 1, "expected a wrap, got {rows:?}");
+        for (i, row) in rows.iter().enumerate() {
+            let text = row_text(row);
+            assert!(display_width(&text) <= 18, "row {i} too wide: {text:?}");
+            if i > 0 {
+                assert!(text.starts_with(" │  "), "row {i} lost note rule: {text:?}");
+                assert_eq!(row.spans[3].content, CONTINUATION);
+            }
+        }
+        assert!(
+            row_text(rows.last().unwrap()).ends_with("epsilon!"),
+            "last character was clipped: {rows:?}"
+        );
+        assert_eq!(row_count(&line, 18, note_prefix_width(&line)), rows.len());
     }
 
     #[test]

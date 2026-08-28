@@ -672,7 +672,7 @@ impl DisplayRowIndex {
             let prefix_width = if line_info.get(idx).copied().flatten().is_some() {
                 wrap::gutter_prefix_width(line)
             } else {
-                0
+                wrap::note_prefix_width(line)
             };
             let rows = if width == 0 {
                 1
@@ -5046,7 +5046,7 @@ fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             let prefix = if app.line_info.get(line_idx).copied().flatten().is_some() {
                 wrap::gutter_prefix(line)
             } else {
-                Vec::new()
+                wrap::note_prefix(line)
             };
             wrap::wrap_line(&styled, content_area.width, &prefix)
         } else {
@@ -5786,6 +5786,16 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert_eq!(index.line_at_row(1), Some((1, 0)));
         assert_eq!(index.line_at_row(3), Some((1, 2)));
         assert_eq!(index.line_at_row(4), Some((2, 0)));
+    }
+
+    #[test]
+    fn display_row_index_counts_note_continuations() {
+        let line = note_line(1, "alpha beta gamma delta epsilon!");
+        let expected = wrap::wrap_line(&line, 18, &wrap::note_prefix(&line)).len();
+        let index = DisplayRowIndex::build(&[line], &[None], 18);
+
+        assert!(expected > 1);
+        assert_eq!(index.total_rows(), expected);
     }
 
     #[test]
