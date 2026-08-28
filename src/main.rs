@@ -2690,15 +2690,15 @@ fn main() -> Result<()> {
     let _ = color_eyre::install();
     let cli = Cli::parse();
 
-    if let Some(command) = cli.command {
-        std::process::exit(run_client(command));
-    }
-
     if let Some(path) = &cli.repository {
         std::env::set_current_dir(path).unwrap_or_else(|e| {
             eprintln!("recto: -R {}: {e}", path.display());
             std::process::exit(2);
         });
+    }
+
+    if let Some(command) = cli.command {
+        std::process::exit(run_client(command));
     }
 
     let backend = detect_backend().unwrap_or_else(|e| {
