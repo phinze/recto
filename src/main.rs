@@ -165,6 +165,40 @@ struct Cli {
     repository: Option<std::path::PathBuf>,
 }
 
+#[derive(serde::Deserialize)]
+struct RigInfo {
+    schema_version: u32,
+    review_pr: Option<String>,
+}
+
+/// Ask Rig for the current repository's public context. A missing binary or a
+/// non-rig cwd is the ordinary standalone case and returns no PR. Successful
+/// output is a versioned API, so malformed JSON is worth surfacing instead of
+/// silently treating a broken integration as "not a review".
+fn review_pr_from_rig(repo_root: &Path) -> Result<Option<String>> {
+    let output = match Command::new("rig")
+        .args(["info", "--format=json"])
+        .current_dir(repo_root)
+        .output()
+    {
+        Ok(output) => output,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(anyhow!("could not ask rig for review context: {error}")),
+    };
+    if !output.status.success() {
+        return Ok(None);
+    }
+    let info: RigInfo = serde_json::from_slice(&output.stdout)
+        .map_err(|error| anyhow!("rig info returned invalid JSON: {error}"))?;
+    if info.schema_version != 1 {
+        return Err(anyhow!(
+            "rig info schema {} is not supported",
+            info.schema_version
+        ));
+    }
+    Ok(info.review_pr)
+}
+
 /// Subcommands that talk to an already-running recto over its workspace socket.
 #[derive(Subcommand, Debug)]
 enum ClientCommand {
@@ -182,8 +216,8 @@ enum ClientCommand {
     Clear,
     /// Check that a recto is listening for this workspace.
     Ping,
-    /// Fetch and open a GitHub PR in the running recto. LOCATOR is a full PR
-    /// URL or `OWNER/REPO#NUMBER`.
+    /// Fetch and open a GitHub PR in the running recto, selecting its exact
+    /// base. LOCATOR is a full PR URL or `OWNER/REPO#NUMBER`.
     Pr { locator: String },
     /// Leave a private note for the local agent. SPEC is
     /// `path:LINE=body` or `path:START-END=body`. Notes accumulate; run
@@ -1909,25 +1943,7 @@ impl App {
         match request {
             link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::AttachPr { pull_request } => {
-                let pull_request = *pull_request;
-                if (self.review_draft_body.is_some() || !self.review_draft_comments.is_empty())
-                    && self.pull_request.as_ref().is_some_and(|current| {
-                        current.repository != pull_request.repository
-                            || current.number != pull_request.number
-                            || current.head_oid != pull_request.head_oid
-                    })
-                {
-                    return link::Response::err(
-                        "another PR or head has shared review drafts; delete them before switching",
-                    );
-                }
-                let label = format!("{}#{}", pull_request.repository, pull_request.number);
-                self.pull_request = Some(pull_request);
-                self.pr_scroll = 0;
-                self.active_thread = None;
-                self.page = Page::PullRequest;
-                self.reweave();
-                link::Response::ok_note(format!("opened {label}"))
+                self.attach_pull_request(*pull_request, true)
             }
             link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
             link::Request::Annotate { sites } => self.annotate(sites),
@@ -1971,6 +1987,46 @@ impl App {
                 }
             },
         }
+    }
+
+    /// Attach a public PR snapshot and, for a live client request, move the
+    /// diff to GitHub's exact base branch. Startup review-rig restoration has
+    /// already loaded that base, so it skips the second load while sharing all
+    /// of the draft-safety and presentation behavior here.
+    fn attach_pull_request(
+        &mut self,
+        pull_request: link::PullRequest,
+        select_base: bool,
+    ) -> link::Response {
+        if (self.review_draft_body.is_some() || !self.review_draft_comments.is_empty())
+            && self.pull_request.as_ref().is_some_and(|current| {
+                current.repository != pull_request.repository
+                    || current.number != pull_request.number
+                    || current.head_oid != pull_request.head_oid
+            })
+        {
+            return link::Response::err(
+                "another PR or head has shared review drafts; delete them before switching",
+            );
+        }
+
+        let base = pull_request.base_ref.clone();
+        let base_changed = self.backend.base_label(self.base()) != base;
+        let label = format!("{}#{}", pull_request.repository, pull_request.number);
+        self.pull_request = Some(pull_request);
+        self.pr_scroll = 0;
+        self.active_thread = None;
+        self.page = Page::PullRequest;
+        if select_base && base_changed {
+            // A tour resolved against the old range must not survive onto a
+            // different PR diff. Authored notes remain anchored and visible
+            // if their spans still exist after the reload.
+            self.focus_span = None;
+            self.annotations.clear();
+            self.select_base(Base::Revision(base));
+        }
+        self.reweave();
+        link::Response::ok_note(format!("opened {label}"))
     }
 
     /// Resolve a companion `focus` request against the current diff: scroll the
@@ -2709,11 +2765,39 @@ fn main() -> Result<()> {
         eprintln!("recto: repository root {}: {e}", backend.root().display());
         std::process::exit(2);
     });
+
+    let mut startup_notice = None;
+    let pull_request = match review_pr_from_rig(backend.root()) {
+        Ok(Some(locator)) => match github::fetch_pull_request(&locator) {
+            Ok(pull_request) => Some(pull_request),
+            Err(error) => {
+                startup_notice = Some(format!("could not restore rig review {locator}: {error}"));
+                None
+            }
+        },
+        Ok(None) => None,
+        Err(error) => {
+            startup_notice = Some(error.to_string());
+            None
+        }
+    };
+    // An explicit base remains an escape hatch. Otherwise a review rig starts
+    // from GitHub's exact base instead of Recto's ordinary trunk branch point.
+    let initial_base = cli
+        .base
+        .or_else(|| pull_request.as_ref().map(|pr| pr.base_ref.clone()));
     let hl = Highlighter::new();
-    let mut app = App::load(backend, hl, cli.base).unwrap_or_else(|e| {
+    let mut app = App::load(backend, hl, initial_base).unwrap_or_else(|e| {
         eprintln!("recto: {e}");
         std::process::exit(2);
     });
+    if let Some(pull_request) = pull_request {
+        let response = app.attach_pull_request(pull_request, false);
+        debug_assert!(response.ok);
+    }
+    if startup_notice.is_some() {
+        app.load_error = startup_notice;
+    }
 
     let mut terminal = init_terminal()?;
     let result = run(&mut terminal, &mut app);
@@ -5429,12 +5513,15 @@ mod tests {
             "test"
         }
 
-        fn base_label(&self, _base: &Base) -> String {
-            "base".into()
+        fn base_label(&self, base: &Base) -> String {
+            match base {
+                Base::Revision(revision) => revision.clone(),
+                Base::MergeBase { against } => format!("merge({})", self.base_label(against)),
+            }
         }
 
-        fn base_display(&self, _base: &Base) -> String {
-            "base".into()
+        fn base_display(&self, base: &Base) -> String {
+            self.base_label(base)
         }
 
         fn list_changes(&self, _scope: &Scope, _ignore_ws: bool) -> Result<Vec<FileChange>> {
@@ -5477,6 +5564,26 @@ mod tests {
             app.poll_load();
             assert!(Instant::now() < deadline, "loader did not settle");
             std::thread::yield_now();
+        }
+    }
+
+    fn empty_pull_request(base_ref: &str) -> link::PullRequest {
+        link::PullRequest {
+            repository: "owner/repo".into(),
+            number: 42,
+            title: "Review me".into(),
+            body: String::new(),
+            author: link::Actor {
+                login: "author".into(),
+                name: None,
+            },
+            base_ref: base_ref.into(),
+            head_ref: "feature".into(),
+            head_oid: "abc123".into(),
+            url: "https://github.com/owner/repo/pull/42".into(),
+            conversation: Vec::new(),
+            reviews: Vec::new(),
+            threads: Vec::new(),
         }
     }
 
@@ -5558,6 +5665,40 @@ mod tests {
         settle_load(&mut app);
 
         assert_eq!(app.load_error.as_deref(), Some("synthetic load failure"));
+    }
+
+    #[test]
+    fn rig_info_review_locator_is_a_narrow_json_contract() {
+        let info: RigInfo = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "id": "pr-42",
+                "kind": "review",
+                "repo": "repo",
+                "repository": "owner/repo",
+                "review_pr": "https://github.com/owner/repo/pull/42"
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            info.review_pr.as_deref(),
+            Some("https://github.com/owner/repo/pull/42")
+        );
+        assert_eq!(info.schema_version, 1);
+    }
+
+    #[test]
+    fn attaching_pull_request_selects_its_exact_base() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None).unwrap();
+        let response = app.handle_request(link::Request::AttachPr {
+            pull_request: Box::new(empty_pull_request("stack-base")),
+        });
+
+        assert!(response.ok);
+        assert_eq!(app.base(), &Base::Revision("stack-base".into()));
+        assert!(matches!(app.page, Page::PullRequest));
+        assert!(app.loading.is_some());
     }
 
     const GO_SAMPLE: &str = r#"package x

@@ -59,13 +59,15 @@ post-change file, the ones you'd see in your editor after the edit.
 Annotate SPECs are `PATH:LINE=label` or `PATH:START-END=label`. Argument
 order sets the step numbers, and each call replaces the whole set.
 
-`recto pr` is an explicit network boundary. The client fetches the PR through
-`gh`, then attaches a read-only snapshot to the running TUI; recto startup
-stays offline. A full `https://github.com/OWNER/REPO/pull/NUMBER` URL works too.
-The PR overview opens immediately with its description, timeline, and inline
-review threads. The user toggles between it and the diff with `p`, moves among
-public threads with `t` / `T`, and presses `enter` on an anchored thread in the
-diff to open its full conversation.
+`recto pr` fetches the PR through `gh`, attaches a read-only snapshot, and
+switches the diff to GitHub's exact base branch. A full
+`https://github.com/OWNER/REPO/pull/NUMBER` URL works too. In a Rig review
+workspace, Recto asks `rig info --format=json` for the current repository's PR
+and performs the same attachment automatically on startup. Other Recto
+startups stay offline. The PR overview opens immediately with its description,
+timeline, and inline review threads. The user toggles between it and the diff
+with `p`, moves among public threads with `t` / `T`, and presses `enter` on an
+anchored thread in the diff to open its full conversation.
 
 Tour stops, published threads, shared review drafts, and private agent notes
 also appear as typed child rows beneath their changed file in the file pane.

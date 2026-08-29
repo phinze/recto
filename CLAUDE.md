@@ -41,7 +41,10 @@ The editor handoff and workspace socket make Recto a shared review surface for
 the user and a companion agent. Either side can focus code, the agent can lay
 down an annotated tour, and the user can leave private agent notes or co-author
 a durable local GitHub review draft. Public PR descriptions and conversations
-can be attached as read-only context.
+can be attached as read-only context. Inside a Rig review workspace, Recto asks
+Rig's versioned JSON API for that repository's PR and restores the context
+automatically. Rig owns review identity and manifest storage; Recto only
+understands the public API field.
 
 ## Stack
 
