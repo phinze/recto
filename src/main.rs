@@ -6,6 +6,7 @@ mod graph;
 mod highlight;
 mod link;
 mod markdown;
+mod state;
 mod theme;
 mod watch;
 mod wrap;
@@ -59,6 +60,7 @@ use crate::highlight::{Highlighter, ext_for_path};
 const SCROLLOFF: u16 = 3;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
+const STATE_DEBOUNCE: Duration = Duration::from_millis(150);
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_MS: u128 = 80;
@@ -168,6 +170,11 @@ struct Cli {
 #[derive(serde::Deserialize)]
 struct RigInfo {
     schema_version: u32,
+    #[serde(default)]
+    root: Option<std::path::PathBuf>,
+    #[serde(default)]
+    repo: Option<String>,
+    #[serde(default)]
     review_pr: Option<String>,
 }
 
@@ -175,7 +182,7 @@ struct RigInfo {
 /// non-rig cwd is the ordinary standalone case and returns no PR. Successful
 /// output is a versioned API, so malformed JSON is worth surfacing instead of
 /// silently treating a broken integration as "not a review".
-fn review_pr_from_rig(repo_root: &Path) -> Result<Option<String>> {
+fn info_from_rig(repo_root: &Path) -> Result<Option<RigInfo>> {
     let output = match Command::new("rig")
         .args(["info", "--format=json"])
         .current_dir(repo_root)
@@ -196,7 +203,7 @@ fn review_pr_from_rig(repo_root: &Path) -> Result<Option<String>> {
             info.schema_version
         ));
     }
-    Ok(info.review_pr)
+    Ok(Some(info))
 }
 
 /// Subcommands that talk to an already-running recto over its workspace socket.
@@ -224,12 +231,15 @@ enum ClientCommand {
     /// this once per note.
     #[command(alias = "comment")]
     Note { spec: String },
-    /// Drain the pending agent notes as agent-ready markdown, clearing
-    /// them from the running recto.
+    /// Read pending agent notes as agent-ready markdown. After acting, pass
+    /// their stable ids with --ack to remove only those notes.
     #[command(alias = "comments")]
-    Notes,
-    /// Show the session-durable local review draft as JSON. Unlike `notes`, this is a
-    /// non-consuming read and may be called throughout co-authoring.
+    Notes {
+        #[arg(long, num_args = 1..)]
+        ack: Vec<u64>,
+    },
+    /// Show the local review draft as JSON. This is a non-consuming read and
+    /// may be called throughout co-authoring.
     Review,
     /// Add, revise, or delete the shared top-level review body. An empty BODY
     /// deletes the draft.
@@ -450,16 +460,16 @@ enum Mode {
     QuitConfirm,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum ComposerKind {
     AgentNote,
     ReviewComment,
     ReviewBody,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 enum ComposerEdit {
-    AgentNote(usize),
+    AgentNote(u64),
     ReviewComment(u64),
     ReviewBody,
 }
@@ -467,7 +477,7 @@ enum ComposerEdit {
 /// A private agent note being written. The anchor is captured when the modal opens rather
 /// than read at submit time, so a diff reload mid-sentence can't move the note
 /// to a different line than the one the reviewer was looking at.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct NoteDraft {
     kind: ComposerKind,
     anchor: Option<(String, u32)>,
@@ -475,10 +485,11 @@ struct NoteDraft {
     /// Caret position as a character index into `body`.
     caret: usize,
     /// Why the last submit bounced, shown in the modal so the text isn't lost.
+    #[serde(default, skip)]
     error: Option<String>,
-    /// Stable target when re-opening existing content. Public drafts use their
-    /// id rather than a vector index so an agent-side update while the composer
-    /// is open cannot make the user's save land on a different comment.
+    /// Stable target when re-opening existing content. Both channels use ids
+    /// rather than vector positions, so a companion-side update while the
+    /// composer is open cannot make the save land on a different item.
     editing: Option<ComposerEdit>,
 }
 
@@ -680,9 +691,10 @@ struct Annotation {
 
 /// A reviewer-authored note waiting to be handed to an agent. Anchored the same
 /// way an [`Annotation`] is, but it flows the other direction: the agent writes
-/// annotations for us to read, we write these for the agent to drain.
-#[derive(Clone, Debug, PartialEq, Eq)]
+/// annotations for us to read, we write these for the agent to acknowledge.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct AgentNote {
+    id: u64,
     path: String,
     start: u32,
     end: u32,
@@ -814,19 +826,24 @@ struct App {
     /// Companion-driven tour annotations, in step order. Sticky like
     /// `focus_span`; replaced wholesale by each `annotate` request.
     annotations: Vec<Annotation>,
-    /// Private agent notes awaiting a drain, in authoring order. Deliberately not
+    /// Private agent notes awaiting acknowledgement, in authoring order. Deliberately not
     /// on any clear path: `clear`, Esc and `q` all drop the agent's tour, and
     /// sweeping up our own undelivered notes alongside it would be data loss.
-    /// Draining is the only thing that empties this.
+    /// Explicit acknowledgement is the only thing that empties this.
     agent_notes: Vec<AgentNote>,
+    next_agent_note_id: u64,
     /// Durable public review comments shared with the companion agent. These
     /// are local draft content, distinct from both published PR threads and
-    /// drain-on-read private notes.
+    /// private agent notes.
     review_draft_comments: Vec<link::DraftReviewComment>,
     /// Optional top-level body for the same shared review draft. Unlike inline
     /// comments it has no file anchor and is authored from the PR overview.
     review_draft_body: Option<link::DraftReviewBody>,
     next_review_draft_id: u64,
+    /// Rig-scoped durable state. Standalone Recto deliberately remains
+    /// in-memory; Rig supplies both the storage root and its cleanup lifecycle.
+    persistence: Option<state::Store>,
+    persistence_due: Option<Instant>,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
     /// Distinct from `focus_span` (agent-driven): this is the local "I clicked
     /// here, `e` goes here" marker. Cleared on reload since the index is
@@ -856,7 +873,12 @@ struct App {
 }
 
 impl App {
-    fn load(backend: Arc<dyn Backend>, hl: Highlighter, initial: Option<String>) -> Result<Self> {
+    fn load(
+        backend: Arc<dyn Backend>,
+        hl: Highlighter,
+        initial: Option<String>,
+        persistence: Option<state::Store>,
+    ) -> Result<Self> {
         let mut bases = backend.default_bases();
         let base_idx = if let Some(r) = initial {
             if let Some(i) = bases.iter().position(|b| backend.base_label(b) == r) {
@@ -882,6 +904,13 @@ impl App {
         let rendered_review_objects = vec![None; loaded.rendered.len()];
         let mut file_state = ListState::default();
         file_state.select(first_file_row(&file_rows));
+        let (agent_notes, next_agent_note_id, restored_note_composer) = persistence
+            .as_ref()
+            .map(|store| {
+                let (notes, next_id, composer) = store.notes();
+                (notes.to_vec(), next_id, composer.cloned())
+            })
+            .unwrap_or_else(|| (Vec::new(), 1, None));
         let mut app = Self {
             worker,
             backend,
@@ -891,7 +920,7 @@ impl App {
             fixed_bases,
             revs,
             cursor: Cursor::All,
-            mode: Mode::Normal,
+            mode: restored_note_composer.map_or(Mode::Normal, Mode::NoteInput),
             page: Page::Diff,
             pull_request: None,
             pr_scroll: 0,
@@ -933,10 +962,13 @@ impl App {
             search_active_idx: None,
             focus_span: None,
             annotations: Vec::new(),
-            agent_notes: Vec::new(),
+            agent_notes,
+            next_agent_note_id,
             review_draft_comments: Vec::new(),
             review_draft_body: None,
             next_review_draft_id: 1,
+            persistence,
+            persistence_due: None,
             diff_cursor: None,
             last_review_click: None,
             show_files: false,
@@ -954,6 +986,9 @@ impl App {
         } else {
             Focus::Diff
         };
+        if !app.agent_notes.is_empty() {
+            app.reweave();
+        }
         Ok(app)
     }
 
@@ -1808,7 +1843,7 @@ impl App {
                     caret: body.chars().count(),
                     body,
                     error: None,
-                    editing: Some(ComposerEdit::AgentNote(i)),
+                    editing: Some(ComposerEdit::AgentNote(note.id)),
                 });
             }
         }
@@ -1938,6 +1973,65 @@ impl App {
         }
     }
 
+    fn pull_request_ref(&self) -> Option<link::PullRequestRef> {
+        self.pull_request.as_ref().map(|pr| link::PullRequestRef {
+            repository: pr.repository.clone(),
+            number: pr.number,
+            head_oid: pr.head_oid.clone(),
+        })
+    }
+
+    fn persist_soon(&mut self) {
+        if self.persistence.is_some() {
+            self.persistence_due = Some(Instant::now() + STATE_DEBOUNCE);
+        }
+    }
+
+    fn persist_now(&mut self) -> Result<()> {
+        self.persistence_due = None;
+        let Some(_) = &self.persistence else {
+            return Ok(());
+        };
+        let pull_request = self.pull_request_ref();
+        let (note_composer, review_composer) = match &self.mode {
+            Mode::NoteInput(draft) if draft.kind == ComposerKind::AgentNote => {
+                (Some(Some(draft.clone())), None)
+            }
+            Mode::NoteInput(draft) => (None, Some(Some(draft.clone()))),
+            _ => (Some(None), Some(None)),
+        };
+        let store = self.persistence.as_mut().expect("checked above");
+        store.set_notes(&self.agent_notes, self.next_agent_note_id);
+        if let Some(composer) = note_composer {
+            store.set_note_composer(composer.as_ref());
+        }
+        if let Some(pull_request) = pull_request {
+            store.set_review(
+                pull_request.clone(),
+                self.review_draft_body.as_ref(),
+                &self.review_draft_comments,
+                self.next_review_draft_id,
+            );
+            if let Some(composer) = review_composer {
+                store.set_review_composer(&pull_request, composer.as_ref());
+            }
+        }
+        store.save()
+    }
+
+    fn poll_persistence(&mut self) -> bool {
+        let due = self
+            .persistence_due
+            .is_some_and(|deadline| Instant::now() >= deadline);
+        if !due {
+            return false;
+        }
+        if let Err(error) = self.persist_now() {
+            self.load_error = Some(format!("could not autosave review state: {error}"));
+        }
+        true
+    }
+
     /// Handle a command from a companion session.
     fn handle_request(&mut self, request: link::Request) -> link::Response {
         match request {
@@ -1964,7 +2058,9 @@ impl App {
                 end,
                 body,
             } => self.add_agent_note(&path, start, end, body),
-            link::Request::AgentNotes => self.drain_agent_notes(),
+            link::Request::AgentNotes => self.drain_agent_notes_legacy(),
+            link::Request::ReadAgentNotes => self.agent_notes_response(),
+            link::Request::AcknowledgeAgentNotes { ids } => self.acknowledge_agent_notes(&ids),
             link::Request::ReviewDraft => self.review_draft_response(),
             link::Request::ReviewDraftBody { body } => {
                 self.set_review_draft_body(body, link::DraftEditor::Agent)
@@ -1998,6 +2094,14 @@ impl App {
         pull_request: link::PullRequest,
         select_base: bool,
     ) -> link::Response {
+        let incoming_ref = link::PullRequestRef {
+            repository: pull_request.repository.clone(),
+            number: pull_request.number,
+            head_oid: pull_request.head_oid.clone(),
+        };
+        let same_review = self
+            .pull_request_ref()
+            .is_some_and(|current| current == incoming_ref);
         if (self.review_draft_body.is_some() || !self.review_draft_comments.is_empty())
             && self.pull_request.as_ref().is_some_and(|current| {
                 current.repository != pull_request.repository
@@ -2008,6 +2112,34 @@ impl App {
             return link::Response::err(
                 "another PR or head has shared review drafts; delete them before switching",
             );
+        }
+        if !same_review
+            && matches!(self.mode, Mode::NoteInput(ref draft) if draft.kind != ComposerKind::AgentNote)
+        {
+            return link::Response::err(
+                "finish or cancel the in-progress review editor before switching PRs",
+            );
+        }
+
+        if !same_review {
+            let restored = self
+                .persistence
+                .as_ref()
+                .and_then(|store| store.review(&incoming_ref));
+            if let Some(restored) = restored {
+                self.review_draft_body = restored.body;
+                self.review_draft_comments = restored.comments;
+                self.next_review_draft_id = restored.next_id;
+                if !matches!(self.mode, Mode::NoteInput(ref draft) if draft.kind == ComposerKind::AgentNote)
+                    && let Some(composer) = restored.composer
+                {
+                    self.mode = Mode::NoteInput(composer);
+                }
+            } else {
+                self.review_draft_body = None;
+                self.review_draft_comments.clear();
+                self.next_review_draft_id = 1;
+            }
         }
 
         let base = pull_request.base_ref.clone();
@@ -2298,12 +2430,16 @@ impl App {
                 "{path}:{start}-{end} not in current diff (outside any shown hunk)"
             ));
         }
+        let id = self.next_agent_note_id;
+        self.next_agent_note_id += 1;
         self.agent_notes.push(AgentNote {
+            id,
             path: path.to_string(),
             start,
             end,
             body,
         });
+        self.persist_soon();
         self.reweave();
         if let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end) {
             self.reveal_span(&rows);
@@ -2322,38 +2458,64 @@ impl App {
     /// Replace a pending comment's body, or drop it entirely when the reviewer
     /// submits an empty one. Deleting through the same gesture that edits keeps
     /// Esc unambiguously "cancel", so nothing discards a note by accident.
-    fn revise_agent_note(&mut self, idx: usize, body: String) -> link::Response {
-        if idx >= self.agent_notes.len() {
+    fn revise_agent_note(&mut self, id: u64, body: String) -> link::Response {
+        let Some(idx) = self.agent_notes.iter().position(|note| note.id == id) else {
             return link::Response::err("that note is no longer pending");
-        }
+        };
         let body = body.trim().to_string();
         if body.is_empty() {
             self.agent_notes.remove(idx);
         } else {
             self.agent_notes[idx].body = body;
         }
+        self.persist_soon();
         self.reweave();
         link::Response::ok()
     }
 
-    /// Hand over every pending comment and clear the set. Clear-on-read is the
-    /// whole contract: delivered means gone, so the reviewer never wonders
-    /// whether a note was picked up, and the agent never re-reads stale notes.
-    fn drain_agent_notes(&mut self) -> link::Response {
-        let drained: Vec<link::AgentNote> = std::mem::take(&mut self.agent_notes)
-            .into_iter()
+    /// Hand over every pending note without consuming it. Stable ids let the
+    /// companion acknowledge exactly what it finished after the response is
+    /// safely in hand, without racing a newer note that arrived meanwhile.
+    fn agent_notes_response(&self) -> link::Response {
+        let notes: Vec<link::AgentNote> = self
+            .agent_notes
+            .iter()
             .enumerate()
             .map(|(i, c)| link::AgentNote {
+                id: c.id,
                 n: i + 1,
                 snippet: self.snippet_for(&c.path, c.start, c.end),
-                path: c.path,
+                path: c.path.clone(),
                 start: c.start,
                 end: c.end,
-                body: c.body,
+                body: c.body.clone(),
             })
             .collect();
-        self.reweave();
-        link::Response::ok_agent_notes(drained)
+        link::Response::ok_agent_notes(notes)
+    }
+
+    /// Preserve the original wire contract for an older `recto notes` client.
+    /// New clients use `ReadAgentNotes` plus acknowledgement and never enter
+    /// this response-loss window.
+    fn drain_agent_notes_legacy(&mut self) -> link::Response {
+        let response = self.agent_notes_response();
+        if !self.agent_notes.is_empty() {
+            self.agent_notes.clear();
+            self.persist_soon();
+            self.reweave();
+        }
+        response
+    }
+
+    fn acknowledge_agent_notes(&mut self, ids: &[u64]) -> link::Response {
+        let before = self.agent_notes.len();
+        self.agent_notes.retain(|note| !ids.contains(&note.id));
+        let removed = before - self.agent_notes.len();
+        if removed > 0 {
+            self.persist_soon();
+            self.reweave();
+        }
+        link::Response::ok_note(format!("acknowledged {removed} agent note(s)"))
     }
 
     fn review_draft_response(&self) -> link::Response {
@@ -2382,6 +2544,7 @@ impl App {
         let body = body.trim().to_string();
         self.review_draft_body =
             (!body.is_empty()).then_some(link::DraftReviewBody { body, last_editor });
+        self.persist_soon();
         self.review_draft_response()
     }
 
@@ -2419,6 +2582,7 @@ impl App {
             body,
             last_editor,
         });
+        self.persist_soon();
         self.reweave();
         if let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end) {
             self.reveal_span(&rows);
@@ -2455,6 +2619,7 @@ impl App {
             self.review_draft_comments[idx].body = body;
             self.review_draft_comments[idx].last_editor = last_editor;
         }
+        self.persist_soon();
         self.reweave();
         if !deleting
             && let Some(file_idx) = self.changes.iter().position(|c| c.path == anchor.0)
@@ -2766,20 +2931,36 @@ fn main() -> Result<()> {
         std::process::exit(2);
     });
 
-    let mut startup_notice = None;
-    let pull_request = match review_pr_from_rig(backend.root()) {
-        Ok(Some(locator)) => match github::fetch_pull_request(&locator) {
-            Ok(pull_request) => Some(pull_request),
+    let mut startup_notices = Vec::new();
+    let rig_info = match info_from_rig(backend.root()) {
+        Ok(info) => info,
+        Err(error) => {
+            startup_notices.push(error.to_string());
+            None
+        }
+    };
+    let persistence = match rig_info
+        .as_ref()
+        .and_then(|info| info.root.as_deref().zip(info.repo.as_deref()))
+    {
+        Some((root, repo)) => match state::Store::load(root, repo) {
+            Ok(store) => Some(store),
             Err(error) => {
-                startup_notice = Some(format!("could not restore rig review {locator}: {error}"));
+                startup_notices.push(format!("could not restore review state: {error}"));
                 None
             }
         },
-        Ok(None) => None,
-        Err(error) => {
-            startup_notice = Some(error.to_string());
-            None
-        }
+        None => None,
+    };
+    let pull_request = match rig_info.as_ref().and_then(|info| info.review_pr.as_ref()) {
+        Some(locator) => match github::fetch_pull_request(locator) {
+            Ok(pull_request) => Some(pull_request),
+            Err(error) => {
+                startup_notices.push(format!("could not restore rig review {locator}: {error}"));
+                None
+            }
+        },
+        None => None,
     };
     // An explicit base remains an escape hatch. Otherwise a review rig starts
     // from GitHub's exact base instead of Recto's ordinary trunk branch point.
@@ -2787,7 +2968,7 @@ fn main() -> Result<()> {
         .base
         .or_else(|| pull_request.as_ref().map(|pr| pr.base_ref.clone()));
     let hl = Highlighter::new();
-    let mut app = App::load(backend, hl, initial_base).unwrap_or_else(|e| {
+    let mut app = App::load(backend, hl, initial_base, persistence).unwrap_or_else(|e| {
         eprintln!("recto: {e}");
         std::process::exit(2);
     });
@@ -2795,8 +2976,8 @@ fn main() -> Result<()> {
         let response = app.attach_pull_request(pull_request, false);
         debug_assert!(response.ok);
     }
-    if startup_notice.is_some() {
-        app.load_error = startup_notice;
+    if !startup_notices.is_empty() {
+        app.load_error = Some(startup_notices.join("; "));
     }
 
     let mut terminal = init_terminal()?;
@@ -2837,8 +3018,8 @@ fn run_client(command: ClientCommand) -> i32 {
                     }
                 }
             }
-            // A drain's payload is markdown on stdout, so it can be piped
-            // straight into a prompt. An empty drain writes nothing there —
+            // A note read's payload is markdown on stdout, so it can be piped
+            // straight into a prompt. An empty read writes nothing there —
             // "no comments" belongs on stderr with the other asides.
             if let Some(comments) = &resp.comments {
                 if comments.is_empty() {
@@ -2918,7 +3099,10 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 .collect::<Result<Vec<_>>>()?;
             Ok(link::Request::Annotate { sites })
         }
-        ClientCommand::Notes => Ok(link::Request::AgentNotes),
+        ClientCommand::Notes { ack } if ack.is_empty() => Ok(link::Request::ReadAgentNotes),
+        ClientCommand::Notes { ack } => {
+            Ok(link::Request::AcknowledgeAgentNotes { ids: ack.clone() })
+        }
         ClientCommand::Review => Ok(link::Request::ReviewDraft),
         ClientCommand::ReviewBody { body } => {
             Ok(link::Request::ReviewDraftBody { body: body.clone() })
@@ -2970,15 +3154,15 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
     }
 }
 
-/// Format a drained comment set as the markdown an agent reads. Each note leads
+/// Format a pending note set as the markdown an agent reads. Each note leads
 /// with its number and `path:line`, then quotes the diff rows it points at, so
 /// the agent can act without re-opening the file — and so the note still makes
 /// sense after its own edits have moved those line numbers.
 fn render_agent_notes_markdown(comments: &[link::AgentNote]) -> String {
     let mut out = format!("# Agent notes ({})\n\n", comments.len());
     out.push_str(
-        "Private notes the user left for the local agent on the current diff. They have been \
-         drained and are no longer pending. Line numbers are new-side; `>` \
+        "Private notes the user left for the local agent on the current diff. Reading does not \
+         remove them. Line numbers are new-side; `>` \
          marks the lines a note points at.\n",
     );
     for c in comments {
@@ -3002,6 +3186,14 @@ fn render_agent_notes_markdown(comments: &[link::AgentNote]) -> String {
         }
         out.push_str("```\n");
     }
+    let ids = comments
+        .iter()
+        .map(|comment| comment.id.to_string())
+        .collect::<Vec<_>>()
+        .join(" ");
+    out.push_str(&format!(
+        "\nAfter acting on every note above, acknowledge exactly this set with:\n\n    recto notes --ack {ids}\n"
+    ));
     out
 }
 
@@ -3171,10 +3363,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
 
     loop {
         needs_redraw |= app.poll_load();
+        needs_redraw |= app.poll_persistence();
 
         if let Some(link_rx) = &link_rx {
             while let Ok(incoming) = link_rx.try_recv() {
-                let resp = app.handle_request(incoming.request);
+                let mut resp = app.handle_request(incoming.request);
+                if resp.ok
+                    && app.persistence_due.is_some()
+                    && let Err(error) = app.persist_now()
+                {
+                    resp = link::Response::err(format!(
+                        "state changed in memory but could not be saved: {error}"
+                    ));
+                }
                 let _ = incoming.respond.send(resp);
                 needs_redraw = true;
             }
@@ -3209,6 +3410,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                 handle_event(app, terminal, event::read()?, &editor_link)?,
                 Action::Quit
             ) {
+                app.persist_now()?;
                 break;
             }
             needs_redraw = true;
@@ -3219,6 +3421,7 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
                     handle_event(app, terminal, event::read()?, &editor_link)?,
                     Action::Quit
                 ) {
+                    app.persist_now()?;
                     return Ok(());
                 }
                 needs_redraw = true;
@@ -3234,6 +3437,7 @@ fn handle_event(
     event: Event,
     editor_link: &link::EditorLink,
 ) -> Result<Action> {
+    let was_composing = matches!(app.mode, Mode::NoteInput(_));
     let mut mode = app.mode.clone();
     match event {
         Event::Key(key) if key.kind == KeyEventKind::Press => {
@@ -3631,7 +3835,9 @@ fn handle_event(
                                 caret: body.chars().count(),
                                 body,
                                 error: None,
-                                editing: note_idx.map(ComposerEdit::AgentNote),
+                                editing: note_idx
+                                    .and_then(|i| app.agent_notes.get(i))
+                                    .map(|note| ComposerEdit::AgentNote(note.id)),
                             });
                             mode = app.mode.clone();
                         }
@@ -3664,6 +3870,12 @@ fn handle_event(
             // that decision has to win over the draft we were mutating.
             if matches!(app.mode, Mode::SearchInput { .. } | Mode::NoteInput { .. }) {
                 app.mode = mode;
+            }
+            let is_composing = matches!(app.mode, Mode::NoteInput(_));
+            if was_composing && !is_composing {
+                app.persist_now()?;
+            } else if is_composing {
+                app.persist_soon();
             }
         }
         Event::Mouse(m) if matches!(app.mode, Mode::Normal) => handle_mouse(app, m),
@@ -3900,7 +4112,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
     // Pending agent notes are invisible once you scroll away from them, and the
     // whole point is that they're waiting on an agent, so keep the count in
-    // view until something drains it.
+    // view until the agent acknowledges it.
     if !app.agent_notes.is_empty() {
         let n = app.agent_notes.len();
         header_spans.push(Span::styled(
@@ -4455,12 +4667,16 @@ fn draw_quit_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         width,
         height,
     };
-    let warning = quit_loss_summary(
-        app.agent_notes.len(),
-        app.review_draft_body.is_some(),
-        app.review_draft_comments.len(),
-    )
-    .unwrap_or_else(|| "The current review session will close.".into());
+    let warning = if app.persistence.is_some() {
+        "Saved review state will remain with this rig.".into()
+    } else {
+        quit_loss_summary(
+            app.agent_notes.len(),
+            app.review_draft_body.is_some(),
+            app.review_draft_comments.len(),
+        )
+        .unwrap_or_else(|| "The current review session will close.".into())
+    };
     let lines = vec![
         Line::from(Span::styled(warning, Style::default().fg(theme::TEXT))),
         Line::default(),
@@ -5633,7 +5849,7 @@ mod tests {
     #[test]
     fn filesystem_change_during_load_gets_a_followup_load() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend.clone(), Highlighter::new(), None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
 
         app.request_current_scope();
         assert!(!app.request_reload());
@@ -5648,7 +5864,7 @@ mod tests {
     #[test]
     fn reader_wraps_by_default_and_toggle_unwraps() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend, Highlighter::new(), None).unwrap();
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
 
         assert!(app.wrap);
         app.toggle_wrap();
@@ -5658,7 +5874,7 @@ mod tests {
     #[test]
     fn background_load_failure_stays_visible() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend.clone(), Highlighter::new(), None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
         backend.fail.store(true, Ordering::SeqCst);
 
         app.request_current_scope();
@@ -5673,6 +5889,7 @@ mod tests {
             r#"{
                 "schema_version": 1,
                 "id": "pr-42",
+                "root": "/tmp/pr-42",
                 "kind": "review",
                 "repo": "repo",
                 "repository": "owner/repo",
@@ -5685,12 +5902,151 @@ mod tests {
             Some("https://github.com/owner/repo/pull/42")
         );
         assert_eq!(info.schema_version, 1);
+        assert_eq!(info.root.as_deref(), Some(Path::new("/tmp/pr-42")));
+    }
+
+    #[test]
+    fn restored_note_composer_reopens_with_its_text_and_caret() {
+        let root =
+            std::env::temp_dir().join(format!("recto-app-state-{}-composer", std::process::id()));
+        let _ = std::fs::remove_dir_all(root.join(".recto"));
+        let mut store = state::Store::load(&root, "recto").unwrap();
+        let composer = NoteDraft {
+            kind: ComposerKind::AgentNote,
+            anchor: Some(("src/main.rs".into(), 12)),
+            body: "unfinished thought".into(),
+            caret: 8,
+            error: None,
+            editing: None,
+        };
+        store.set_note_composer(Some(&composer));
+        store.save().unwrap();
+
+        let backend = Arc::new(TestBackend::new());
+        let app = App::load(
+            backend,
+            Highlighter::new(),
+            None,
+            Some(state::Store::load(&root, "recto").unwrap()),
+        )
+        .unwrap();
+        assert_eq!(app.mode, Mode::NoteInput(composer));
+    }
+
+    #[test]
+    fn composer_autosave_flushes_after_the_debounce() {
+        let root =
+            std::env::temp_dir().join(format!("recto-app-state-{}-debounce", std::process::id()));
+        let _ = std::fs::remove_dir_all(root.join(".recto"));
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(
+            backend,
+            Highlighter::new(),
+            None,
+            Some(state::Store::load(&root, "recto").unwrap()),
+        )
+        .unwrap();
+        app.mode = Mode::NoteInput(NoteDraft {
+            kind: ComposerKind::AgentNote,
+            anchor: Some(("src/main.rs".into(), 12)),
+            body: "autosaved text".into(),
+            caret: 9,
+            error: None,
+            editing: None,
+        });
+        app.persist_soon();
+        app.persistence_due = Some(Instant::now());
+        assert!(app.poll_persistence());
+
+        let restored = state::Store::load(&root, "recto").unwrap();
+        assert_eq!(
+            restored.notes().2.map(|draft| draft.body.as_str()),
+            Some("autosaved text")
+        );
+    }
+
+    #[test]
+    fn attaching_a_pr_restores_only_its_saved_head_draft() {
+        let root =
+            std::env::temp_dir().join(format!("recto-app-state-{}-review", std::process::id()));
+        let _ = std::fs::remove_dir_all(root.join(".recto"));
+        let mut store = state::Store::load(&root, "recto").unwrap();
+        let key = link::PullRequestRef {
+            repository: "owner/repo".into(),
+            number: 42,
+            head_oid: "abc123".into(),
+        };
+        store.set_review(
+            key,
+            Some(&link::DraftReviewBody {
+                body: "Saved overall review".into(),
+                last_editor: link::DraftEditor::User,
+            }),
+            &[link::DraftReviewComment {
+                id: 7,
+                path: "src/main.rs".into(),
+                start: 12,
+                end: 12,
+                body: "Saved inline comment".into(),
+                last_editor: link::DraftEditor::Agent,
+            }],
+            8,
+        );
+        store.save().unwrap();
+
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(
+            backend,
+            Highlighter::new(),
+            None,
+            Some(state::Store::load(&root, "recto").unwrap()),
+        )
+        .unwrap();
+        let response = app.attach_pull_request(empty_pull_request("base"), false);
+        assert!(response.ok);
+        assert_eq!(
+            app.review_draft_body
+                .as_ref()
+                .map(|draft| draft.body.as_str()),
+            Some("Saved overall review")
+        );
+        assert_eq!(app.review_draft_comments[0].id, 7);
+        assert_eq!(app.next_review_draft_id, 8);
+    }
+
+    #[test]
+    fn note_acknowledgement_removes_only_the_ids_that_were_read() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.agent_notes = vec![
+            AgentNote {
+                id: 4,
+                path: "one".into(),
+                start: 1,
+                end: 1,
+                body: "first".into(),
+            },
+            AgentNote {
+                id: 5,
+                path: "two".into(),
+                start: 2,
+                end: 2,
+                body: "new arrival".into(),
+            },
+        ];
+
+        let response = app.acknowledge_agent_notes(&[4]);
+        assert!(response.ok);
+        assert_eq!(app.agent_notes.len(), 1);
+        assert_eq!(app.agent_notes[0].id, 5);
+        assert!(app.revise_agent_note(5, "still the new arrival".into()).ok);
+        assert_eq!(app.agent_notes[0].body, "still the new arrival");
     }
 
     #[test]
     fn attaching_pull_request_selects_its_exact_base() {
         let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend, Highlighter::new(), None).unwrap();
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         let response = app.handle_request(link::Request::AttachPr {
             pull_request: Box::new(empty_pull_request("stack-base")),
         });
@@ -5785,6 +6141,19 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             request,
             link::Request::ReviewDraftBody { body }
                 if body == "## Summary\n\nLooks good."
+        ));
+    }
+
+    #[test]
+    fn notes_ack_command_carries_stable_ids() {
+        assert!(matches!(
+            build_request(&ClientCommand::Notes { ack: vec![] }).unwrap(),
+            link::Request::ReadAgentNotes
+        ));
+        let request = build_request(&ClientCommand::Notes { ack: vec![4, 5] }).unwrap();
+        assert!(matches!(
+            request,
+            link::Request::AcknowledgeAgentNotes { ids } if ids == [4, 5]
         ));
     }
 
@@ -6194,12 +6563,14 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn comment_lookup_covers_the_whole_span() {
         let comments = vec![
             AgentNote {
+                id: 1,
                 path: "src/main.rs".into(),
                 start: 10,
                 end: 14,
                 body: "range note".into(),
             },
             AgentNote {
+                id: 2,
                 path: "src/link.rs".into(),
                 start: 3,
                 end: 3,
@@ -6299,12 +6670,13 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert_eq!(gutter_signature(&hunk_header("@@ -1,3 +1,4 @@")), None);
     }
 
-    /// The drain's markdown is the actual agent-facing contract: number and
+    /// The note markdown is the actual agent-facing contract: number and
     /// location first so a note is addressable, then the body, then the quoted
     /// rows with `>` on the ones being commented on.
     #[test]
     fn comment_markdown_quotes_the_span() {
         let md = render_agent_notes_markdown(&[link::AgentNote {
+            id: 7,
             n: 1,
             path: "src/main.rs".into(),
             start: 42,
@@ -6337,6 +6709,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert!(md.contains("    41   let a = 1;\n"));
         assert!(md.contains(">      - let b = 2;\n"));
         assert!(md.contains(">   42 + let b = 3;\n"));
+        assert!(md.contains("recto notes --ack 7"));
     }
 
     /// A range renders as `start-end`, and a comment whose span fell out of the
@@ -6344,6 +6717,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     #[test]
     fn comment_markdown_handles_ranges_and_missing_snippets() {
         let md = render_agent_notes_markdown(&[link::AgentNote {
+            id: 8,
             n: 2,
             path: "src/link.rs".into(),
             start: 10,
@@ -6425,6 +6799,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             last_editor: link::DraftEditor::Agent,
         }];
         let notes = [AgentNote {
+            id: 9,
             path: "src/link.rs".into(),
             start: 42,
             end: 42,

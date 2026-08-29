@@ -54,11 +54,16 @@ pub enum Request {
         end: Option<u32>,
         body: String,
     },
-    /// Drain the pending agent notes: hand them over and clear the set.
-    /// Delivered means gone, so a drain that loses its reply loses the notes —
-    /// which is why this is never queued behind an editor handoff.
+    /// Legacy clear-on-read request retained for older companion binaries.
     #[serde(rename = "notes", alias = "comments")]
     AgentNotes,
+    /// Read pending agent notes without consuming them. The companion
+    /// acknowledges stable ids separately after it has acted on the notes.
+    #[serde(rename = "peek-notes")]
+    ReadAgentNotes,
+    /// Remove only agent notes the companion has finished handling.
+    #[serde(rename = "ack-notes")]
+    AcknowledgeAgentNotes { ids: Vec<u64> },
     /// Read the shared, local-only review draft without consuming it.
     #[serde(rename = "review")]
     ReviewDraft,
@@ -95,13 +100,16 @@ pub struct Site {
     pub label: String,
 }
 
-/// One private note handed back by a [`Request::AgentNotes`] drain. Carries
+/// One private note handed back by a [`Request::AgentNotes`] read. Carries
 /// the anchoring snippet alongside the body: the agent starts editing the
 /// moment it reads this, so `path:line` goes stale almost immediately while the
 /// quoted text stays meaningful.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct AgentNote {
-    /// 1-based position in the drained set, matching the on-screen badge.
+    /// Stable id used to acknowledge this note after acting on it.
+    #[serde(default)]
+    pub id: u64,
+    /// 1-based position in the returned set, matching the on-screen badge.
     pub n: usize,
     pub path: String,
     pub start: u32,
@@ -113,8 +121,8 @@ pub struct AgentNote {
     pub snippet: Option<Vec<SnippetRow>>,
 }
 
-/// The session-durable, local-only public review being co-authored in recto. Reading
-/// this object never changes it; posting is deliberately a later boundary.
+/// The local-only public review being co-authored in recto. Rig-backed sessions
+/// persist it across restarts. Reading never changes it; posting is a later boundary.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReviewDraft {
     pub pull_request: PullRequestRef,
@@ -251,7 +259,7 @@ pub struct SnippetRow {
 /// `note` carries an informational aside on success — e.g. that recto was in an
 /// editor and drove neovim directly rather than scrolling the TUI. `status` is
 /// the machine-readable snapshot a [`Request::Ping`] asks for; absent otherwise.
-/// `comments` is the legacy wire field carrying a drained [`Request::AgentNotes`]
+/// `comments` is the legacy wire field carrying a [`Request::AgentNotes`]
 /// set. The field name stays stable for older companion clients.
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct Response {
@@ -299,7 +307,7 @@ pub struct Status {
     pub focus: bool,
     /// Number of active tour annotations.
     pub annotations: usize,
-    /// Private agent notes waiting for a `recto notes` drain. The field retains
+    /// Private agent notes waiting for a `recto notes` read. The field retains
     /// its old wire name so older companion clients can still discover them.
     #[serde(default)]
     pub pending_comments: usize,
@@ -314,7 +322,7 @@ pub struct Status {
     pub pull_request: Option<PullRequestRef>,
 }
 
-#[derive(Debug, Clone, Deserialize, Serialize)]
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
 pub struct PullRequestRef {
     pub repository: String,
     pub number: u64,
@@ -686,11 +694,17 @@ fn handle_while_in_editor(
             queue(tx, request.clone());
             Response::ok_note("recto is in an editor; the comment will land when you return")
         }
-        // A drain must never be queued. `queue` discards the response, and a
-        // drained comment is gone from recto — queuing one would delete the
-        // user's notes and hand them to nobody. Refuse instead.
-        Request::AgentNotes => {
-            Response::err("recto is in an editor; leave it before draining agent notes")
+        // Reading notes needs its response, so it cannot be queued behind the
+        // editor handoff. Acknowledgement is a state mutation and queues like
+        // the other writes.
+        Request::AgentNotes | Request::ReadAgentNotes => {
+            Response::err("recto is in an editor; leave it before reading agent notes")
+        }
+        Request::AcknowledgeAgentNotes { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note(
+                "recto is in an editor; note acknowledgement will land when you return",
+            )
         }
         Request::ReviewDraft => {
             Response::err("recto is in an editor; leave it before reading the review draft")
@@ -1112,13 +1126,21 @@ mod tests {
 
         let drain: Request = serde_json::from_str(r#"{"cmd":"comments"}"#).expect("parse");
         assert!(matches!(drain, Request::AgentNotes));
+
+        let read: Request = serde_json::from_str(r#"{"cmd":"peek-notes"}"#).expect("parse");
+        assert!(matches!(read, Request::ReadAgentNotes));
+
+        let ack: Request =
+            serde_json::from_str(r#"{"cmd":"ack-notes","ids":[4,5]}"#).expect("parse");
+        assert!(matches!(ack, Request::AcknowledgeAgentNotes { ids } if ids == [4, 5]));
     }
 
-    /// The drained payload is what the agent actually reads, so its field names
+    /// The note payload is what the agent actually reads, so its field names
     /// are a contract — including the per-row snippet shape.
     #[test]
     fn drained_comment_wire_format() {
         let resp = Response::ok_agent_notes(vec![AgentNote {
+            id: 7,
             n: 1,
             path: "src/main.rs".into(),
             start: 42,
@@ -1167,11 +1189,10 @@ mod tests {
         );
     }
 
-    /// A drain that arrives while recto is parked in an editor must be refused,
-    /// never queued: `queue` throws the response away, so queuing a drain would
-    /// clear the user's comments and deliver them nowhere.
+    /// A read that arrives while recto is parked in an editor must be refused,
+    /// never queued: `queue` throws the response away.
     #[test]
-    fn drain_in_editor_is_refused_not_queued() {
+    fn note_read_in_editor_is_refused_not_queued() {
         let editor = EditorLink::default();
         editor.enter(
             None,
@@ -1196,11 +1217,11 @@ mod tests {
         let (tx, rx) = mpsc::channel::<Incoming>();
 
         let resp = handle_while_in_editor(&Request::AgentNotes, &tx, &editor);
-        assert!(!resp.ok, "drain must fail while parked in an editor");
+        assert!(!resp.ok, "read must fail while parked in an editor");
         assert!(resp.comments.is_none());
         assert!(
             rx.try_recv().is_err(),
-            "a drain must not reach the main loop's queue"
+            "a read must not reach the main loop's queue"
         );
 
         // Authoring, by contrast, is queued and lands on return.

@@ -78,8 +78,11 @@ objects directly from either their file-pane row or their inline diff content.
 
 ## Co-author a public review draft
 
-The top-level review body and inline review comments are durable local drafts,
-not published GitHub content and not drain-on-read agent notes. The user stages
+The top-level review body and inline review comments are local drafts, not
+published GitHub content and not private agent notes. In a Rig, Recto saves
+them under the rig root and restores only the draft matching the attached
+repository, PR number, and head OID. Outside a Rig, authored state remains
+process-local. The user stages
 or edits the body with `c` on the PR overview, and an inline comment with `c`
 on a diff line. Read the whole shared draft with `recto review`; this is a
 peek, so calling it repeatedly never consumes anything. The body and each
@@ -95,7 +98,7 @@ deletes the draft. Every mutation returns the updated draft as JSON so both
 sides can immediately see the same object.
 
 These commands require an attached PR, and this workflow does not post
-anything publicly. Do not drain private `recto notes` into the review draft by
+anything publicly. Do not copy private `recto notes` into the review draft by
 assumption: notes are ephemeral direction, while shared drafts are the exact
 public-facing prose being co-authored.
 
@@ -172,7 +175,8 @@ Everything above points the user's eyes at code. `recto notes` runs the other
 way: it hands you private notes they left for the local agent while reading the diff, each
 one anchored to a span and quoted with the surrounding lines. They write
 those by moving the cursor with `j`/`k` and pressing `n` in recto, which is
-worth mentioning if they ask how to give you line-level feedback.
+worth mentioning if they ask how to give you line-level feedback. Inside a
+Rig, pending notes and half-written composers survive Recto restarts.
 
     recto notes
 
@@ -180,25 +184,26 @@ The output is markdown on stdout, one numbered section per note, with the
 commented lines marked by `>` inside a fenced snippet. Treat each note as a
 task. The quoted snippet is the reliable part of the anchor, not the line
 number: the moment you start editing, the numbers in the header shift, while
-the quoted text still says what the user was looking at.
+the quoted text still says what the user was looking at. The final line gives
+an acknowledgement command containing the stable ids of exactly that set.
 
-**Draining clears.** A note is delivered exactly once, so it disappears
-from recto the moment you read it. Only run `recto notes` when you are
-actually about to act on what comes back. Never run it to check whether
-comments exist, never run it and then discard the output, and never run it
-twice hoping to re-read something. If you need to know whether notes are
-waiting, that is what `ping` is for.
+**Read, act, acknowledge.** Reading never removes a note, so it is safe to
+retry after an interrupted turn. Once every note in that response has been
+handled, run the exact command printed at the bottom, for example
+`recto notes --ack 4 5`. Acknowledgement removes only those stable ids, so a
+new note arriving while you work remains pending. Do not acknowledge first.
+If you only need to know whether notes are waiting, use `ping`.
 
 **Do not write agent notes.** `recto note` exists, but it is the user's
 private channel into recto, not yours. Your channel is `annotate`. If you push your
-own notes into the note set you will drain them straight back to yourself
+own notes into the note set you will read them straight back to yourself
 and lose the user's in the noise.
 
-Drain in one of two situations: the user says they left notes or asks you to
+Read notes in one of two situations: the user says they left notes or asks you to
 address their comments, or a `ping` reports `pending_comments` above zero and
 the conversation has moved on to acting on the diff. If you notice pending
 comments while doing something else, mention them rather than silently
-draining, since draining takes them off the user's screen.
+reading them.
 
 ## Reading the exit code
 
@@ -219,7 +224,7 @@ exception: its scope is the workspace, not the current diff.
 
 `recto notes` is the one command that exits 0 with nothing on stdout: that
 means no notes were pending. It exits 1 only when recto is parked in an
-editor, where a drain would destroy the notes rather than deliver them. Ask
+editor, where the TUI loop cannot answer the read. Ask
 the user to come back to recto, then try again.
 
 ## Reading the ping
@@ -262,8 +267,8 @@ cheapest place to notice. Anything above zero means `recto notes` has
 something for you. An older recto that predates the feature omits the field
 entirely, which reads as zero.
 
-`draft_comments` counts the session-durable public review comments being
-co-authored locally. It is safe to follow a nonzero count with `recto review`:
+`draft_comments` counts the public review comments being co-authored locally.
+Inside a Rig they survive Recto restarts. It is safe to follow a nonzero count with `recto review`:
 that command only peeks and can never remove draft content.
 
 `draft_body` reports whether the same shared review has a top-level body. Like
