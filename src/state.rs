@@ -1,9 +1,9 @@
-//! Durable review state scoped to a Rig's lifetime.
+//! Durable authored state for every Recto workspace.
 //!
-//! Rig tells Recto where the rig root is through its public JSON API. Recto
-//! owns the `.recto/` directory and everything in this file; it never reads
-//! Rig's manifest. Each repository gets one small atomic JSON document, so the
-//! Rectos in a multi-repository rig never contend on a write.
+//! Recto owns one atomic JSON document beneath the XDG state directory, keyed
+//! by the canonical workspace root. Rig and standalone launches therefore use
+//! the same persistence model. A lifecycle owner can ask Recto to forget a
+//! workspace through the public CLI without knowing this layout or format.
 
 use std::fs::{self, OpenOptions};
 use std::io::{BufReader, BufWriter, Write};
@@ -13,11 +13,13 @@ use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 use crate::link::{DraftReviewBody, DraftReviewComment, PullRequestRef};
 use crate::{AgentNote, NoteDraft};
 
-const SCHEMA_VERSION: u32 = 1;
+const SCHEMA_VERSION: u32 = 2;
+const LEGACY_SCHEMA_VERSION: u32 = 1;
 
 #[derive(Debug, Default, Deserialize, Serialize)]
 struct NoteState {
@@ -45,6 +47,16 @@ struct ReviewState {
 #[derive(Debug, Deserialize, Serialize)]
 struct Document {
     schema_version: u32,
+    workspace_root: PathBuf,
+    #[serde(default)]
+    notes: NoteState,
+    #[serde(default)]
+    reviews: Vec<ReviewState>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct LegacyDocument {
+    schema_version: u32,
     repo: String,
     #[serde(default)]
     notes: NoteState,
@@ -53,10 +65,10 @@ struct Document {
 }
 
 impl Document {
-    fn empty(repo: String) -> Self {
+    fn empty(workspace_root: PathBuf) -> Self {
         Self {
             schema_version: SCHEMA_VERSION,
-            repo,
+            workspace_root,
             notes: NoteState {
                 next_id: first_id(),
                 ..NoteState::default()
@@ -79,24 +91,25 @@ pub struct RestoredReview {
 }
 
 impl Store {
-    pub fn load(rig_root: &Path, repo: &str) -> Result<Self> {
-        if Path::new(repo).components().count() != 1
-            || !matches!(
-                Path::new(repo).components().next(),
-                Some(Component::Normal(_))
-            )
-        {
-            return Err(anyhow!(
-                "rig info returned invalid repository directory {repo:?}"
-            ));
-        }
-        let path = rig_root.join(".recto").join(format!("{repo}.json"));
+    pub fn load(workspace_root: &Path, legacy_rig: Option<(&Path, &str)>) -> Result<Self> {
+        Self::load_at(&state_home()?, workspace_root, legacy_rig)
+    }
+
+    pub(crate) fn load_at(
+        state_home: &Path,
+        workspace_root: &Path,
+        legacy_rig: Option<(&Path, &str)>,
+    ) -> Result<Self> {
+        let workspace_root = normalize_workspace_root(workspace_root)?;
+        let path = state_path_at(state_home, &workspace_root);
         let document = match OpenOptions::new().read(true).open(&path) {
             Ok(file) => serde_json::from_reader::<_, Document>(BufReader::new(file))
                 .with_context(|| format!("could not parse {}", path.display()))?,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-                Document::empty(repo.to_string())
-            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => match legacy_rig {
+                Some((rig_root, repo)) => load_legacy(rig_root, repo, &workspace_root)?
+                    .unwrap_or_else(|| Document::empty(workspace_root.clone())),
+                None => Document::empty(workspace_root.clone()),
+            },
             Err(error) => {
                 return Err(error).with_context(|| format!("could not read {}", path.display()));
             }
@@ -108,14 +121,26 @@ impl Store {
                 document.schema_version
             ));
         }
-        if document.repo != repo {
+        if document.workspace_root != workspace_root {
             return Err(anyhow!(
-                "{} belongs to repository directory {:?}",
+                "{} belongs to workspace {}",
                 path.display(),
-                document.repo
+                document.workspace_root.display()
             ));
         }
-        Ok(Self { path, document })
+
+        let store = Self { path, document };
+        if let Some((rig_root, repo)) = legacy_rig {
+            let legacy = legacy_path(rig_root, repo)?;
+            if legacy.exists() {
+                store.save()?;
+                let _ = fs::remove_file(&legacy);
+                if let Some(parent) = legacy.parent() {
+                    let _ = fs::remove_dir(parent);
+                }
+            }
+        }
+        Ok(store)
     }
 
     pub fn notes(&self) -> (&[AgentNote], u64, Option<&NoteDraft>) {
@@ -219,14 +244,7 @@ impl Store {
             .path
             .parent()
             .ok_or_else(|| anyhow!("state path has no parent: {}", self.path.display()))?;
-        fs::create_dir_all(parent)
-            .with_context(|| format!("could not create {}", parent.display()))?;
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::PermissionsExt;
-            fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
-                .with_context(|| format!("could not protect {}", parent.display()))?;
-        }
+        protect_state_dirs(parent)?;
 
         let temporary = self
             .path
@@ -250,6 +268,144 @@ impl Store {
     }
 }
 
+pub fn forget(workspace_root: &Path) -> Result<()> {
+    forget_at(&state_home()?, workspace_root)
+}
+
+fn forget_at(state_home: &Path, workspace_root: &Path) -> Result<()> {
+    let workspace_root = normalize_workspace_root(workspace_root)?;
+    let path = state_path_at(state_home, &workspace_root);
+    match fs::remove_file(&path) {
+        Ok(()) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not remove {}", path.display()));
+        }
+    }
+    if let Some(workspaces) = path.parent() {
+        let _ = fs::remove_dir(workspaces);
+        if let Some(recto) = workspaces.parent() {
+            let _ = fs::remove_dir(recto);
+        }
+    }
+    Ok(())
+}
+
+fn state_home() -> Result<PathBuf> {
+    if let Some(value) = std::env::var_os("XDG_STATE_HOME") {
+        let path = PathBuf::from(value);
+        if path.is_absolute() {
+            return Ok(path);
+        }
+    }
+    let home = std::env::var_os("HOME").ok_or_else(|| {
+        anyhow!("cannot locate Recto state: neither XDG_STATE_HOME nor HOME is set")
+    })?;
+    Ok(PathBuf::from(home).join(".local/state"))
+}
+
+fn state_path_at(state_home: &Path, workspace_root: &Path) -> PathBuf {
+    let digest = Sha256::digest(workspace_root.to_string_lossy().as_bytes());
+    state_home
+        .join("recto/workspaces")
+        .join(format!("{digest:x}.json"))
+}
+
+fn normalize_workspace_root(workspace_root: &Path) -> Result<PathBuf> {
+    match fs::canonicalize(workspace_root) {
+        Ok(path) => Ok(path),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let absolute = if workspace_root.is_absolute() {
+                workspace_root.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(workspace_root)
+            };
+            Ok(clean_path(&absolute))
+        }
+        Err(error) => {
+            Err(error).with_context(|| format!("could not resolve {}", workspace_root.display()))
+        }
+    }
+}
+
+fn clean_path(path: &Path) -> PathBuf {
+    let mut clean = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                clean.pop();
+            }
+            component => clean.push(component.as_os_str()),
+        }
+    }
+    clean
+}
+
+fn legacy_path(rig_root: &Path, repo: &str) -> Result<PathBuf> {
+    if Path::new(repo).components().count() != 1
+        || !matches!(
+            Path::new(repo).components().next(),
+            Some(Component::Normal(_))
+        )
+    {
+        return Err(anyhow!(
+            "rig info returned invalid repository directory {repo:?}"
+        ));
+    }
+    Ok(rig_root.join(".recto").join(format!("{repo}.json")))
+}
+
+fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Option<Document>> {
+    let path = legacy_path(rig_root, repo)?;
+    let file = match OpenOptions::new().read(true).open(&path) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| format!("could not read {}", path.display()));
+        }
+    };
+    let legacy = serde_json::from_reader::<_, LegacyDocument>(BufReader::new(file))
+        .with_context(|| format!("could not parse {}", path.display()))?;
+    if legacy.schema_version != LEGACY_SCHEMA_VERSION {
+        return Err(anyhow!(
+            "{} uses unsupported legacy state schema {}",
+            path.display(),
+            legacy.schema_version
+        ));
+    }
+    if legacy.repo != repo {
+        return Err(anyhow!(
+            "{} belongs to repository directory {:?}",
+            path.display(),
+            legacy.repo
+        ));
+    }
+    Ok(Some(Document {
+        schema_version: SCHEMA_VERSION,
+        workspace_root: workspace_root.to_path_buf(),
+        notes: legacy.notes,
+        reviews: legacy.reviews,
+    }))
+}
+
+fn protect_state_dirs(workspaces: &Path) -> Result<()> {
+    fs::create_dir_all(workspaces)
+        .with_context(|| format!("could not create {}", workspaces.display()))?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        for directory in [workspaces.parent(), Some(workspaces)]
+            .into_iter()
+            .flatten()
+        {
+            fs::set_permissions(directory, fs::Permissions::from_mode(0o700))
+                .with_context(|| format!("could not protect {}", directory.display()))?;
+        }
+    }
+    Ok(())
+}
+
 fn first_id() -> u64 {
     1
 }
@@ -259,13 +415,23 @@ mod tests {
     use super::*;
     use crate::{ComposerEdit, ComposerKind};
 
+    fn roots(name: &str) -> (PathBuf, PathBuf) {
+        let root = std::env::temp_dir().join(format!(
+            "recto-state-{name}-{}-{:?}",
+            std::process::id(),
+            std::thread::current().id()
+        ));
+        let _ = fs::remove_dir_all(&root);
+        let state_home = root.join("state");
+        let workspace = root.join("workspace");
+        fs::create_dir_all(&workspace).unwrap();
+        (state_home, workspace)
+    }
+
     #[test]
     fn round_trips_notes_composers_and_pr_head_drafts() {
-        let root =
-            std::env::temp_dir().join(format!("recto-state-round-trip-{}", std::process::id()));
-        fs::create_dir_all(&root).unwrap();
-        let _ = fs::remove_dir_all(root.join(".recto"));
-        let mut store = Store::load(&root, "recto").unwrap();
+        let (state_home, workspace) = roots("round-trip");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
         let note = AgentNote {
             id: 4,
             path: "src/lib.rs".into(),
@@ -316,27 +482,87 @@ mod tests {
         store.set_review_composer(&pull_request, Some(&review_composer));
         store.save().unwrap();
 
-        let restored = Store::load(&root, "recto").unwrap();
+        let restored = Store::load_at(&state_home, &workspace, None).unwrap();
         assert_eq!(restored.notes(), (&[note][..], 5, Some(&note_composer)));
         let review = restored.review(&pull_request).unwrap();
         assert_eq!(review.body.unwrap().body, "Overall");
         assert_eq!(review.comments[0].body, "Inline");
         assert_eq!(review.next_id, 8);
         assert_eq!(review.composer, Some(review_composer));
+        assert!(!workspace.join(".recto").exists());
     }
 
     #[test]
-    fn rejects_a_repository_path_instead_of_escaping_recto_state() {
-        let root = std::env::temp_dir();
-        assert!(Store::load(&root, "../other").is_err());
-        assert!(Store::load(&root, "nested/repo").is_err());
+    fn canonical_workspace_roots_get_distinct_external_documents() {
+        let (state_home, workspace) = roots("keys");
+        let other = workspace.parent().unwrap().join("other");
+        fs::create_dir_all(&other).unwrap();
+        let first = Store::load_at(&state_home, &workspace, None).unwrap();
+        let second = Store::load_at(&state_home, &other, None).unwrap();
+        assert_ne!(first.path, second.path);
+        assert!(first.path.starts_with(state_home.join("recto/workspaces")));
+    }
+
+    #[test]
+    fn migrates_the_colocated_rig_document_once() {
+        let (state_home, workspace) = roots("migration");
+        let rig_root = workspace.parent().unwrap();
+        let legacy = legacy_path(rig_root, "workspace").unwrap();
+        fs::create_dir_all(legacy.parent().unwrap()).unwrap();
+        let document = LegacyDocument {
+            schema_version: LEGACY_SCHEMA_VERSION,
+            repo: "workspace".into(),
+            notes: NoteState {
+                next_id: 2,
+                items: vec![AgentNote {
+                    id: 1,
+                    path: "src/main.rs".into(),
+                    start: 4,
+                    end: 4,
+                    body: "Do not lose me".into(),
+                }],
+                composer: None,
+            },
+            reviews: Vec::new(),
+        };
+        fs::write(&legacy, serde_json::to_vec(&document).unwrap()).unwrap();
+
+        let store = Store::load_at(&state_home, &workspace, Some((rig_root, "workspace"))).unwrap();
+        assert_eq!(store.notes().0[0].body, "Do not lose me");
+        assert!(store.path.exists());
+        assert!(!legacy.exists());
+    }
+
+    #[test]
+    fn forget_is_idempotent_and_accepts_a_removed_workspace() {
+        let (state_home, workspace) = roots("forget");
+        let store = Store::load_at(&state_home, &workspace, None).unwrap();
+        store.save().unwrap();
+        let path = store.path.clone();
+        fs::remove_dir_all(&workspace).unwrap();
+
+        forget_at(&state_home, &workspace).unwrap();
+        forget_at(&state_home, &workspace).unwrap();
+        assert!(!path.exists());
+    }
+
+    #[test]
+    fn rejects_a_repository_path_in_legacy_context() {
+        let (state_home, workspace) = roots("legacy-path");
+        assert!(
+            Store::load_at(
+                &state_home,
+                &workspace,
+                Some((workspace.parent().unwrap(), "../other"))
+            )
+            .is_err()
+        );
     }
 
     #[test]
     fn a_new_pr_head_does_not_inherit_the_old_heads_draft() {
-        let root = std::env::temp_dir().join(format!("recto-state-heads-{}", std::process::id()));
-        let _ = fs::remove_dir_all(root.join(".recto"));
-        let mut store = Store::load(&root, "recto").unwrap();
+        let (state_home, workspace) = roots("heads");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
         let old = PullRequestRef {
             repository: "phinze/recto".into(),
             number: 8,

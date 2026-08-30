@@ -209,6 +209,11 @@ fn info_from_rig(repo_root: &Path) -> Result<Option<RigInfo>> {
 /// Subcommands that talk to an already-running recto over its workspace socket.
 #[derive(Subcommand, Debug)]
 enum ClientCommand {
+    /// Inspect or remove Recto's durable state without opening the TUI.
+    State {
+        #[command(subcommand)]
+        command: StateCommand,
+    },
     /// Focus a file or span in the running recto. PATHSPEC is `path`,
     /// `path:LINE`, or `path:START-END` (new-side line numbers).
     Focus { pathspec: String },
@@ -251,6 +256,15 @@ enum ClientCommand {
         #[arg(long)]
         id: Option<u64>,
         input: String,
+    },
+}
+
+#[derive(Subcommand, Debug)]
+enum StateCommand {
+    /// Remove the authored state associated with a workspace root.
+    Forget {
+        #[arg(long, value_name = "PATH")]
+        workspace_root: std::path::PathBuf,
     },
 }
 
@@ -840,8 +854,7 @@ struct App {
     /// comments it has no file anchor and is authored from the PR overview.
     review_draft_body: Option<link::DraftReviewBody>,
     next_review_draft_id: u64,
-    /// Rig-scoped durable state. Standalone Recto deliberately remains
-    /// in-memory; Rig supplies both the storage root and its cleanup lifecycle.
+    /// XDG-backed durable state keyed by this workspace's canonical root.
     persistence: Option<state::Store>,
     persistence_due: Option<Instant>,
     /// Source-line index of a click-placed edit cursor in the diff, if any.
@@ -2939,18 +2952,15 @@ fn main() -> Result<()> {
             None
         }
     };
-    let persistence = match rig_info
+    let legacy_rig = rig_info
         .as_ref()
-        .and_then(|info| info.root.as_deref().zip(info.repo.as_deref()))
-    {
-        Some((root, repo)) => match state::Store::load(root, repo) {
-            Ok(store) => Some(store),
-            Err(error) => {
-                startup_notices.push(format!("could not restore review state: {error}"));
-                None
-            }
-        },
-        None => None,
+        .and_then(|info| info.root.as_deref().zip(info.repo.as_deref()));
+    let persistence = match state::Store::load(backend.root(), legacy_rig) {
+        Ok(store) => Some(store),
+        Err(error) => {
+            startup_notices.push(format!("could not restore review state: {error}"));
+            None
+        }
     };
     let pull_request = match rig_info.as_ref().and_then(|info| info.review_pr.as_ref()) {
         Some(locator) => match github::fetch_pull_request(locator) {
@@ -2990,6 +3000,9 @@ fn main() -> Result<()> {
 /// process exit code: 0 on `{"ok":true}`, 1 on a refused request (e.g. target
 /// not in the diff), 2 when we couldn't reach a recto at all.
 fn run_client(command: ClientCommand) -> i32 {
+    if let ClientCommand::State { command } = &command {
+        return run_state_command(command);
+    }
     let socket = match link::socket_for_cwd() {
         Ok(p) => p,
         Err(e) => {
@@ -3056,10 +3069,26 @@ fn run_client(command: ClientCommand) -> i32 {
     }
 }
 
+fn run_state_command(command: &StateCommand) -> i32 {
+    let result = match command {
+        StateCommand::Forget { workspace_root } => state::forget(workspace_root),
+    };
+    match result {
+        Ok(()) => 0,
+        Err(error) => {
+            eprintln!("recto: {error}");
+            2
+        }
+    }
+}
+
 /// Turn a CLI subcommand into a wire [`link::Request`], normalizing focus paths
 /// to workspace-root-relative so the agent can pass whatever form it used.
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
+        ClientCommand::State { .. } => {
+            Err(anyhow!("state commands do not use the workspace socket"))
+        }
         ClientCommand::Ping => Ok(link::Request::Ping),
         ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
             pull_request: Box::new(github::fetch_pull_request(locator)?),
@@ -4668,7 +4697,7 @@ fn draw_quit_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
         height,
     };
     let warning = if app.persistence.is_some() {
-        "Saved review state will remain with this rig.".into()
+        "Saved review state will remain available for this workspace.".into()
     } else {
         quit_loss_summary(
             app.agent_notes.len(),
@@ -5909,8 +5938,10 @@ mod tests {
     fn restored_note_composer_reopens_with_its_text_and_caret() {
         let root =
             std::env::temp_dir().join(format!("recto-app-state-{}-composer", std::process::id()));
-        let _ = std::fs::remove_dir_all(root.join(".recto"));
-        let mut store = state::Store::load(&root, "recto").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state_home = root.join("state");
+        let mut store = state::Store::load_at(&state_home, &root, None).unwrap();
         let composer = NoteDraft {
             kind: ComposerKind::AgentNote,
             anchor: Some(("src/main.rs".into(), 12)),
@@ -5927,7 +5958,7 @@ mod tests {
             backend,
             Highlighter::new(),
             None,
-            Some(state::Store::load(&root, "recto").unwrap()),
+            Some(state::Store::load_at(&state_home, &root, None).unwrap()),
         )
         .unwrap();
         assert_eq!(app.mode, Mode::NoteInput(composer));
@@ -5937,13 +5968,15 @@ mod tests {
     fn composer_autosave_flushes_after_the_debounce() {
         let root =
             std::env::temp_dir().join(format!("recto-app-state-{}-debounce", std::process::id()));
-        let _ = std::fs::remove_dir_all(root.join(".recto"));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state_home = root.join("state");
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(
             backend,
             Highlighter::new(),
             None,
-            Some(state::Store::load(&root, "recto").unwrap()),
+            Some(state::Store::load_at(&state_home, &root, None).unwrap()),
         )
         .unwrap();
         app.mode = Mode::NoteInput(NoteDraft {
@@ -5958,7 +5991,7 @@ mod tests {
         app.persistence_due = Some(Instant::now());
         assert!(app.poll_persistence());
 
-        let restored = state::Store::load(&root, "recto").unwrap();
+        let restored = state::Store::load_at(&state_home, &root, None).unwrap();
         assert_eq!(
             restored.notes().2.map(|draft| draft.body.as_str()),
             Some("autosaved text")
@@ -5969,8 +6002,10 @@ mod tests {
     fn attaching_a_pr_restores_only_its_saved_head_draft() {
         let root =
             std::env::temp_dir().join(format!("recto-app-state-{}-review", std::process::id()));
-        let _ = std::fs::remove_dir_all(root.join(".recto"));
-        let mut store = state::Store::load(&root, "recto").unwrap();
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state_home = root.join("state");
+        let mut store = state::Store::load_at(&state_home, &root, None).unwrap();
         let key = link::PullRequestRef {
             repository: "owner/repo".into(),
             number: 42,
@@ -5999,7 +6034,7 @@ mod tests {
             backend,
             Highlighter::new(),
             None,
-            Some(state::Store::load(&root, "recto").unwrap()),
+            Some(state::Store::load_at(&state_home, &root, None).unwrap()),
         )
         .unwrap();
         let response = app.attach_pull_request(empty_pull_request("base"), false);

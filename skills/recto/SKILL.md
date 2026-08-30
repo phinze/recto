@@ -51,6 +51,12 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto review-body BODY       # create, revise, or delete the top-level body
     recto review-comment PATH:LINE=BODY
     recto review-comment --id ID BODY
+    recto state forget --workspace-root PATH
+
+`state forget` is a destructive lifecycle API, not part of ordinary companion
+work. Rig calls it while tearing down a workspace. Do not call it merely to
+clear a draft or resolve a review, and do not call it without an explicit
+workspace-lifecycle request from the user.
 
 PATH is relative to anywhere in the workspace (recto normalizes it to
 the repo root). Line numbers are **new-side** — the line numbers in the
@@ -79,14 +85,16 @@ objects directly from either their file-pane row or their inline diff content.
 ## Co-author a public review draft
 
 The top-level review body and inline review comments are local drafts, not
-published GitHub content and not private agent notes. In a Rig, Recto saves
-them under the rig root and restores only the draft matching the attached
-repository, PR number, and head OID. Outside a Rig, authored state remains
-process-local. The user stages
-or edits the body with `c` on the PR overview, and an inline comment with `c`
-on a diff line. Read the whole shared draft with `recto review`; this is a
-peek, so calling it repeatedly never consumes anything. The body and each
-comment carry a `last_editor` field, and inline comments also have stable ids.
+published GitHub content and not private agent notes. Recto saves authored
+state beneath `$XDG_STATE_HOME/recto/workspaces/`, keyed by the canonical
+workspace root, whether or not Rig launched it. It restores only the draft
+matching the attached repository, PR number, and head OID. The user stages or
+edits the body with `c` on the PR overview, and an inline comment with `c` on a
+diff line. Read the whole shared draft with `recto review`; this is a peek, so
+calling it repeatedly never consumes anything. The body and each comment carry
+a `last_editor` field, and inline comments also have stable ids. Rig teardown
+uses `recto state forget` to end that state with the workspace without learning
+Recto's file layout.
 
 Revise the top-level body with `recto review-body 'new Markdown'`. Passing an
 empty body deletes it. The command returns the updated full draft as JSON.
@@ -175,8 +183,8 @@ Everything above points the user's eyes at code. `recto notes` runs the other
 way: it hands you private notes they left for the local agent while reading the diff, each
 one anchored to a span and quoted with the surrounding lines. They write
 those by moving the cursor with `j`/`k` and pressing `n` in recto, which is
-worth mentioning if they ask how to give you line-level feedback. Inside a
-Rig, pending notes and half-written composers survive Recto restarts.
+worth mentioning if they ask how to give you line-level feedback. Pending
+notes and half-written composers survive Recto restarts in every workspace.
 
     recto notes
 
@@ -268,8 +276,8 @@ something for you. An older recto that predates the feature omits the field
 entirely, which reads as zero.
 
 `draft_comments` counts the public review comments being co-authored locally.
-Inside a Rig they survive Recto restarts. It is safe to follow a nonzero count with `recto review`:
-that command only peeks and can never remove draft content.
+They survive Recto restarts. It is safe to follow a nonzero count with
+`recto review`: that command only peeks and can never remove draft content.
 
 `draft_body` reports whether the same shared review has a top-level body. Like
 `draft_comments`, `true` is a reason to peek with `recto review`, never to

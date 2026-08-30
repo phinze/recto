@@ -55,3 +55,19 @@ fn repository_override_routes_client_to_target_workspace() {
     assert_eq!(redirected.stderr, from_target.stderr);
     assert_ne!(redirected.stderr, from_caller.stderr);
 }
+
+#[test]
+fn state_forget_is_an_offline_idempotent_command() {
+    let repos = TempRepos::new();
+    let workspace = repos.repo("target");
+    let output = Command::new(env!("CARGO_BIN_EXE_recto"))
+        .env("XDG_STATE_HOME", repos.0.join("state"))
+        .args(["state", "forget", "--workspace-root"])
+        .arg(&workspace)
+        .output()
+        .expect("run recto state forget");
+
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stdout.is_empty());
+    assert!(output.stderr.is_empty());
+}
