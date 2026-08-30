@@ -48,6 +48,10 @@ drafts are additionally keyed by repository, PR number, and head OID. Inside a
 review Rig, Recto asks Rig's versioned JSON API only for PR context; `rig down`
 asks Recto's public CLI to forget the workspaces whose lifecycle has ended.
 Neither tool reads the other's private persistence format.
+Recto also resolves the committed workspace revision beneath the mutable
+working copy on every diff load. If it differs from an attached PR's head OID,
+`ping` reports a stale review, the TUI shows the mismatch, and companion focus
+or annotations are refused until the review is explicitly refreshed.
 
 ## Stack
 

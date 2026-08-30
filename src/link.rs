@@ -290,6 +290,10 @@ pub struct Status {
     pub backend: String,
     /// Absolute workspace root recto is reviewing.
     pub workspace_root: String,
+    /// Exact committed revision beneath the mutable working copy. For an
+    /// attached review this must equal `pull_request.head_oid`.
+    #[serde(default)]
+    pub workspace_revision: String,
     /// The base label shown in the header (e.g. `@-`, `trunk()`, `HEAD`).
     pub base: String,
     /// `"range"` for the whole base diff, or `"rev"` when narrowed to one rev.
@@ -320,6 +324,9 @@ pub struct Status {
     /// Public PR snapshot currently attached to the TUI, if any.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub pull_request: Option<PullRequestRef>,
+    /// Whether the attached PR identity and live workspace have diverged.
+    #[serde(default)]
+    pub stale_review: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -962,6 +969,7 @@ mod tests {
             pid: 4321,
             backend: "jj".into(),
             workspace_root: "/home/me/repo".into(),
+            workspace_revision: "abc123".into(),
             base: "@-".into(),
             scope: "range".into(),
             files: vec!["src/main.rs".into(), "src/link.rs".into()],
@@ -973,11 +981,13 @@ mod tests {
             draft_comments: 0,
             draft_body: false,
             pull_request: None,
+            stale_review: false,
         });
         let json = serde_json::to_string(&resp).expect("serialize");
         let back: Response = serde_json::from_str(&json).expect("round trip");
         let status = back.status.expect("status present");
         assert_eq!(status.backend, "jj");
+        assert_eq!(status.workspace_revision, "abc123");
         assert_eq!(status.base, "@-");
         assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
         assert_eq!(status.pending_comments, 2);
@@ -1004,6 +1014,8 @@ mod tests {
         let old: Status = serde_json::from_str(old_status).expect("old status parses");
         assert_eq!(old.surface, Surface::Recto);
         assert_eq!(old.capabilities, Capabilities::recto());
+        assert!(old.workspace_revision.is_empty());
+        assert!(!old.stale_review);
         // A recto too old to know about comments simply has none pending.
         assert_eq!(old.pending_comments, 0);
         assert_eq!(old.draft_comments, 0);
@@ -1029,6 +1041,7 @@ mod tests {
                 pid: 7,
                 backend: "git".into(),
                 workspace_root: "/tmp/repo".into(),
+                workspace_revision: "abc123".into(),
                 base: "HEAD".into(),
                 scope: "range".into(),
                 files: vec!["a.rs".into()],
@@ -1040,6 +1053,7 @@ mod tests {
                 draft_comments: 0,
                 draft_body: false,
                 pull_request: None,
+                stale_review: false,
             },
         );
         let (tx, _rx) = mpsc::channel::<Incoming>();
@@ -1075,6 +1089,7 @@ mod tests {
                 pid: 7,
                 backend: "jj".into(),
                 workspace_root: "/tmp/repo".into(),
+                workspace_revision: "abc123".into(),
                 base: "@-".into(),
                 scope: "range".into(),
                 files: vec!["changed.rs".into()],
@@ -1086,6 +1101,7 @@ mod tests {
                 draft_comments: 0,
                 draft_body: false,
                 pull_request: None,
+                stale_review: false,
             },
         );
         let (tx, _rx) = mpsc::channel::<Incoming>();
@@ -1201,6 +1217,7 @@ mod tests {
                 pid: 7,
                 backend: "jj".into(),
                 workspace_root: "/tmp/repo".into(),
+                workspace_revision: "abc123".into(),
                 base: "@-".into(),
                 scope: "range".into(),
                 files: vec!["a.rs".into()],
@@ -1212,6 +1229,7 @@ mod tests {
                 draft_comments: 0,
                 draft_body: false,
                 pull_request: None,
+                stale_review: false,
             },
         );
         let (tx, rx) = mpsc::channel::<Incoming>();

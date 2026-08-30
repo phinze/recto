@@ -45,6 +45,7 @@ use crate::diff::{FetchContent, LineInfo, file_row_line, render_diff, sticky_lin
 use crate::diff::{Gutter, augment_hunk_header, diff_body_line, hunk_header, parse_hunk_starts};
 
 struct LoadedDiff {
+    workspace_revision: String,
     changes: Vec<FileChange>,
     rendered: Vec<Line<'static>>,
     file_starts: Vec<usize>,
@@ -123,6 +124,7 @@ fn spawn_worker_with(load: impl Fn(&DiffRequest) -> Result<LoadedDiff> + Send + 
 
 fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Result<LoadedDiff> {
     let scope = &req.scope;
+    let workspace_revision = backend.workspace_revision()?;
     let changes = backend.list_changes(scope, req.ignore_ws)?;
     let diff = backend.unified_diff(scope, req.ignore_ws)?;
     let revs = match scope {
@@ -141,6 +143,7 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Resu
     };
     let rd = render_diff(&diff, &changes, hl, &*fetch);
     Ok(LoadedDiff {
+        workspace_revision,
         changes,
         rendered: rd.lines,
         file_starts: rd.file_starts,
@@ -788,6 +791,9 @@ struct App {
     mode: Mode,
     page: Page,
     pull_request: Option<link::PullRequest>,
+    /// Published commit beneath the mutable working copy, refreshed alongside
+    /// every diff load so an attached PR can prove it still names this view.
+    workspace_revision: String,
     pr_scroll: usize,
     pr_max_scroll: usize,
     active_thread: Option<usize>,
@@ -936,6 +942,7 @@ impl App {
             mode: restored_note_composer.map_or(Mode::Normal, Mode::NoteInput),
             page: Page::Diff,
             pull_request: None,
+            workspace_revision: loaded.workspace_revision,
             pr_scroll: 0,
             pr_max_scroll: 0,
             active_thread: None,
@@ -1510,6 +1517,11 @@ impl App {
             .selected_change()
             .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
 
+        self.workspace_revision = loaded.workspace_revision;
+        if self.review_is_stale() {
+            self.focus_span = None;
+            self.annotations.clear();
+        }
         self.changes = loaded.changes;
         self.file_rows = build_file_rows(&self.changes);
         self.base_rendered = loaded.rendered;
@@ -1963,11 +1975,16 @@ impl App {
             Cursor::Rev(_) => "rev",
         };
         let workspace_root = self.backend.root().to_string_lossy().into_owned();
+        let workspace_revision = self
+            .backend
+            .workspace_revision()
+            .unwrap_or_else(|_| self.workspace_revision.clone());
         link::Status {
             version: env!("CARGO_PKG_VERSION").to_string(),
             pid: std::process::id(),
             backend: self.backend.kind().to_string(),
             workspace_root,
+            workspace_revision: workspace_revision.clone(),
             base: self.backend.base_label(self.base()),
             scope: scope.to_string(),
             files: self.changes.iter().map(|c| c.path.clone()).collect(),
@@ -1983,6 +2000,41 @@ impl App {
                 number: pr.number,
                 head_oid: pr.head_oid.clone(),
             }),
+            stale_review: self.review_is_stale_at(&workspace_revision),
+        }
+    }
+
+    fn review_is_stale(&self) -> bool {
+        self.review_is_stale_at(&self.workspace_revision)
+    }
+
+    fn review_is_stale_at(&self, workspace_revision: &str) -> bool {
+        self.pull_request
+            .as_ref()
+            .is_some_and(|pr| !pr.head_oid.eq_ignore_ascii_case(workspace_revision))
+    }
+
+    fn stale_review_error_at(&self, workspace_revision: &str) -> Option<String> {
+        let pr = self.pull_request.as_ref()?;
+        self.review_is_stale_at(workspace_revision).then(|| {
+            format!(
+                "stale review: attached head {} does not match workspace revision {}; refresh the review before focusing or annotating",
+                pr.head_oid, workspace_revision
+            )
+        })
+    }
+
+    fn stale_review_error(&self) -> Option<String> {
+        self.stale_review_error_at(&self.workspace_revision)
+    }
+
+    fn review_target_error(&self) -> Option<String> {
+        self.pull_request.as_ref()?;
+        match self.backend.workspace_revision() {
+            Ok(workspace_revision) => self.stale_review_error_at(&workspace_revision),
+            Err(error) => Some(format!(
+                "could not verify the live workspace revision before targeting the attached review: {error}"
+            )),
         }
     }
 
@@ -2052,8 +2104,14 @@ impl App {
             link::Request::AttachPr { pull_request } => {
                 self.attach_pull_request(*pull_request, true)
             }
-            link::Request::Focus { path, start, end } => self.focus_target(&path, start, end),
-            link::Request::Annotate { sites } => self.annotate(sites),
+            link::Request::Focus { path, start, end } => match self.review_target_error() {
+                Some(error) => link::Response::err(error),
+                None => self.focus_target(&path, start, end),
+            },
+            link::Request::Annotate { sites } => match self.review_target_error() {
+                Some(error) => link::Response::err(error),
+                None => self.annotate(sites),
+            },
             // Deliberately leaves `agent_notes` alone: `clear` is how an agent
             // tidies up its own tour, and it has no business discarding review
             // notes it hasn't read yet.
@@ -2159,6 +2217,10 @@ impl App {
         let base_changed = self.backend.base_label(self.base()) != base;
         let label = format!("{}#{}", pull_request.repository, pull_request.number);
         self.pull_request = Some(pull_request);
+        if self.review_is_stale() {
+            self.focus_span = None;
+            self.annotations.clear();
+        }
         self.pr_scroll = 0;
         self.active_thread = None;
         self.page = Page::PullRequest;
@@ -2171,7 +2233,10 @@ impl App {
             self.select_base(Base::Revision(base));
         }
         self.reweave();
-        link::Response::ok_note(format!("opened {label}"))
+        match self.stale_review_error() {
+            Some(warning) => link::Response::ok_note(format!("opened {label}; {warning}")),
+            None => link::Response::ok_note(format!("opened {label}")),
+        }
     }
 
     /// Resolve a companion `focus` request against the current diff: scroll the
@@ -4134,10 +4199,22 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
     }
     if let Some(pr) = &app.pull_request {
-        header_spans.push(Span::styled(
-            format!(" · PR #{} attached", pr.number),
-            Style::default().fg(theme::TEAL),
-        ));
+        if app.review_is_stale() {
+            header_spans.push(Span::styled(
+                format!(
+                    " · STALE PR #{} {} != workspace {}",
+                    pr.number,
+                    short_oid(&pr.head_oid),
+                    short_oid(&app.workspace_revision)
+                ),
+                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+            ));
+        } else {
+            header_spans.push(Span::styled(
+                format!(" · PR #{} attached", pr.number),
+                Style::default().fg(theme::TEAL),
+            ));
+        }
     }
     // Pending agent notes are invisible once you scroll away from them, and the
     // whole point is that they're waiting on an agent, so keep the count in
@@ -5733,11 +5810,13 @@ fn pane_block(title: &str, focused: bool, terminal_focused: bool) -> Block<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
     struct TestBackend {
         loads: AtomicUsize,
         fail: AtomicBool,
+        revision: Mutex<String>,
     }
 
     impl TestBackend {
@@ -5745,7 +5824,12 @@ mod tests {
             Self {
                 loads: AtomicUsize::new(0),
                 fail: AtomicBool::new(false),
+                revision: Mutex::new("abc123".into()),
             }
+        }
+
+        fn set_revision(&self, revision: &str) {
+            *self.revision.lock().unwrap() = revision.into();
         }
     }
 
@@ -5756,6 +5840,10 @@ mod tests {
 
         fn kind(&self) -> &'static str {
             "test"
+        }
+
+        fn workspace_revision(&self) -> Result<String> {
+            Ok(self.revision.lock().unwrap().clone())
         }
 
         fn base_label(&self, base: &Base) -> String {
@@ -6090,6 +6178,73 @@ mod tests {
         assert_eq!(app.base(), &Base::Revision("stack-base".into()));
         assert!(matches!(app.page, Page::PullRequest));
         assert!(app.loading.is_some());
+    }
+
+    #[test]
+    fn stale_review_reports_both_heads_and_refuses_agent_targets() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
+        assert!(
+            app.attach_pull_request(empty_pull_request("base"), false)
+                .ok
+        );
+        app.focus_span = Some(FocusSpan {
+            path: "src/main.rs".into(),
+            start: 12,
+            end: 12,
+            set_at: Instant::now(),
+        });
+        app.annotations.push(Annotation {
+            path: "src/main.rs".into(),
+            start: 12,
+            end: 12,
+            label: "old tour".into(),
+        });
+
+        backend.set_revision("def456");
+        let live_status = app
+            .handle_request(link::Request::Ping)
+            .status
+            .expect("live ping status");
+        assert_eq!(live_status.workspace_revision, "def456");
+        assert!(live_status.stale_review);
+        let live_focus = app.handle_request(link::Request::Focus {
+            path: "src/main.rs".into(),
+            start: Some(12),
+            end: None,
+        });
+        assert!(!live_focus.ok, "live mismatch must fail before a reload");
+
+        let moved = load_diff(&*backend, &Highlighter::new(), &test_request(1)).unwrap();
+        app.apply_loaded(Scope::Range(Base::Revision("base".into())), moved);
+
+        assert!(app.focus_span.is_none());
+        assert!(app.annotations.is_empty());
+        let response = app.handle_request(link::Request::Ping);
+        let status = response.status.expect("ping status");
+        assert_eq!(status.workspace_revision, "def456");
+        assert_eq!(status.pull_request.expect("attached PR").head_oid, "abc123");
+        assert!(status.stale_review);
+
+        let focus = app.handle_request(link::Request::Focus {
+            path: "src/main.rs".into(),
+            start: Some(12),
+            end: None,
+        });
+        assert!(!focus.ok);
+        assert!(focus.error.as_deref().is_some_and(|error| {
+            error.contains("attached head abc123") && error.contains("workspace revision def456")
+        }));
+        let annotate = app.handle_request(link::Request::Annotate {
+            sites: vec![link::Site {
+                path: "src/main.rs".into(),
+                start: 12,
+                end: None,
+                label: "new tour".into(),
+            }],
+        });
+        assert!(!annotate.ok);
+        assert!(app.annotations.is_empty());
     }
 
     const GO_SAMPLE: &str = r#"package x

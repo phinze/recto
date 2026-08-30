@@ -107,6 +107,10 @@ pub trait Backend: Send + Sync {
     /// Which VCS this backend speaks: `"jj"` or `"git"`. Reported in the
     /// status payload so a companion session knows the model it's driving.
     fn kind(&self) -> &'static str;
+    /// Exact committed revision beneath the mutable working copy. Git names
+    /// this `HEAD`; jj review workspaces put a fresh working-copy commit above
+    /// the fetched PR head, so their published revision is `@-`.
+    fn workspace_revision(&self) -> Result<String>;
     /// Label for a base in the backend's own vocabulary — the exact string
     /// you could paste into `jj diff --from` or `git diff`. This is what
     /// `--base` is matched against and what the companion status reports.
@@ -231,6 +235,25 @@ impl Backend for JjBackend {
 
     fn kind(&self) -> &'static str {
         "jj"
+    }
+
+    fn workspace_revision(&self) -> Result<String> {
+        let output = self.run(&[
+            "log",
+            "-r",
+            "@-",
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\n\"",
+        ])?;
+        let revisions: Vec<&str> = output.lines().filter(|line| !line.is_empty()).collect();
+        match revisions.as_slice() {
+            [revision] => Ok((*revision).to_string()),
+            _ => Err(anyhow!(
+                "`@-` resolved to {} revisions; an attached review needs exactly one published head",
+                revisions.len()
+            )),
+        }
     }
 
     fn base_label(&self, base: &Base) -> String {
@@ -474,6 +497,11 @@ impl Backend for GitBackend {
 
     fn kind(&self) -> &'static str {
         "git"
+    }
+
+    fn workspace_revision(&self) -> Result<String> {
+        self.run(&["rev-parse", "HEAD"])
+            .map(|revision| revision.trim().to_string())
     }
 
     fn base_label(&self, base: &Base) -> String {
