@@ -229,19 +229,20 @@ impl JjBackend {
         .unwrap_or_default()
     }
 
-    /// A bookmark between trunk's fork point and the working copy marks a
-    /// named layer beneath the current work. Prefer its branch point when
-    /// there is exactly one such nearest ancestor; merges with two candidates
-    /// are ambiguous and fall back to the ordinary trunk branch point.
+    /// A local or tracked bookmark between trunk's fork point and the working
+    /// copy marks a named layer beneath the current work. Prefer its branch
+    /// point when there is exactly one such nearest ancestor; merges with two
+    /// candidates are ambiguous and fall back to the ordinary trunk branch
+    /// point.
     fn bookmarked_stack_base(&self) -> Option<Base> {
         let out = self
             .run(&[
                 "log",
                 "-r",
-                "heads(bookmarks() & fork_point(trunk() | @)::@-)",
+                "heads((bookmarks() | remote_bookmarks()) & fork_point(trunk() | @)::@-)",
                 "--no-graph",
                 "-T",
-                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
+                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\t\" ++ remote_bookmarks.map(|b| b.name() ++ \"@\" ++ b.remote()).join(\"\\t\") ++ \"\\n\"",
             ])
             .ok()?;
         let rows: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
@@ -1084,6 +1085,51 @@ mod tests {
         let changes = backend
             .list_changes(&Scope::Range(base), false)
             .expect("load the layer above the moved bookmark");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["top.txt"]
+        );
+    }
+
+    #[test]
+    fn jj_default_base_uses_a_tracked_bookmark_when_its_local_copy_diverged() {
+        let repo = TempRepo::new("jj-tracked-stack-base");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+
+        let remote = repo.0.join("remote.git");
+        repo.run("git", &["init", "--bare", remote.to_str().unwrap()]);
+        repo.run(
+            "jj",
+            &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        repo.run("jj", &["git", "push", "--bookmark", "main"]);
+
+        std::fs::write(repo.0.join("lower.txt"), "lower layer\n").unwrap();
+        repo.run("jj", &["describe", "-m", "lower layer"]);
+        repo.run("jj", &["bookmark", "create", "stack-base", "-r", "@"]);
+        repo.run("jj", &["git", "push", "--bookmark", "stack-base"]);
+
+        std::fs::write(repo.0.join("local.txt"), "divergent local work\n").unwrap();
+        repo.run("jj", &["describe", "-m", "divergent local stack base"]);
+        repo.run("jj", &["bookmark", "move", "stack-base", "--to", "@"]);
+        repo.run("jj", &["new", "-r", "stack-base@origin"]);
+        std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = backend.default_bases().remove(0);
+        assert_eq!(
+            backend.base_label(&base),
+            "fork_point(stack-base@origin | @)"
+        );
+        let changes = backend
+            .list_changes(&Scope::Range(base), false)
+            .expect("load only the layer above the tracked bookmark");
         assert_eq!(
             changes
                 .iter()
