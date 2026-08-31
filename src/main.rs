@@ -883,9 +883,11 @@ struct App {
     /// GitHub-style "ignore whitespace" toggle. When on, diffs are computed
     /// with `-w` (`--ignore-all-space`), collapsing reindentation noise.
     ignore_ws: bool,
-    /// Whether the keybinding help overlay is up. Toggled by `?`; any key
-    /// dismisses it.
+    /// Whether the keybinding help overlay is up, plus its vertical scroll
+    /// position and the maximum established by the latest draw.
     show_help: bool,
+    help_scroll: u16,
+    help_max_scroll: u16,
     /// Whether our terminal/tmux pane currently has focus. Driven by
     /// focus-change reports; stays `true` on terminals that don't send them.
     terminal_focused: bool,
@@ -997,6 +999,8 @@ impl App {
             commits_vis: PaneVis::Auto,
             ignore_ws: false,
             show_help: false,
+            help_scroll: 0,
+            help_max_scroll: 0,
             terminal_focused: true,
         };
         app.resolve_panes();
@@ -3676,6 +3680,27 @@ fn handle_event(
                     KeyCode::Char('q') | KeyCode::Char('y') => return Ok(Action::Quit),
                     _ => app.mode = Mode::Normal,
                 },
+                Mode::Normal if app.show_help => match key.code {
+                    KeyCode::Char('?') | KeyCode::Esc => app.show_help = false,
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.help_scroll = (app.help_scroll + 1).min(app.help_max_scroll)
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.help_scroll = app.help_scroll.saturating_sub(1)
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        app.help_scroll =
+                            app.help_scroll.saturating_add(10).min(app.help_max_scroll)
+                    }
+                    KeyCode::PageUp => app.help_scroll = app.help_scroll.saturating_sub(10),
+                    KeyCode::Char('g') | KeyCode::Home => app.help_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => app.help_scroll = app.help_max_scroll,
+                    _ => {}
+                },
+                Mode::Normal if key.code == KeyCode::Char('?') => {
+                    app.help_scroll = 0;
+                    app.show_help = true;
+                }
                 Mode::Normal if app.page == Page::PullRequest => match key.code {
                     KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Char('p') | KeyCode::Esc => {
@@ -3756,11 +3781,6 @@ fn handle_event(
                     KeyCode::Char('G') | KeyCode::End => app.thread_scroll = app.thread_max_scroll,
                     _ => {}
                 },
-                // Help overlay is up: any key dismisses it and is otherwise
-                // swallowed, so the binding it names doesn't also fire.
-                Mode::Normal if app.show_help => {
-                    app.show_help = false;
-                }
                 // Base picker is up. Same swallow-everything-else discipline as
                 // the help overlay: a stray key backs out of the pick rather
                 // than half-applying it and half-doing something unrelated.
@@ -3775,7 +3795,6 @@ fn handle_event(
                     _ => app.base_pick = None,
                 },
                 Mode::Normal => match key.code {
-                    KeyCode::Char('?') => app.show_help = true,
                     // `q` starts the same quit confirmation from every page.
                     // Esc keeps its peel-one-layer chain, since backing out a
                     // layer at a time is exactly what it's for; only its final
@@ -3981,6 +4000,16 @@ fn handle_event(
 }
 
 fn handle_mouse(app: &mut App, m: event::MouseEvent) {
+    if app.show_help {
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                app.help_scroll = app.help_scroll.saturating_add(3).min(app.help_max_scroll)
+            }
+            MouseEventKind::ScrollUp => app.help_scroll = app.help_scroll.saturating_sub(3),
+            _ => {}
+        }
+        return;
+    }
     if app.page == Page::PullRequest {
         match m.kind {
             MouseEventKind::ScrollDown => {
@@ -4106,15 +4135,59 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     }
 }
 
+fn contextual_footer(app: &App) -> Option<Paragraph<'static>> {
+    match &app.mode {
+        Mode::SearchInput { query } => Some(Paragraph::new(Line::from(vec![
+            Span::styled(
+                "/",
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(query.clone(), Style::default().fg(theme::TEXT)),
+        ]))),
+        Mode::Normal if app.base_pick.is_some() => {
+            // The warning is the whole guard against basing off @'s line. It
+            // appears exactly when it is actionable, unlike the old always-on
+            // keybinding strip.
+            let off_line = app
+                .base_pick
+                .and_then(|i| app.revs.get(i))
+                .is_some_and(|r| !r.is_ancestor);
+            let text = if off_line {
+                "picking base · not on @'s line: its commits will read as reversals · b / enter anyway · any other key cancels"
+            } else {
+                "picking base · j k move · b / enter set base · any other key cancels"
+            };
+            Some(Paragraph::new(text).style(Style::default().fg(theme::OVERLAY0)))
+        }
+        Mode::Normal => app.search_query.as_ref().map(|query| {
+            let total_matches = app.search_matches.len();
+            let active_match = app.search_active_idx.map_or(0, |idx| idx + 1);
+            Paragraph::new(format!(
+                "search: \"{query}\" · match {active_match}/{total_matches}"
+            ))
+            .style(Style::default().fg(theme::OVERLAY0))
+        }),
+        _ => None,
+    }
+}
+
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     match app.page {
         Page::PullRequest => {
             draw_pull_request(frame, app);
+            if app.show_help {
+                draw_help(frame, frame.area(), app);
+            }
             draw_mode_overlay(frame, app);
             return;
         }
         Page::ReviewThread => {
             draw_review_thread(frame, app);
+            if app.show_help {
+                draw_help(frame, frame.area(), app);
+            }
             draw_mode_overlay(frame, app);
             return;
         }
@@ -4122,12 +4195,14 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
     let area = frame.area();
 
+    let footer = contextual_footer(app);
+    let footer_height = u16::from(footer.is_some());
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
             Constraint::Min(0),
-            Constraint::Length(1),
+            Constraint::Length(footer_height),
         ])
         .split(area);
 
@@ -4287,89 +4362,16 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         app.commits_area = Rect::default();
     }
 
-    let footer_widget = match &app.mode {
-        Mode::SearchInput { query } => {
-            let spans = vec![
-                Span::styled(
-                    "/",
-                    Style::default()
-                        .fg(theme::MAUVE)
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(query.clone(), Style::default().fg(theme::TEXT)),
-            ];
-            Paragraph::new(Line::from(spans))
-        }
-        _ => {
-            let wrap_hint = if app.wrap { "w unwrap" } else { "w wrap" };
-            let ws_hint = if app.ignore_ws {
-                "W show ws"
-            } else {
-                "W ignore ws"
-            };
-            let mut text = match &app.mode {
-                // The warning is the whole guard against basing off @'s line.
-                // It costs no row width and appears exactly when it's
-                // actionable, which a per-row label manages neither of.
-                Mode::Normal if app.base_pick.is_some() => {
-                    let off_line = app
-                        .base_pick
-                        .and_then(|i| app.revs.get(i))
-                        .is_some_and(|r| !r.is_ancestor);
-                    if off_line {
-                        "picking base — not on @'s line: its commits will read as reversals · b / enter anyway · any other key cancels".to_string()
-                    } else {
-                        "picking base — j k move · b / enter set base · any other key cancels"
-                            .to_string()
-                    }
-                }
-                Mode::Normal => match app.focus {
-                    Focus::Commits => {
-                        format!(
-                            "q quit · j k select · b pick base · enter view rev · esc focus diff · {wrap_hint} · {ws_hint} · ? help"
-                        )
-                    }
-                    Focus::Files => {
-                        format!(
-                            "q quit · j k select · enter open · tab focus · b base · {wrap_hint} · {ws_hint} · ? help"
-                        )
-                    }
-                    Focus::Diff => {
-                        format!(
-                            "q quit · tab focus · b base · {wrap_hint} · {ws_hint} · n agent note · e edit · ? help"
-                        )
-                    }
-                },
-                _ => String::new(),
-            };
-            if !app.annotations.is_empty() {
-                text = format!("{text} · 1-9 step [{}]", app.annotations.len());
-            }
-            if let Some(ref query) = app.search_query {
-                let total_matches = app.search_matches.len();
-                let active_match = app.search_active_idx.map_or(0, |idx| idx + 1);
-                text = format!(
-                    "{text} · n next · N prev · / \"{query}\" [{active_match}/{total_matches}]"
-                );
-            }
-            if let Some(pr) = &app.pull_request {
-                text = format!("{text} · p PR context");
-                text = format!("{text} · c shared review draft");
-                if !pr.threads.is_empty() {
-                    text = format!("{text} · t T review thread");
-                }
-            }
-            Paragraph::new(Line::from(text)).style(Style::default().fg(theme::OVERLAY0))
-        }
-    };
-    frame.render_widget(footer_widget, rows[2]);
+    if let Some(footer) = footer {
+        frame.render_widget(footer, rows[2]);
+    }
 
     if let Mode::SearchInput { query } = &app.mode {
         frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
     }
 
     if app.show_help {
-        draw_help(frame, frame.area());
+        draw_help(frame, frame.area(), app);
     }
     draw_mode_overlay(frame, app);
 }
@@ -4391,11 +4393,7 @@ fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(frame.area());
 
     let header = vec![
@@ -4453,11 +4451,6 @@ fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
             .wrap(Wrap { trim: false })
             .scroll((app.pr_scroll.min(u16::MAX as usize) as u16, 0)),
         rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new("p/esc diff · c review body · t/T threads · j/k scroll · g/G ends · q quit")
-            .style(Style::default().fg(theme::OVERLAY0)),
-        rows[2],
     );
 }
 
@@ -4552,11 +4545,7 @@ fn draw_review_thread(frame: &mut ratatui::Frame, app: &mut App) {
     };
     let rows = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(2),
-            Constraint::Min(0),
-            Constraint::Length(1),
-        ])
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
         .split(frame.area());
     let state = if thread.outdated {
         "outdated"
@@ -4608,11 +4597,6 @@ fn draw_review_thread(frame: &mut ratatui::Frame, app: &mut App) {
             .wrap(Wrap { trim: false })
             .scroll((app.thread_scroll.min(u16::MAX as usize) as u16, 0)),
         rows[1],
-    );
-    frame.render_widget(
-        Paragraph::new("esc diff · t/T threads · j/k scroll · p PR · q quit")
-            .style(Style::default().fg(theme::OVERLAY0)),
-        rows[2],
     );
 }
 
@@ -4980,9 +4964,9 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("esc", "dismiss or step back"),
 ];
 
-/// Centered keybinding reference. Drawn over everything when `show_help` is on;
-/// the source of truth the footer used to try (and fail) to fit inline.
-fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
+/// Centered, scrollable keybinding reference. Drawn over everything when
+/// `show_help` is on; this is the sole always-available binding reference.
+fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     // Widest key column across all bindings, so descriptions align.
     let key_w = HELP_ROWS
         .iter()
@@ -5033,6 +5017,20 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
         height,
     };
 
+    let content_height = popup.height.saturating_sub(2);
+    app.help_max_scroll = (lines.len() as u16).saturating_sub(content_height);
+    app.help_scroll = app.help_scroll.min(app.help_max_scroll);
+    let first_visible = (app.help_scroll as usize + 1).min(lines.len());
+    let last_visible = (app.help_scroll as usize + content_height as usize).min(lines.len());
+    let hint = if app.help_max_scroll == 0 {
+        " ? / esc close ".to_string()
+    } else {
+        format!(
+            " ↑↓ / pgup pgdn scroll · {first_visible}-{last_visible}/{} · ? / esc close ",
+            lines.len()
+        )
+    };
+
     let block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(theme::MAUVE))
@@ -5042,11 +5040,14 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect) {
                 .fg(theme::MAUVE)
                 .add_modifier(Modifier::BOLD),
         )
+        .title_bottom(Span::styled(hint, Style::default().fg(theme::OVERLAY0)))
         .style(Style::default().bg(theme::BASE));
 
     frame.render_widget(Clear, popup);
     frame.render_widget(
-        Paragraph::new(lines).block(block.padding(ratatui::widgets::Padding::horizontal(1))),
+        Paragraph::new(lines)
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
+            .scroll((app.help_scroll, 0)),
         popup,
     );
 }
@@ -5987,6 +5988,38 @@ mod tests {
         assert!(app.wrap);
         app.toggle_wrap();
         assert!(!app.wrap);
+    }
+
+    #[test]
+    fn idle_diff_reclaims_the_contextual_footer_row() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let idle_height = app.diff_content_area.height;
+
+        app.search_query = Some("needle".into());
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(idle_height, app.diff_content_area.height + 1);
+    }
+
+    #[test]
+    fn help_scroll_is_clamped_to_a_small_terminal() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(80, 12);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.show_help = true;
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.help_max_scroll > 0);
+
+        app.help_scroll = u16::MAX;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.help_scroll, app.help_max_scroll);
     }
 
     #[test]
