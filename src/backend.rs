@@ -36,8 +36,10 @@ pub enum Scope {
     Rev(String),
 }
 
-/// A revision in the current range. `id` is the canonical handle we pass back
-/// to the backend (jj change-id, git sha); `short_id` is the truncated display.
+/// A revision in the current range. `id` is the immutable handle we pass back
+/// to the backend (jj commit id, git sha); `short_id` is the truncated display.
+/// A jj change id can name multiple divergent commits, so it is display data,
+/// not a safe revision target.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rev {
     pub id: String,
@@ -207,11 +209,11 @@ impl JjBackend {
         }
     }
 
-    /// Resolve a revset to exactly one change id, or empty if it doesn't
+    /// Resolve a revset to exactly one commit id, or empty if it doesn't
     /// resolve. `--limit 1` matters: without it a revset returning two commits
     /// concatenates their ids into a string that matches no rev at all, which
     /// silently drops the marker rather than failing loudly.
-    fn resolve_change_id(&self, revset: &str) -> String {
+    fn resolve_commit_id(&self, revset: &str) -> String {
         self.run(&[
             "log",
             "-r",
@@ -220,7 +222,7 @@ impl JjBackend {
             "1",
             "--no-graph",
             "-T",
-            "change_id ++ \"\\n\"",
+            "commit_id ++ \"\\n\"",
         ])
         .ok()
         .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
@@ -239,7 +241,7 @@ impl JjBackend {
                 "heads(bookmarks() & fork_point(trunk() | @)::@-)",
                 "--no-graph",
                 "-T",
-                "change_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
+                "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
             ])
             .ok()?;
         let rows: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
@@ -248,7 +250,7 @@ impl JjBackend {
         };
         let mut fields = row.split('\t');
         let candidate_id = fields.next()?;
-        if candidate_id == self.resolve_change_id("fork_point(trunk() | @)") {
+        if candidate_id == self.resolve_commit_id("fork_point(trunk() | @)") {
             return None;
         }
         let bookmarks: Vec<&str> = fields.filter(|name| !name.is_empty()).collect();
@@ -353,15 +355,15 @@ impl Backend for JjBackend {
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>> {
         let base_revset = Self::revset(base);
 
-        let base_id = self.resolve_change_id(&base_revset);
-        let wc_id = self.resolve_change_id("@");
+        let base_id = self.resolve_commit_id(&base_revset);
+        let wc_id = self.resolve_commit_id("@");
         // Landmarks worth pointing at in the picker. Both are cheap single-rev
         // resolves, and both are answers to "where would I plausibly want to
         // be based instead", which is the question the panel exists to answer.
-        let trunk_id = self.resolve_change_id("trunk()");
-        let fork_id = self.resolve_change_id("fork_point(trunk() | @)");
+        let trunk_id = self.resolve_commit_id("trunk()");
+        let fork_id = self.resolve_commit_id("fork_point(trunk() | @)");
 
-        // Get the set of change_ids that fall within the range `base_revset..@`
+        // Get the set of commit ids that fall within the range `base_revset..@`.
         let range_output = self
             .run(&[
                 "log",
@@ -369,7 +371,7 @@ impl Backend for JjBackend {
                 &format!("{base_revset}..@"),
                 "--no-graph",
                 "-T",
-                "change_id ++ \"\n\"",
+                "commit_id ++ \"\n\"",
             ])
             .unwrap_or_default();
         let range_ids: std::collections::HashSet<String> = range_output
@@ -387,7 +389,7 @@ impl Backend for JjBackend {
                 "::@",
                 "--no-graph",
                 "-T",
-                "change_id ++ \"\\n\"",
+                "commit_id ++ \"\\n\"",
             ])
             .unwrap_or_default()
             .lines()
@@ -407,7 +409,7 @@ impl Backend for JjBackend {
         // is drawn from those in `crate::graph`, which is why this asks for
         // data rather than glyphs.
         let revset = format!("::@ | ::{base_revset} | ::trunk()");
-        let template = r#"change_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\t" ++ parents.map(|p| p.change_id()).join(" ") ++ "\n""#;
+        let template = r#"commit_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(" ") ++ "\n""#;
         let out = self.run(&[
             "log",
             "-r",
@@ -974,6 +976,50 @@ mod tests {
         // Anything we have no name for falls through as itself rather than
         // becoming a lie.
         assert_eq!(jj.base_display(&Base::Revision("abc123".into())), "abc123");
+    }
+
+    #[test]
+    fn jj_revision_rows_remain_selectable_when_a_change_is_divergent() {
+        let repo = TempRepo::new("jj-divergent-revision-row");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+
+        let remote = repo.0.join("remote.git");
+        repo.run("git", &["init", "--bare", remote.to_str().unwrap()]);
+        repo.run(
+            "jj",
+            &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        repo.run("jj", &["git", "push", "--bookmark", "main"]);
+
+        std::fs::write(repo.0.join("layer.txt"), "published layer\n").unwrap();
+        repo.run("jj", &["describe", "-m", "published layer"]);
+        repo.run("jj", &["bookmark", "create", "layer", "-r", "@"]);
+        repo.run("jj", &["git", "push", "--bookmark", "layer"]);
+
+        std::fs::write(repo.0.join("layer.txt"), "rewritten layer\n").unwrap();
+        repo.run("jj", &["describe", "-m", "rewritten layer"]);
+        repo.run("jj", &["bookmark", "move", "layer", "--to", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
+
+        let backend = JjBackend::new(repo.0.clone());
+        let trunk = Base::MergeBase {
+            against: Box::new(Base::Revision("trunk()".into())),
+        };
+        let rev = backend
+            .list_revs(&trunk)
+            .expect("load revision rows")
+            .into_iter()
+            .find(|rev| rev.summary == "rewritten layer")
+            .expect("find rewritten layer");
+
+        let changes = backend
+            .list_changes(&Scope::Rev(rev.id), false)
+            .expect("select one revision despite its divergent change id");
+        assert!(changes.iter().any(|change| change.path == "layer.txt"));
     }
 
     #[test]
