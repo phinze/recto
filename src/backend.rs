@@ -239,7 +239,7 @@ impl JjBackend {
                 "heads(bookmarks() & fork_point(trunk() | @)::@-)",
                 "--no-graph",
                 "-T",
-                "change_id ++ \"\\t\" ++ bookmarks.join(\"\\t\") ++ \"\\n\"",
+                "change_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\n\"",
             ])
             .ok()?;
         let rows: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
@@ -987,6 +987,48 @@ mod tests {
         let changes = backend
             .list_changes(&Scope::Range(base), false)
             .expect("load only the top stack layer");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["top.txt"]
+        );
+    }
+
+    #[test]
+    fn jj_default_base_uses_the_name_of_an_unsynced_bookmark() {
+        let repo = TempRepo::new("jj-unsynced-stack-base");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+
+        let remote = repo.0.join("remote.git");
+        repo.run("git", &["init", "--bare", remote.to_str().unwrap()]);
+        repo.run(
+            "jj",
+            &["git", "remote", "add", "origin", remote.to_str().unwrap()],
+        );
+        repo.run("jj", &["git", "push", "--bookmark", "main"]);
+
+        std::fs::write(repo.0.join("lower.txt"), "lower layer\n").unwrap();
+        repo.run("jj", &["describe", "-m", "lower layer"]);
+        repo.run("jj", &["bookmark", "create", "stack-base", "-r", "@"]);
+        repo.run("jj", &["git", "push", "--bookmark", "stack-base"]);
+
+        std::fs::write(repo.0.join("middle.txt"), "moved stack base\n").unwrap();
+        repo.run("jj", &["describe", "-m", "moved stack base"]);
+        repo.run("jj", &["bookmark", "move", "stack-base", "--to", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = backend.default_bases().remove(0);
+        assert_eq!(backend.base_label(&base), "fork_point(stack-base | @)");
+        let changes = backend
+            .list_changes(&Scope::Range(base), false)
+            .expect("load the layer above the moved bookmark");
         assert_eq!(
             changes
                 .iter()
