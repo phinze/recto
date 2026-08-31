@@ -36,6 +36,10 @@ pub enum Request {
     Annotate { sites: Vec<Site> },
     /// Clear any active focus highlight and annotations.
     Clear,
+    /// Show, hide, or toggle non-tour comments in the diff and file tree.
+    /// `None` toggles the current state.
+    #[serde(rename = "comment-visibility")]
+    CommentVisibility { visible: Option<bool> },
     /// Liveness check.
     Ping,
     /// Attach a read-only GitHub pull request snapshot to the review surface.
@@ -312,6 +316,11 @@ pub struct Status {
     pub focus: bool,
     /// Number of active tour annotations.
     pub annotations: usize,
+    /// Whether published threads, shared drafts, and private notes are visible
+    /// in the diff and file tree. Older Recto versions omitted this and always
+    /// showed them.
+    #[serde(default = "visible_by_default")]
+    pub comments_visible: bool,
     /// Private agent notes waiting for a `recto notes` read. The field retains
     /// its old wire name so older companion clients can still discover them.
     #[serde(default)]
@@ -328,6 +337,10 @@ pub struct Status {
     /// Whether the attached PR identity and live workspace have diverged.
     #[serde(default)]
     pub stale_review: bool,
+}
+
+const fn visible_by_default() -> bool {
+    true
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize, PartialEq, Eq)]
@@ -677,6 +690,12 @@ fn handle_while_in_editor(
             queue(tx, request.clone());
             Response::ok()
         }
+        Request::CommentVisibility { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note(
+                "recto is in an editor; comment visibility will apply when you return",
+            )
+        }
         Request::Focus { path, start, end } => {
             let drove = nvim
                 .as_ref()
@@ -892,6 +911,26 @@ mod tests {
     }
 
     #[test]
+    fn comment_visibility_wire_format() {
+        let hide: Request = serde_json::from_str(r#"{"cmd":"comment-visibility","visible":false}"#)
+            .expect("parse hide");
+        assert!(matches!(
+            hide,
+            Request::CommentVisibility {
+                visible: Some(false)
+            }
+        ));
+
+        let toggle: Request =
+            serde_json::from_str(r#"{"cmd":"comment-visibility","visible":null}"#)
+                .expect("parse toggle");
+        assert!(matches!(
+            toggle,
+            Request::CommentVisibility { visible: None }
+        ));
+    }
+
+    #[test]
     fn shared_review_draft_wire_format() {
         let create = r#"{"cmd":"review-comment","path":"src/main.rs","start":42,"body":"Could this return the error?"}"#;
         let req: Request = serde_json::from_str(create).expect("parse create");
@@ -978,6 +1017,7 @@ mod tests {
             capabilities: Capabilities::recto(),
             focus: false,
             annotations: 0,
+            comments_visible: true,
             pending_comments: 2,
             draft_comments: 0,
             draft_body: false,
@@ -992,6 +1032,7 @@ mod tests {
         assert_eq!(status.base, "@-");
         assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
         assert_eq!(status.pending_comments, 2);
+        assert!(status.comments_visible);
         assert!(!status.draft_body);
         assert_eq!(status.surface, Surface::Recto);
         assert_eq!(
@@ -1017,6 +1058,7 @@ mod tests {
         assert_eq!(old.capabilities, Capabilities::recto());
         assert!(old.workspace_revision.is_empty());
         assert!(!old.stale_review);
+        assert!(old.comments_visible);
         // A recto too old to know about comments simply has none pending.
         assert_eq!(old.pending_comments, 0);
         assert_eq!(old.draft_comments, 0);
@@ -1050,6 +1092,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                comments_visible: true,
                 pending_comments: 0,
                 draft_comments: 0,
                 draft_body: false,
@@ -1098,6 +1141,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                comments_visible: true,
                 pending_comments: 0,
                 draft_comments: 0,
                 draft_body: false,
@@ -1226,6 +1270,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                comments_visible: true,
                 pending_comments: 3,
                 draft_comments: 0,
                 draft_body: false,

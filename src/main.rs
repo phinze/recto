@@ -19,7 +19,7 @@ use std::sync::{Arc, mpsc};
 use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
-use clap::{Parser, Subcommand};
+use clap::{Parser, Subcommand, ValueEnum};
 use crossterm::{
     event::{
         self, DisableFocusChange, DisableMouseCapture, EnableFocusChange, EnableMouseCapture,
@@ -229,6 +229,12 @@ enum ClientCommand {
     },
     /// Clear any active focus highlight and annotations in the running recto.
     Clear,
+    /// Control visibility of published threads, shared drafts, and private
+    /// notes without affecting tour annotations.
+    CommentVisibility {
+        #[arg(value_enum, default_value_t = VisibilityAction::Toggle)]
+        action: VisibilityAction,
+    },
     /// Check that a recto is listening for this workspace.
     Ping,
     /// Fetch and open a GitHub PR in the running recto, selecting its exact
@@ -260,6 +266,13 @@ enum ClientCommand {
         id: Option<u64>,
         input: String,
     },
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum)]
+enum VisibilityAction {
+    Show,
+    Hide,
+    Toggle,
 }
 
 #[derive(Subcommand, Debug)]
@@ -892,6 +905,10 @@ struct App {
     /// GitHub-style "ignore whitespace" toggle. When on, diffs are computed
     /// with `-w` (`--ignore-all-space`), collapsing reindentation noise.
     ignore_ws: bool,
+    /// Whether non-tour review objects are woven into the diff and file tree.
+    /// Session-only so a tour cannot leave the next Recto launch mysteriously
+    /// missing review context.
+    show_comments: bool,
     /// Whether the keybinding help overlay is up, plus its vertical scroll
     /// position and the maximum established by the latest draw.
     show_help: bool,
@@ -1010,6 +1027,7 @@ impl App {
             files_vis: PaneVis::Auto,
             commits_vis: PaneVis::Auto,
             ignore_ws: false,
+            show_comments: true,
             show_help: false,
             help_scroll: 0,
             help_max_scroll: 0,
@@ -1701,16 +1719,29 @@ impl App {
             FileRow::Dir(_) => None,
         });
 
-        let threads = self
-            .pull_request
-            .as_ref()
-            .map_or(&[][..], |pr| pr.threads.as_slice());
+        let threads = if self.show_comments {
+            self.pull_request
+                .as_ref()
+                .map_or(&[][..], |pr| pr.threads.as_slice())
+        } else {
+            &[]
+        };
+        let drafts = if self.show_comments {
+            self.review_draft_comments.as_slice()
+        } else {
+            &[]
+        };
+        let agent_notes = if self.show_comments {
+            self.agent_notes.as_slice()
+        } else {
+            &[]
+        };
         let rows = build_review_file_rows(
             &self.changes,
             &self.annotations,
             threads,
-            &self.review_draft_comments,
-            &self.agent_notes,
+            drafts,
+            agent_notes,
         );
 
         let selected_row = selected
@@ -1899,26 +1930,31 @@ impl App {
 
         let (file_idx, line) = self.line_info.get(row).copied().flatten()?;
         let path = &self.changes.get(file_idx)?.path;
-        let threads = self
-            .pull_request
-            .as_ref()
-            .map_or(&[][..], |pr| pr.threads.as_slice());
-        let contains = |thread: &link::ReviewThread| {
-            thread.path == *path
-                && review_thread_span(thread)
-                    .is_some_and(|(start, end)| (start..=end).contains(&line))
-        };
-        if let Some(i) = self
-            .active_thread
-            .filter(|i| threads.get(*i).is_some_and(contains))
-            .or_else(|| threads.iter().position(contains))
-        {
-            return Some(FileReviewObject::PublishedThread(i));
+        if self.show_comments {
+            let threads = self
+                .pull_request
+                .as_ref()
+                .map_or(&[][..], |pr| pr.threads.as_slice());
+            let contains = |thread: &link::ReviewThread| {
+                thread.path == *path
+                    && review_thread_span(thread)
+                        .is_some_and(|(start, end)| (start..=end).contains(&line))
+            };
+            if let Some(i) = self
+                .active_thread
+                .filter(|i| threads.get(*i).is_some_and(contains))
+                .or_else(|| threads.iter().position(contains))
+            {
+                return Some(FileReviewObject::PublishedThread(i));
+            }
         }
         if let Some(i) = self.annotations.iter().position(|annotation| {
             annotation.path == *path && (annotation.start..=annotation.end).contains(&line)
         }) {
             return Some(FileReviewObject::TourStop(i));
+        }
+        if !self.show_comments {
+            return None;
         }
         if let Some(comment) = self
             .review_draft_comments
@@ -1944,6 +1980,23 @@ impl App {
         if double {
             self.activate_review_object(object);
         }
+    }
+
+    fn set_comment_visibility(&mut self, visible: Option<bool>) -> link::Response {
+        let visible = visible.unwrap_or(!self.show_comments);
+        if visible != self.show_comments {
+            self.show_comments = visible;
+            self.last_review_click = None;
+            self.reweave();
+        }
+        link::Response::ok_note(format!(
+            "comments {}",
+            if self.show_comments {
+                "shown"
+            } else {
+                "hidden"
+            }
+        ))
     }
 
     fn scroll_right(&mut self, n: u16) {
@@ -2008,6 +2061,7 @@ impl App {
             capabilities: link::Capabilities::recto(),
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
+            comments_visible: self.show_comments,
             pending_comments: self.agent_notes.len(),
             draft_comments: self.review_draft_comments.len(),
             draft_body: self.review_draft_body.is_some(),
@@ -2139,6 +2193,7 @@ impl App {
                 }
                 link::Response::ok()
             }
+            link::Request::CommentVisibility { visible } => self.set_comment_visibility(visible),
             link::Request::AgentNote {
                 path,
                 start,
@@ -2362,56 +2417,62 @@ impl App {
                 Some(FileReviewObject::TourStop(i)),
             ));
         }
-        if let Some(pr) = &self.pull_request {
-            for (i, thread) in pr.threads.iter().enumerate() {
-                let Some((start, end)) = review_thread_span(thread) else {
-                    continue;
-                };
-                let Some(file_idx) = self.changes.iter().position(|c| c.path == thread.path) else {
-                    continue;
-                };
-                let Some(rows) = rows_for_span(&self.base_line_info, file_idx, start, end) else {
-                    continue;
-                };
-                inserts.push((
-                    *rows.start(),
-                    review_thread_line(i + 1, thread),
-                    Some(FileReviewObject::PublishedThread(i)),
-                ));
+        if self.show_comments {
+            if let Some(pr) = &self.pull_request {
+                for (i, thread) in pr.threads.iter().enumerate() {
+                    let Some((start, end)) = review_thread_span(thread) else {
+                        continue;
+                    };
+                    let Some(file_idx) = self.changes.iter().position(|c| c.path == thread.path)
+                    else {
+                        continue;
+                    };
+                    let Some(rows) = rows_for_span(&self.base_line_info, file_idx, start, end)
+                    else {
+                        continue;
+                    };
+                    inserts.push((
+                        *rows.start(),
+                        review_thread_line(i + 1, thread),
+                        Some(FileReviewObject::PublishedThread(i)),
+                    ));
+                }
             }
-        }
-        for (i, comment) in self.review_draft_comments.iter().enumerate() {
-            let Some(file_idx) = self.changes.iter().position(|ch| ch.path == comment.path) else {
-                continue;
-            };
-            let Some(rows) =
-                rows_for_span(&self.base_line_info, file_idx, comment.start, comment.end)
-            else {
-                continue;
-            };
-            for (j, line) in markdown::lines(&comment.body).into_iter().enumerate() {
-                inserts.push((
-                    *rows.start(),
-                    review_draft_line(i + 1, comment, line, j == 0),
-                    Some(FileReviewObject::SharedDraft(comment.id)),
-                ));
+            for (i, comment) in self.review_draft_comments.iter().enumerate() {
+                let Some(file_idx) = self.changes.iter().position(|ch| ch.path == comment.path)
+                else {
+                    continue;
+                };
+                let Some(rows) =
+                    rows_for_span(&self.base_line_info, file_idx, comment.start, comment.end)
+                else {
+                    continue;
+                };
+                for (j, line) in markdown::lines(&comment.body).into_iter().enumerate() {
+                    inserts.push((
+                        *rows.start(),
+                        review_draft_line(i + 1, comment, line, j == 0),
+                        Some(FileReviewObject::SharedDraft(comment.id)),
+                    ));
+                }
             }
-        }
-        for (i, c) in self.agent_notes.iter().enumerate() {
-            let Some(file_idx) = self.changes.iter().position(|ch| ch.path == c.path) else {
-                continue;
-            };
-            let Some(rows) = rows_for_span(&self.base_line_info, file_idx, c.start, c.end) else {
-                continue;
-            };
-            // A comment body can be several lines; each gets its own row so a
-            // long note stays readable instead of being truncated to a preview.
-            for (j, text) in c.body.lines().enumerate() {
-                inserts.push((
-                    *rows.start(),
-                    agent_note_line(i + 1, text, j == 0),
-                    Some(FileReviewObject::AgentNote(i)),
-                ));
+            for (i, c) in self.agent_notes.iter().enumerate() {
+                let Some(file_idx) = self.changes.iter().position(|ch| ch.path == c.path) else {
+                    continue;
+                };
+                let Some(rows) = rows_for_span(&self.base_line_info, file_idx, c.start, c.end)
+                else {
+                    continue;
+                };
+                // A comment body can be several lines; each gets its own row so a
+                // long note stays readable instead of being truncated to a preview.
+                for (j, text) in c.body.lines().enumerate() {
+                    inserts.push((
+                        *rows.start(),
+                        agent_note_line(i + 1, text, j == 0),
+                        Some(FileReviewObject::AgentNote(i)),
+                    ));
+                }
             }
         }
         if inserts.is_empty() {
@@ -3175,6 +3236,13 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
             pull_request: Box::new(github::fetch_pull_request(locator)?),
         }),
         ClientCommand::Clear => Ok(link::Request::Clear),
+        ClientCommand::CommentVisibility { action } => Ok(link::Request::CommentVisibility {
+            visible: match action {
+                VisibilityAction::Show => Some(true),
+                VisibilityAction::Hide => Some(false),
+                VisibilityAction::Toggle => None,
+            },
+        }),
         ClientCommand::Focus { pathspec } => {
             let (raw_path, start, end) = parse_pathspec(pathspec);
             let cwd = std::env::current_dir()?;
@@ -3712,6 +3780,9 @@ fn handle_event(
                 Mode::Normal if key.code == KeyCode::Char('?') => {
                     app.help_scroll = 0;
                     app.show_help = true;
+                }
+                Mode::Normal if key.code == KeyCode::Char('v') => {
+                    app.set_comment_visibility(None);
                 }
                 Mode::Normal if app.page == Page::PullRequest => match key.code {
                     KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
@@ -4289,6 +4360,12 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         header_spans.push(Span::styled(
             " · ignoring whitespace".to_string(),
             Style::default().fg(theme::MAUVE),
+        ));
+    }
+    if !app.show_comments {
+        header_spans.push(Span::styled(
+            " · comments hidden",
+            Style::default().fg(theme::OVERLAY0),
         ));
     }
     if let Some(loading) = &app.loading {
@@ -5018,6 +5095,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("double click", "open a review object in files or diff"),
     bind("c", "create / edit a shared public review draft"),
     bind("n", "leave a private note for the local agent"),
+    bind("v", "toggle non-tour comments"),
     bind(
         "enter",
         "stage locally · shift-enter newline · empty deletes",
@@ -6288,6 +6366,96 @@ mod tests {
     }
 
     #[test]
+    fn hiding_comments_leaves_tour_annotations_woven() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let changes = vec![change("foo.go")];
+        let fetch: Box<FetchContent> = Box::new(|_| None);
+        let rendered = render_diff(TWO_HUNK_DIFF, &changes, &Highlighter::new(), &*fetch);
+        app.apply_loaded(
+            Scope::Range(Base::Revision("base".into())),
+            LoadedDiff {
+                workspace_revision: "abc123".into(),
+                changes,
+                rendered: rendered.lines,
+                file_starts: rendered.file_starts,
+                line_info: rendered.line_info,
+                file_stats: rendered.file_stats,
+                revs: Some(Vec::new()),
+            },
+        );
+        app.annotations.push(Annotation {
+            path: "foo.go".into(),
+            start: 2,
+            end: 2,
+            label: "Tour stop".into(),
+        });
+        app.review_draft_comments.push(link::DraftReviewComment {
+            id: 7,
+            path: "foo.go".into(),
+            start: 2,
+            end: 2,
+            body: "Shared draft".into(),
+            last_editor: link::DraftEditor::User,
+        });
+        app.agent_notes.push(AgentNote {
+            id: 8,
+            path: "foo.go".into(),
+            start: 2,
+            end: 2,
+            body: "Private note".into(),
+        });
+        let mut pr = empty_pull_request("base");
+        pr.threads.push(link::ReviewThread {
+            id: "thread-1".into(),
+            path: "foo.go".into(),
+            side: link::DiffSide::Right,
+            line: Some(2),
+            start_line: None,
+            original_line: Some(2),
+            original_start_line: None,
+            resolved: false,
+            outdated: false,
+            comments: Vec::new(),
+        });
+        app.pull_request = Some(pr);
+        app.reweave();
+        assert_eq!(app.rendered_review_objects.iter().flatten().count(), 4);
+
+        let response = app.handle_request(link::Request::CommentVisibility {
+            visible: Some(false),
+        });
+        assert!(response.ok);
+        assert!(!app.show_comments);
+        assert_eq!(app.annotations.len(), 1);
+        assert_eq!(
+            app.rendered_review_objects
+                .iter()
+                .flatten()
+                .copied()
+                .collect::<Vec<_>>(),
+            vec![FileReviewObject::TourStop(0)]
+        );
+        assert_eq!(
+            app.file_rows
+                .iter()
+                .filter(|row| matches!(row, FileRow::ReviewObject { .. }))
+                .count(),
+            1
+        );
+        assert!(
+            !app.handle_request(link::Request::Ping)
+                .status
+                .expect("ping status")
+                .comments_visible
+        );
+
+        app.handle_request(link::Request::CommentVisibility { visible: None });
+        assert!(app.show_comments);
+        assert_eq!(app.rendered_review_objects.iter().flatten().count(), 4);
+    }
+
+    #[test]
     fn stale_review_reports_both_heads_and_refuses_agent_targets() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
@@ -6438,6 +6606,27 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             request,
             link::Request::ReviewDraftBody { body }
                 if body == "## Summary\n\nLooks good."
+        ));
+    }
+
+    #[test]
+    fn comment_visibility_command_maps_show_hide_and_toggle() {
+        let request = |action| build_request(&ClientCommand::CommentVisibility { action }).unwrap();
+        assert!(matches!(
+            request(VisibilityAction::Show),
+            link::Request::CommentVisibility {
+                visible: Some(true)
+            }
+        ));
+        assert!(matches!(
+            request(VisibilityAction::Hide),
+            link::Request::CommentVisibility {
+                visible: Some(false)
+            }
+        ));
+        assert!(matches!(
+            request(VisibilityAction::Toggle),
+            link::Request::CommentVisibility { visible: None }
         ));
     }
 

@@ -44,6 +44,8 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto focus PATH             # scroll to the file, no line span
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
     recto clear                  # remove the highlight and any annotations
+    recto comment-visibility hide # hide non-tour comments from the diff and file tree
+    recto comment-visibility show # restore non-tour comments
     recto ping                   # is a recto listening here?
     recto pr OWNER/REPO#NUMBER   # fetch and open public PR context in the TUI
     recto notes                  # collect the private notes the user left for you
@@ -153,6 +155,15 @@ turn, `focus` the one step being discussed and stop again. Do not clear the
 final highlight until the user acknowledges that the tour is done or asks to
 leave the tour.
 
+For a tour with noisy existing review context, use
+`recto comment-visibility hide`. This hides published threads, shared drafts,
+and private agent notes from the diff and file tree without touching tour
+annotations or deleting any content. Prefer explicit `hide` and `show` over
+`toggle`, since the user shares this live state with you. Restore comments with
+`recto comment-visibility show` when the tour ends unless the user asks to keep
+them hidden. Visibility is session-only, and PR/thread pages remain available
+when explicitly opened.
+
 ## How to use it in a tour
 
 For a single-threaded walkthrough, `focus` the current span, describe it, and
@@ -258,6 +269,7 @@ It looks like:
       },
       "focus": false,
       "annotations": 0,
+      "comments_visible": true,
       "pending_comments": 2,
       "draft_comments": 1,
       "draft_body": true
@@ -274,6 +286,10 @@ way to push into your session, so a ping you were already going to run is the
 cheapest place to notice. Anything above zero means `recto notes` has
 something for you. An older recto that predates the feature omits the field
 entirely, which reads as zero.
+
+`comments_visible` reports the shared TUI state controlled by `v` and
+`recto comment-visibility`. Older Recto versions omit it and always show
+comments.
 
 `draft_comments` counts the public review comments being co-authored locally.
 They survive Recto restarts. It is safe to follow a nonzero count with
