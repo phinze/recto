@@ -1000,6 +1000,20 @@ mod tests {
     fn jj_default_base_uses_the_name_of_an_unsynced_bookmark() {
         let repo = TempRepo::new("jj-unsynced-stack-base");
         repo.run("jj", &["git", "init", "--colocate", "."]);
+        repo.run(
+            "jj",
+            &["config", "set", "--repo", "user.name", "Recto Test"],
+        );
+        repo.run(
+            "jj",
+            &[
+                "config",
+                "set",
+                "--repo",
+                "user.email",
+                "recto@example.invalid",
+            ],
+        );
         std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
         repo.run("jj", &["describe", "-m", "trunk"]);
         repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
