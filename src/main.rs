@@ -510,6 +510,16 @@ struct NoteDraft {
     editing: Option<ComposerEdit>,
 }
 
+/// Geometry from the latest composer draw. Mouse input arrives between draws,
+/// so it needs both the body rectangle and the wrapped-row viewport that was
+/// actually on screen when the user clicked.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct NoteLayout {
+    body: Rect,
+    wrap_width: usize,
+    first_row: usize,
+}
+
 impl NoteDraft {
     fn byte_at(&self, caret: usize) -> usize {
         self.body
@@ -833,10 +843,9 @@ struct App {
     files_area: Rect,
     diff_content_area: Rect,
     commits_area: Rect,
-    /// Column count the agent-note modal last wrapped its body to. Left behind by
-    /// the draw pass so key handling can move the caret by visual row without
-    /// re-deriving the popup geometry.
-    note_wrap_width: usize,
+    /// The composer body geometry and viewport left behind by the draw pass,
+    /// shared by keyboard motion and mouse hit-testing.
+    note_layout: NoteLayout,
     commits_state: ListState,
     search_query: Option<String>,
     search_matches: Vec<SearchMatch>,
@@ -977,7 +986,10 @@ impl App {
             commits_area: Rect::default(),
             // Plausible stand-in for the one frame between opening the modal
             // and drawing it; the real width lands before any key arrives.
-            note_wrap_width: 76,
+            note_layout: NoteLayout {
+                wrap_width: 76,
+                ..NoteLayout::default()
+            },
             commits_state: ListState::default(),
             search_query: None,
             search_matches: Vec::new(),
@@ -3574,7 +3586,7 @@ fn handle_event(
                     let shift = key.modifiers.contains(event::KeyModifiers::SHIFT);
                     // Vertical motion needs the layout the modal was last
                     // drawn at; the draw pass leaves the width behind for us.
-                    let rows = draft.wrap_rows(app.note_wrap_width);
+                    let rows = draft.wrap_rows(app.note_layout.wrap_width);
                     match key.code {
                         KeyCode::Esc => app.mode = Mode::Normal,
                         // Newline needs a modifier because plain Enter submits.
@@ -3991,6 +4003,20 @@ fn handle_event(
                 app.persist_soon();
             }
         }
+        Event::Mouse(m) if matches!(app.mode, Mode::NoteInput(_)) => {
+            if let Mode::NoteInput(draft) = &mut mode
+                && m.kind == MouseEventKind::Down(MouseButton::Left)
+            {
+                move_note_caret_to_click(
+                    draft,
+                    app.note_layout,
+                    Position {
+                        x: m.column,
+                        y: m.row,
+                    },
+                );
+            }
+        }
         Event::Mouse(m) if matches!(app.mode, Mode::Normal) => handle_mouse(app, m),
         Event::FocusGained => app.terminal_focused = true,
         Event::FocusLost => app.terminal_focused = false,
@@ -4133,6 +4159,19 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         _ => {}
     }
+}
+
+fn move_note_caret_to_click(draft: &mut NoteDraft, layout: NoteLayout, pos: Position) {
+    if !layout.body.contains(pos) {
+        return;
+    }
+    let rows = draft.wrap_rows(layout.wrap_width);
+    let row_idx = layout.first_row + usize::from(pos.y - layout.body.y);
+    let Some(row) = rows.get(row_idx) else {
+        return;
+    };
+    let col = usize::from(pos.x - layout.body.x);
+    draft.caret = (row.start + col).min(row.end);
 }
 
 fn contextual_footer(app: &App) -> Option<Paragraph<'static>> {
@@ -4379,7 +4418,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 fn draw_mode_overlay(frame: &mut ratatui::Frame, app: &mut App) {
     match app.mode.clone() {
         Mode::NoteInput(draft) => {
-            app.note_wrap_width = draw_note_input(frame, frame.area(), &draft);
+            app.note_layout = draw_note_input(frame, frame.area(), &draft, app.note_layout);
         }
         Mode::QuitConfirm => draw_quit_confirm(frame, frame.area(), app),
         Mode::Normal | Mode::SearchInput { .. } => {}
@@ -4802,11 +4841,34 @@ fn draw_quit_confirm(frame: &mut ratatui::Frame, area: Rect, app: &App) {
     );
 }
 
+/// Keep the current viewport when the caret is already visible, and move it by
+/// only as much as necessary when keyboard motion crosses an edge.
+fn composer_scroll(
+    previous: usize,
+    caret_row: usize,
+    body_height: usize,
+    row_count: usize,
+) -> usize {
+    let max_scroll = row_count.saturating_sub(body_height);
+    let mut scroll = previous.min(max_scroll);
+    if caret_row < scroll {
+        scroll = caret_row;
+    } else if caret_row >= scroll + body_height {
+        scroll = caret_row + 1 - body_height;
+    }
+    scroll
+}
+
 /// The inline-comment composer. Sits at the bottom so it covers as little of
 /// the diff as possible: the draft is about a line you want to keep reading.
-/// Returns the column count the body was wrapped to, which key handling needs
-/// to move the caret by visual row.
-fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) -> usize {
+/// Returns the visible body geometry, which keyboard and mouse handling use to
+/// navigate the same wrapped rows the user saw.
+fn draw_note_input(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    draft: &NoteDraft,
+    previous: NoteLayout,
+) -> NoteLayout {
     let width = (area.width * 3 / 4).clamp(40, 100).min(area.width);
     // Two border columns and one of padding each side, then one more held back
     // so the caret has somewhere to sit at the end of a completely full row.
@@ -4818,7 +4880,7 @@ fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) ->
     // annotated should stay readable. Past that the body scrolls to the caret.
     let max_body = ((area.height.saturating_sub(3) / 2) as usize).max(1);
     let body_h = rows.len().clamp(1, max_body);
-    let scroll = caret_row.saturating_sub(body_h - 1);
+    let scroll = composer_scroll(previous.first_row, caret_row, body_h, rows.len());
 
     let height = (body_h as u16 + 2).min(area.height);
     let popup = Rect {
@@ -4826,6 +4888,12 @@ fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) ->
         y: area.y + area.height.saturating_sub(height).saturating_sub(1),
         width,
         height,
+    };
+    let body = Rect {
+        x: popup.x.saturating_add(2),
+        y: popup.y.saturating_add(1),
+        width: popup.width.saturating_sub(4),
+        height: popup.height.saturating_sub(2),
     };
 
     // The error takes over the accent colour as well as the hint line: a
@@ -4900,7 +4968,11 @@ fn draw_note_input(frame: &mut ratatui::Frame, area: Rect, draft: &NoteDraft) ->
     if x < popup.right().saturating_sub(1) && y < popup.bottom().saturating_sub(1) {
         frame.set_cursor_position((x, y));
     }
-    wrap_width
+    NoteLayout {
+        body,
+        wrap_width,
+        first_row: scroll,
+    }
 }
 
 /// One row in the help overlay: either a section heading (`key` empty) or a
@@ -4957,6 +5029,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("alt-b  alt-f", "word back / forward"),
     bind("^d  del", "delete forward"),
     bind("↑ ↓", "move by wrapped row"),
+    bind("left click", "place the comment caret"),
     head("Other"),
     bind("e", "edit file at line in $EDITOR"),
     bind("?", "toggle this help"),
@@ -6613,6 +6686,37 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         // Caret back up on the first row reports that row's column.
         d.caret = 1;
         assert_eq!(rc(&d), (0, 1));
+    }
+
+    #[test]
+    fn draft_mouse_click_maps_through_the_visible_wrapped_rows() {
+        let mut d = draft();
+        d.body = "abcdefghijklmno".into();
+        let layout = NoteLayout {
+            body: Rect::new(10, 5, 6, 2),
+            wrap_width: 5,
+            first_row: 1,
+        };
+
+        // The second visible row is the third wrapped row in the body.
+        move_note_caret_to_click(&mut d, layout, Position { x: 12, y: 6 });
+        assert_eq!(d.caret, 12);
+
+        // Blank space after a short line clamps to that row's end.
+        move_note_caret_to_click(&mut d, layout, Position { x: 15, y: 5 });
+        assert_eq!(d.caret, 10);
+
+        // Borders and the rest of the screen do not retarget the composer.
+        move_note_caret_to_click(&mut d, layout, Position { x: 9, y: 5 });
+        assert_eq!(d.caret, 10);
+    }
+
+    #[test]
+    fn composer_keeps_its_viewport_when_a_clicked_row_is_visible() {
+        assert_eq!(composer_scroll(10, 10, 5, 20), 10);
+        assert_eq!(composer_scroll(10, 14, 5, 20), 10);
+        assert_eq!(composer_scroll(10, 9, 5, 20), 9);
+        assert_eq!(composer_scroll(10, 15, 5, 20), 11);
     }
 
     /// Long prose soft-wraps at word boundaries instead of running off the
