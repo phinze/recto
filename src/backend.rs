@@ -226,6 +226,39 @@ impl JjBackend {
         .and_then(|s| s.lines().next().map(|l| l.trim().to_string()))
         .unwrap_or_default()
     }
+
+    /// A bookmark between trunk's fork point and the working copy marks a
+    /// named layer beneath the current work. Prefer its branch point when
+    /// there is exactly one such nearest ancestor; merges with two candidates
+    /// are ambiguous and fall back to the ordinary trunk branch point.
+    fn bookmarked_stack_base(&self) -> Option<Base> {
+        let out = self
+            .run(&[
+                "log",
+                "-r",
+                "heads(bookmarks() & fork_point(trunk() | @)::@-)",
+                "--no-graph",
+                "-T",
+                "change_id ++ \"\\t\" ++ bookmarks.join(\"\\t\") ++ \"\\n\"",
+            ])
+            .ok()?;
+        let rows: Vec<&str> = out.lines().filter(|line| !line.is_empty()).collect();
+        let [row] = rows.as_slice() else {
+            return None;
+        };
+        let mut fields = row.split('\t');
+        let candidate_id = fields.next()?;
+        if candidate_id == self.resolve_change_id("fork_point(trunk() | @)") {
+            return None;
+        }
+        let bookmarks: Vec<&str> = fields.filter(|name| !name.is_empty()).collect();
+        if bookmarks.is_empty() || bookmarks.iter().any(|name| name.starts_with("rig-review/")) {
+            return None;
+        }
+        Some(Base::MergeBase {
+            against: Box::new(Base::Revision(bookmarks[0].into())),
+        })
+    }
 }
 
 impl Backend for JjBackend {
@@ -401,19 +434,26 @@ impl Backend for JjBackend {
     }
 
     fn default_bases(&self) -> Vec<Base> {
-        // Branch point leads: "what's on this branch and nothing upstream" is
-        // the reading recto is for, and it degrades gracefully — sitting
-        // directly on trunk, the fork point *is* `@-`, so the plain
-        // working-copy case looks the same as it always did.
-        vec![
-            Base::MergeBase {
-                against: Box::new(Base::Revision("trunk()".into())),
-            },
+        // A named ancestor after the trunk fork point is a stacked branch
+        // boundary. Lead with it when unambiguous, then retain the trunk branch
+        // point as both fallback and an explicit wider choice in the picker.
+        let trunk = Base::MergeBase {
+            against: Box::new(Base::Revision("trunk()".into())),
+        };
+        let mut bases = vec![
+            self.bookmarked_stack_base()
+                .unwrap_or_else(|| trunk.clone()),
+        ];
+        if bases[0] != trunk {
+            bases.push(trunk);
+        }
+        bases.extend([
             Base::Revision("@-".into()),
             Base::Revision("trunk()".into()),
             Base::Revision("@--".into()),
             Base::Revision("root()".into()),
-        ]
+        ]);
+        bases
     }
 
     fn file_content(&self, rev: &str, path: &str) -> Result<String> {
@@ -925,6 +965,56 @@ mod tests {
         // Anything we have no name for falls through as itself rather than
         // becoming a lie.
         assert_eq!(jj.base_display(&Base::Revision("abc123".into())), "abc123");
+    }
+
+    #[test]
+    fn jj_default_base_prefers_the_nearest_bookmarked_stack_boundary() {
+        let repo = TempRepo::new("jj-stacked-base");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("lower.txt"), "lower layer\n").unwrap();
+        repo.run("jj", &["describe", "-m", "lower layer"]);
+        repo.run("jj", &["bookmark", "create", "stack-base", "-r", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = backend.default_bases().remove(0);
+        assert_eq!(backend.base_label(&base), "fork_point(stack-base | @)");
+        let changes = backend
+            .list_changes(&Scope::Range(base), false)
+            .expect("load only the top stack layer");
+        assert_eq!(
+            changes
+                .iter()
+                .map(|change| change.path.as_str())
+                .collect::<Vec<_>>(),
+            vec!["top.txt"]
+        );
+    }
+
+    #[test]
+    fn jj_default_base_ignores_rig_review_pins() {
+        let repo = TempRepo::new("jj-review-pin");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("review.txt"), "review head\n").unwrap();
+        repo.run("jj", &["describe", "-m", "review head"]);
+        repo.run(
+            "jj",
+            &["bookmark", "create", "rig-review/pr-42-repo", "-r", "@"],
+        );
+        repo.run("jj", &["new"]);
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = backend.default_bases().remove(0);
+        assert_eq!(backend.base_label(&base), "fork_point(trunk() | @)");
     }
 
     #[test]

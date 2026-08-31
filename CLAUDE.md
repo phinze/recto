@@ -33,7 +33,8 @@ the source of truth for *how it's built*.
 ## Current Shape
 
 Recto opens a jj or Git repository at its canonical root and shows the full
-range from a readable base such as the branch point. The main diff has syntax
+range from a readable base such as a named stack boundary or the trunk branch
+point. The main diff has syntax
 and word-level highlighting, wrapping, search, mouse and keyboard navigation,
 and live reload. Files and revisions appear in optional navigator panes.
 
