@@ -4283,6 +4283,24 @@ fn contextual_footer(app: &App) -> Option<Paragraph<'static>> {
     }
 }
 
+fn load_error_footer(error: &str, width: u16) -> (Paragraph<'static>, u16) {
+    let mut lines = vec![Line::styled(
+        "reload failed",
+        Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+    )];
+    lines.extend(
+        error
+            .lines()
+            .map(|line| Line::styled(line.to_string(), Style::default().fg(theme::RED))),
+    );
+    let height = lines
+        .iter()
+        .map(|line| wrap::row_count(line, width, 0))
+        .sum::<usize>()
+        .min(u16::MAX as usize) as u16;
+    (Paragraph::new(lines).wrap(Wrap { trim: false }), height)
+}
+
 fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     match app.page {
         Page::PullRequest => {
@@ -4306,7 +4324,18 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let area = frame.area();
 
     let footer = contextual_footer(app);
-    let footer_height = u16::from(footer.is_some());
+    let error_footer = footer
+        .is_none()
+        .then_some(app.load_error.as_deref())
+        .flatten()
+        .map(|error| load_error_footer(error, area.width));
+    let footer_height = if footer.is_some() {
+        1
+    } else {
+        error_footer.as_ref().map_or(0, |(_, height)| {
+            (*height).min(area.height.saturating_sub(2))
+        })
+    };
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -4375,9 +4404,9 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             format!(" · {} loading {}", SPINNER_FRAMES[frame_idx], loading.label),
             Style::default().fg(theme::TEAL),
         ));
-    } else if let Some(error) = &app.load_error {
+    } else if app.load_error.is_some() {
         header_spans.push(Span::styled(
-            format!(" · reload failed: {error}"),
+            " · reload failed",
             Style::default().fg(theme::RED),
         ));
     }
@@ -4479,6 +4508,8 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     if let Some(footer) = footer {
+        frame.render_widget(footer, rows[2]);
+    } else if let Some((footer, _)) = error_footer {
         frame.render_widget(footer, rows[2]);
     }
 
@@ -6183,6 +6214,32 @@ mod tests {
         settle_load(&mut app);
 
         assert_eq!(app.load_error.as_deref(), Some("synthetic load failure"));
+    }
+
+    #[test]
+    fn multiline_load_failure_renders_its_complete_diagnostic() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.load_error = Some(
+            "jj rejected the selected revision\nHint: choose the exact commit id\nfinal diagnostic line"
+                .into(),
+        );
+        let terminal_backend = ratatui::backend::TestBackend::new(48, 12);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(rendered.contains("reload failed"));
+        assert!(rendered.contains("jj rejected the selected revision"));
+        assert!(rendered.contains("Hint: choose the exact commit id"));
+        assert!(rendered.contains("final diagnostic line"));
     }
 
     #[test]
