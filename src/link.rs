@@ -164,6 +164,7 @@ pub struct PullRequest {
     pub body: String,
     pub author: Actor,
     pub base_ref: String,
+    pub base_oid: String,
     pub head_ref: String,
     pub head_oid: String,
     pub url: String,

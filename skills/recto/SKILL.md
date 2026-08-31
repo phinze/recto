@@ -66,7 +66,7 @@ Annotate SPECs are `PATH:LINE=label` or `PATH:START-END=label`. Argument
 order sets the step numbers, and each call replaces the whole set.
 
 `recto pr` fetches the PR through `gh`, attaches a read-only snapshot, and
-switches the diff to GitHub's exact base branch. A full
+switches the diff to GitHub's recorded base commit. A full
 `https://github.com/OWNER/REPO/pull/NUMBER` URL works too. In a Rig review
 workspace, Recto asks `rig info --format=json` for the current repository's PR
 and performs the same attachment automatically on startup. Other Recto

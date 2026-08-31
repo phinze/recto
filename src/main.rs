@@ -2157,7 +2157,7 @@ impl App {
     }
 
     /// Attach a public PR snapshot and, for a live client request, move the
-    /// diff to GitHub's exact base branch. Startup review-rig restoration has
+    /// diff to GitHub's recorded base commit. Startup review-rig restoration has
     /// already loaded that base, so it skips the second load while sharing all
     /// of the draft-safety and presentation behavior here.
     fn attach_pull_request(
@@ -2213,7 +2213,7 @@ impl App {
             }
         }
 
-        let base = pull_request.base_ref.clone();
+        let base = pull_request.base_oid.clone();
         let base_changed = self.backend.base_label(self.base()) != base;
         let label = format!("{}#{}", pull_request.repository, pull_request.number);
         self.pull_request = Some(pull_request);
@@ -3038,10 +3038,10 @@ fn main() -> Result<()> {
         None => None,
     };
     // An explicit base remains an escape hatch. Otherwise a review rig starts
-    // from GitHub's exact base instead of Recto's ordinary trunk branch point.
+    // from GitHub's recorded base commit instead of a moving branch name.
     let initial_base = cli
         .base
-        .or_else(|| pull_request.as_ref().map(|pr| pr.base_ref.clone()));
+        .or_else(|| pull_request.as_ref().map(|pr| pr.base_oid.clone()));
     let hl = Highlighter::new();
     let mut app = App::load(backend, hl, initial_base, persistence).unwrap_or_else(|e| {
         eprintln!("recto: {e}");
@@ -5900,7 +5900,7 @@ mod tests {
         }
     }
 
-    fn empty_pull_request(base_ref: &str) -> link::PullRequest {
+    fn empty_pull_request(base_oid: &str) -> link::PullRequest {
         link::PullRequest {
             repository: "owner/repo".into(),
             number: 42,
@@ -5910,7 +5910,8 @@ mod tests {
                 login: "author".into(),
                 name: None,
             },
-            base_ref: base_ref.into(),
+            base_ref: "main".into(),
+            base_oid: base_oid.into(),
             head_ref: "feature".into(),
             head_oid: "abc123".into(),
             url: "https://github.com/owner/repo/pull/42".into(),
@@ -6374,6 +6375,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 name: None,
             },
             base_ref: "main".into(),
+            base_oid: "base-oid".into(),
             head_ref: "reviews".into(),
             head_oid: "1234567890abcdef".into(),
             url: "https://github.com/phinze/recto/pull/7".into(),

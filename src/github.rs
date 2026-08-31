@@ -64,6 +64,7 @@ struct GhPullRequest {
     body: String,
     author: Option<GhActor>,
     base_ref_name: String,
+    base_ref_oid: String,
     head_ref_name: String,
     head_ref_oid: String,
     url: String,
@@ -206,7 +207,7 @@ pub(crate) fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
             "-R",
             &locator.repository,
             "--json",
-            "number,title,body,author,baseRefName,headRefName,headRefOid,url,comments,reviews",
+            "number,title,body,author,baseRefName,baseRefOid,headRefName,headRefOid,url,comments,reviews",
         ])
         .output()
         .map_err(|e| anyhow!("could not run gh: {e}"))?;
@@ -233,6 +234,7 @@ pub(crate) fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
         body: normalize_github_text(gh.body),
         author: actor_or_ghost(gh.author),
         base_ref: gh.base_ref_name,
+        base_oid: gh.base_ref_oid,
         head_ref: gh.head_ref_name,
         head_oid: gh.head_ref_oid,
         url: gh.url,
