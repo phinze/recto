@@ -2205,6 +2205,7 @@ impl App {
                 .as_ref(),
         );
         store.set_comments_visible(self.show_comments);
+        store.set_pull_request(self.pull_request.as_ref());
         if let Some(composer) = note_composer {
             store.set_note_composer(composer.as_ref());
         }
@@ -2383,6 +2384,7 @@ impl App {
             self.select_base(Base::Revision(base));
         }
         self.reweave();
+        self.persist_soon();
         match self.stale_review_error() {
             Some(warning) => link::Response::ok_note(format!("opened {label}; {warning}")),
             None => link::Response::ok_note(format!("opened {label}")),
@@ -3235,6 +3237,9 @@ fn main() -> Result<()> {
             None
         }
     };
+    // A review rig's freshly fetched PR wins: it is newer than whatever the
+    // last session saved. Everywhere else the saved snapshot is restored from
+    // disk, so an ordinary startup still makes no network call.
     let pull_request = match rig_info.as_ref().and_then(|info| info.review_pr.as_ref()) {
         Some(locator) => match github::fetch_pull_request(locator) {
             Ok(pull_request) => Some(pull_request),
@@ -3243,7 +3248,9 @@ fn main() -> Result<()> {
                 None
             }
         },
-        None => None,
+        None => persistence
+            .as_ref()
+            .and_then(|store| store.pull_request().cloned()),
     };
     // An explicit base remains an escape hatch. Otherwise a review rig starts
     // from GitHub's recorded base commit instead of a moving branch name.
@@ -6674,6 +6681,45 @@ mod tests {
 
         handle_mouse(&mut app, left_click(diff_col, tab_row));
         assert_eq!(app.page, Page::Diff);
+    }
+
+    /// Restoring reads the snapshot off disk. `App::load` never calls `github`,
+    /// so this passing at all is the offline-startup guarantee.
+    #[test]
+    fn a_saved_pull_request_restores_with_its_drafts() {
+        let root =
+            std::env::temp_dir().join(format!("recto-app-state-{}-prsnap", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state_home = root.join("state");
+
+        let backend = Arc::new(TestBackend::new());
+        let store = state::Store::load_at(&state_home, &root, None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, Some(store)).unwrap();
+        assert!(
+            app.attach_pull_request(empty_pull_request("base"), false)
+                .ok
+        );
+        app.set_review_draft_body(
+            "Typed and then the process died".into(),
+            link::DraftEditor::User,
+        );
+        app.persist_now().unwrap();
+
+        let reopened = state::Store::load_at(&state_home, &root, None).unwrap();
+        let snapshot = reopened.pull_request().cloned().expect("snapshot saved");
+        assert_eq!(snapshot.number, 42);
+
+        let mut restarted = App::load(backend, Highlighter::new(), None, Some(reopened)).unwrap();
+        assert!(restarted.attach_pull_request(snapshot, false).ok);
+        assert_eq!(
+            restarted
+                .review_draft_body
+                .as_ref()
+                .map(|body| body.body.as_str()),
+            Some("Typed and then the process died"),
+            "drafts are keyed to the PR, so they come back with it"
+        );
     }
 
     /// The restart case Paul actually cares about: an agent lays down a tour,

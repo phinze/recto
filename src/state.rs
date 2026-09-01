@@ -15,7 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::link::{DraftReviewBody, DraftReviewComment, PullRequestRef};
+use crate::link::{DraftReviewBody, DraftReviewComment, PullRequest, PullRequestRef};
 use crate::{AgentNote, Annotation, FocusAnchor, NoteDraft};
 
 const SCHEMA_VERSION: u32 = 2;
@@ -67,6 +67,11 @@ struct Document {
     /// omit it, which reads as shown.
     #[serde(default = "shown")]
     comments_visible: bool,
+    /// The attached pull request snapshot. Fetched context rather than
+    /// authored words, kept here so restoring it needs no network: the review
+    /// drafts below are keyed to it and are unreachable without it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pull_request: Option<PullRequest>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -93,6 +98,7 @@ impl Document {
             annotations: Vec::new(),
             focus: None,
             comments_visible: true,
+            pull_request: None,
         }
     }
 }
@@ -218,6 +224,14 @@ impl Store {
 
     pub fn set_comments_visible(&mut self, visible: bool) {
         self.document.comments_visible = visible;
+    }
+
+    pub fn pull_request(&self) -> Option<&PullRequest> {
+        self.document.pull_request.as_ref()
+    }
+
+    pub fn set_pull_request(&mut self, pull_request: Option<&PullRequest>) {
+        self.document.pull_request = pull_request.cloned();
     }
 
     pub fn review(&self, pull_request: &PullRequestRef) -> Option<RestoredReview> {
@@ -441,6 +455,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         annotations: Vec::new(),
         focus: None,
         comments_visible: true,
+        pull_request: None,
     }))
 }
 
