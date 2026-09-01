@@ -3147,6 +3147,22 @@ impl App {
         self.focus_target(&path, Some(start), end)
     }
 
+    /// Step back up one level of the review surface: a quote to the tour it
+    /// came from, the tour or PR to the diff, a thread to its PR.
+    ///
+    /// Unlike Esc this only ever navigates. It will not clear a search, drop a
+    /// highlight, discard annotations or reach the quit confirmation, so it
+    /// stays safe to press without checking what else it might mean.
+    fn go_up(&mut self) {
+        match self.page {
+            Page::Diff => {
+                self.return_to_tour();
+            }
+            Page::Tour | Page::PullRequest => self.page = Page::Diff,
+            Page::ReviewThread => self.page = Page::PullRequest,
+        }
+    }
+
     /// Step back out of a quote, if one brought us here. Reported so Esc can
     /// fall through to its usual unwinding when it did not.
     fn return_to_tour(&mut self) -> bool {
@@ -4142,6 +4158,9 @@ fn handle_event(
                 Mode::Normal if key.code == KeyCode::Char('v') => {
                     app.set_comment_visibility(None);
                 }
+                // Ahead of the page arms: stepping up means the same thing on
+                // every surface, and none of them should shadow it.
+                Mode::Normal if key.code == KeyCode::Char('u') => app.go_up(),
                 // Ahead of the page arms: a tab switch means the same thing
                 // everywhere, and the pages must not shadow it.
                 Mode::Normal if shifted_digit(&key).is_some() => {
@@ -6102,6 +6121,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("e", "edit file at line in $EDITOR"),
     bind("?", "toggle this help"),
     bind("q", "confirm quit"),
+    bind("u", "back up one level"),
     bind("esc", "dismiss or step back"),
 ];
 
@@ -7478,6 +7498,56 @@ mod tests {
         app.tour_scroll = app.tour_max_scroll;
         let refused = app.open_quote_in_view();
         assert!(!refused.ok || app.page == Page::Diff);
+    }
+
+    #[test]
+    fn u_steps_up_one_level_and_never_quits() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.pull_request = Some(empty_pull_request("base"));
+        app.handle_request(link::Request::Tour {
+            body: "## Step\n\nprose\n\n```recto foo.go:111\n```\n".into(),
+        });
+
+        // A quote drilled into the diff steps back into the tour. The quote's
+        // rendered position only exists after a draw, as it does in use.
+        let terminal_backend = ratatui::backend::TestBackend::new(159, 77);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert!(app.open_quote_in_view().ok);
+        assert_eq!(app.page, Page::Diff);
+        app.go_up();
+        assert_eq!(app.page, Page::Tour);
+
+        // The tour and the PR both step back to the diff.
+        app.go_up();
+        assert_eq!(app.page, Page::Diff);
+        app.page = Page::PullRequest;
+        app.go_up();
+        assert_eq!(app.page, Page::Diff);
+
+        // A thread steps up to the PR it belongs to.
+        app.page = Page::ReviewThread;
+        app.go_up();
+        assert_eq!(app.page, Page::PullRequest);
+
+        // And on a diff nobody drilled into, it is simply a no-op: no quit
+        // confirmation, no cleared search, no discarded highlight.
+        app.page = Page::Diff;
+        app.search_query = Some("needle".into());
+        app.annotations.push(Annotation {
+            path: "foo.go".into(),
+            start: 111,
+            end: 111,
+            label: "step".into(),
+        });
+        app.go_up();
+        assert_eq!(app.page, Page::Diff);
+        assert!(matches!(app.mode, Mode::Normal), "never reaches quit");
+        assert_eq!(app.search_query.as_deref(), Some("needle"));
+        assert_eq!(app.annotations.len(), 1);
     }
 
     /// Clicking an unfocused pane aims at the window, not at whatever the
