@@ -5216,17 +5216,46 @@ fn draw_document(
     }
 }
 
-/// Lift the diff rows a quote names. Reads the pristine render rather than the
+/// One quoted row: the source line and its number, without the diff's gutter
+/// or its added/removed tint. Syntax and word-level highlighting survive,
+/// since that is the part worth quoting.
+fn quote_line(row: &Line<'static>, number: u32, width: usize) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("  {number:>width$}  "),
+        Style::default().fg(theme::OVERLAY0),
+    )];
+    // The four leading spans are the diff gutter — old column, new column,
+    // marker, pad — and the tint lives on the body spans behind the code.
+    spans.extend(row.spans.iter().skip(4).map(|span| {
+        let mut span = span.clone();
+        span.style.bg = None;
+        span
+    }));
+    Line::from(spans)
+}
+
+/// Lift the source a quote names. Reads the pristine render rather than the
 /// woven one, so notes and threads anchored inside a span cannot turn up inside
-/// a quote of it. The rows arrive already syntax- and word-level highlighted,
-/// gutters and signs intact, because they are the rows the diff pane draws.
+/// a quote of it.
+///
+/// Only rows carrying a new-side line number survive: removals, hunk headers
+/// and file separators drop out. Spans are addressed in new-side numbers
+/// already, so what is left is exactly the source those numbers name.
 fn quote_rows(app: &App, spec: &str) -> Option<Vec<Line<'static>>> {
     let (path, start, end) = parse_pathspec(spec);
     let start = start?;
     let end = end.unwrap_or(start).max(start);
     let file_idx = app.changes.iter().position(|c| c.path == path)?;
     let rows = rows_for_span(&app.base_line_info, file_idx, start, end)?;
-    Some(app.base_rendered[rows].to_vec())
+    let width = end.to_string().len();
+    let quoted: Vec<Line<'static>> = app.base_rendered[rows]
+        .iter()
+        .filter_map(|row| {
+            let (_, number) = gutter_signature(row)?;
+            Some(quote_line(row, number?, width))
+        })
+        .collect();
+    (!quoted.is_empty()).then_some(quoted)
 }
 
 /// The tour's document. Headings become sections, fenced `recto` blocks become
@@ -7188,6 +7217,29 @@ mod tests {
         assert!(app.return_to_tour(), "Esc unwinds back into the tour");
         assert_eq!(app.page, Page::Tour);
         assert!(!app.return_to_tour(), "and the return is spent once used");
+    }
+
+    /// The quote is source, not diff: no added/removed tint, no marker, no
+    /// old-side column — just a line number wide enough for the span.
+    #[test]
+    fn a_quote_prints_source_rather_than_diff_rows() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+
+        let quoted = quote_rows(&app, "foo.go:110-113").expect("span resolves");
+        assert!(!quoted.is_empty());
+
+        for line in &quoted {
+            assert!(
+                line.spans.iter().all(|span| span.style.bg.is_none()),
+                "no diff tint survives into a quote: {line:?}"
+            );
+        }
+        // Every row leads with its own new-side number and then the code.
+        let text: Vec<String> = quoted.iter().map(Line::to_string).collect();
+        assert!(text[0].starts_with("  110  "), "{text:#?}");
+        assert_eq!(text.len(), 4, "110..=113 inclusive: {text:#?}");
     }
 
     /// Tours outlive the diff they were written against, so a span that no
