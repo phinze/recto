@@ -63,6 +63,10 @@ const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(150);
 const DOUBLE_CLICK_WINDOW: Duration = Duration::from_millis(500);
+/// How long after the pane regains focus a click still counts as the one that
+/// focused it. Focus reports and mouse events race, so the window has to cover
+/// a click arriving on either side of the focus change.
+const FOCUS_CLICK_GRACE: Duration = Duration::from_millis(400);
 const SPINNER_FRAMES: &[&str] = &["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 const SPINNER_FRAME_MS: u128 = 80;
 /// How long the arrival flash takes to fade after a focus span lands.
@@ -980,6 +984,9 @@ struct App {
     /// Whether our terminal/tmux pane currently has focus. Driven by
     /// focus-change reports; stays `true` on terminals that don't send them.
     terminal_focused: bool,
+    /// When focus last came back, so the click that brought the pane forward
+    /// can be told apart from the first click meant for what is on screen.
+    focus_regained_at: Option<Instant>,
 }
 
 impl App {
@@ -1127,6 +1134,7 @@ impl App {
             help_scroll: 0,
             help_max_scroll: 0,
             terminal_focused: true,
+            focus_regained_at: None,
         };
         app.resolve_panes();
         // Land focus on the diff unless the files pane opened on its own.
@@ -3063,6 +3071,22 @@ impl App {
         self.take_diff_focus();
     }
 
+    /// Whether this click is the one that brought the pane forward. Clicking an
+    /// unfocused pane should focus it and nothing else, or a click aimed at the
+    /// window lands on whatever the pointer was over.
+    fn consume_focus_click(&mut self) -> bool {
+        let activating = !self.terminal_focused
+            || self
+                .focus_regained_at
+                .is_some_and(|at| at.elapsed() < FOCUS_CLICK_GRACE);
+        if activating {
+            // Spent: the next click is a real one, however fast it follows.
+            self.focus_regained_at = None;
+            self.terminal_focused = true;
+        }
+        activating
+    }
+
     /// Switch to the nth tab, 1-based. Out of range is a no-op rather than a
     /// clamp: shift+3 on a two-tab strip asked for a tab that isn't there.
     fn select_tab(&mut self, n: usize) {
@@ -4463,7 +4487,10 @@ fn handle_event(
             }
         }
         Event::Mouse(m) if matches!(app.mode, Mode::Normal) => handle_mouse(app, m),
-        Event::FocusGained => app.terminal_focused = true,
+        Event::FocusGained => {
+            app.terminal_focused = true;
+            app.focus_regained_at = Some(Instant::now());
+        }
         Event::FocusLost => app.terminal_focused = false,
         _ => {}
     }
@@ -4471,6 +4498,11 @@ fn handle_event(
 }
 
 fn handle_mouse(app: &mut App, m: event::MouseEvent) {
+    // Scrolling is deliberately exempt: reading an unfocused pane is a real
+    // thing to want, and a wheel event was never aimed at the window.
+    if matches!(m.kind, MouseEventKind::Down(_)) && app.consume_focus_click() {
+        return;
+    }
     if app.show_help {
         match m.kind {
             MouseEventKind::ScrollDown => {
@@ -7446,6 +7478,89 @@ mod tests {
         app.tour_scroll = app.tour_max_scroll;
         let refused = app.open_quote_in_view();
         assert!(!refused.ok || app.page == Page::Diff);
+    }
+
+    /// Clicking an unfocused pane aims at the window, not at whatever the
+    /// pointer happens to be over.
+    #[test]
+    fn the_click_that_focuses_the_pane_does_nothing_else() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let entries = tab_entries(&app);
+        let pr_col = entries
+            .iter()
+            .find(|entry| entry.page == Page::PullRequest)
+            .expect("tab present")
+            .columns
+            .start;
+        let tab_row = app.tabs_area.y;
+
+        // Unfocused: the click brings the pane forward and stops there.
+        app.terminal_focused = false;
+        handle_mouse(&mut app, left_click(pr_col, tab_row));
+        assert_eq!(app.page, Page::Diff, "the activating click is swallowed");
+        assert!(app.terminal_focused, "but it does focus the pane");
+
+        // Spent: the very next click is a real one.
+        handle_mouse(&mut app, left_click(pr_col, tab_row));
+        assert_eq!(app.page, Page::PullRequest);
+    }
+
+    /// A focus report can arrive before the click that caused it, so the grace
+    /// window has to catch that ordering too.
+    #[test]
+    fn a_click_just_after_a_focus_report_is_still_the_focusing_click() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let entries = tab_entries(&app);
+        let pr_col = entries
+            .iter()
+            .find(|entry| entry.page == Page::PullRequest)
+            .expect("tab present")
+            .columns
+            .start;
+        let tab_row = app.tabs_area.y;
+
+        // Focus already reported, click lands right behind it.
+        app.terminal_focused = true;
+        app.focus_regained_at = Some(Instant::now());
+        handle_mouse(&mut app, left_click(pr_col, tab_row));
+        assert_eq!(app.page, Page::Diff);
+
+        handle_mouse(&mut app, left_click(pr_col, tab_row));
+        assert_eq!(app.page, Page::PullRequest);
+    }
+
+    /// Scrolling was never aimed at the window, so it keeps working.
+    #[test]
+    fn scrolling_an_unfocused_pane_still_scrolls() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb\n\n## Three\n\nc".into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        app.terminal_focused = false;
+        let wheel = event::MouseEvent {
+            kind: MouseEventKind::ScrollDown,
+            column: app.tour_body_area.x + 2,
+            row: app.tour_body_area.y + 2,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        };
+        handle_mouse(&mut app, wheel);
+        assert!(app.tour_scroll > 0);
     }
 
     /// The way back: a reviewer already looking at a file can reach the prose
