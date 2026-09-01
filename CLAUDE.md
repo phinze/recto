@@ -38,21 +38,35 @@ point. The main diff has syntax
 and word-level highlighting, wrapping, search, mouse and keyboard navigation,
 and live reload. Files and revisions appear in optional navigator panes.
 
+Surfaces sit behind a tab strip: the diff, a literate tour once one is laid
+down, and a pull request once one is attached. The tour and PR are sectioned
+documents sharing one view, with an outline rail beside the prose, badge keys
+and `]` / `[` to move between sections, and the status line naming the section
+in view. `u` steps back up a level from anywhere.
+
 The editor handoff and workspace socket make Recto a shared review surface for
 the user and a companion agent. Either side can focus code, the agent can lay
-down an annotated tour, and the user can leave private agent notes or co-author
-a local GitHub review draft. Public PR descriptions and conversations can be
-attached as read-only context. Recto atomically saves authored state beneath
+down an annotated tour or a literate one, and the user can leave private agent
+notes or co-author a local GitHub review draft. A literate tour is Markdown
+whose headings become sections and whose fenced `recto PATH:SPAN` blocks become
+pull quotes lifted from the diff; a quote opens the full diff at its span and
+`u` comes back. Public PR descriptions and conversations can be attached as
+read-only context. Recto atomically saves authored state beneath
 `$XDG_STATE_HOME/recto/workspaces/`, keyed by the canonical workspace root, so
-standalone and Rig-launched viewers have the same restart behavior. Review
-drafts are additionally keyed by repository, PR number, and head OID. Inside a
+standalone and Rig-launched viewers have the same restart behavior. Durability
+is the rule rather than the exception there: tours, annotations, focus, comment
+visibility, notes, drafts and the attached PR snapshot all survive a restart,
+and only an explicit discard or `state forget` ends them. Restoring the PR
+snapshot from disk keeps ordinary startup offline. Review drafts are
+additionally keyed by repository, PR number, and head OID. Inside a
 review Rig, Recto asks Rig's versioned JSON API only for PR context; `rig down`
 asks Recto's public CLI to forget the workspaces whose lifecycle has ended.
 Neither tool reads the other's private persistence format.
 Recto also resolves the committed workspace revision beneath the mutable
 working copy on every diff load. If it differs from an attached PR's head OID,
-`ping` reports a stale review, the TUI shows the mismatch, and companion focus
-or annotations are refused until the review is explicitly refreshed.
+`ping` reports a stale review, the TUI shows the mismatch, and companion focus,
+annotations and new tours are refused until the review is explicitly refreshed.
+Removing a tour stays allowed, or a stale one could never be cleaned up.
 
 ## Stack
 

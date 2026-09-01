@@ -1,6 +1,6 @@
 ---
 name: recto
-description: Drive a running recto diff viewer from a companion session — scroll to and highlight code, lay down a numbered tour, collect private agent notes, and co-author durable local review drafts. Load whenever you are explaining or reviewing changes where recto might be open, when asked to point at code, when the user says they left notes, or while collaboratively writing PR review comments.
+description: Drive a running recto diff viewer from a companion session: scroll to and highlight code, write a literate tour of prose and quoted diff, lay down numbered tour stops, collect private agent notes, and co-author durable local review drafts. Load whenever you are explaining or reviewing changes where recto might be open, when asked to point at code, when the user says they left notes, or while collaboratively writing PR review comments.
 ---
 
 # recto
@@ -43,6 +43,10 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto focus PATH:LINE        # highlight a single line
     recto focus PATH             # scroll to the file, no line span
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
+    recto tour < FILE            # lay down a literate tour (Markdown on stdin)
+    recto tour BODY              # the same, as an argument; empty removes it
+    recto tour-focus N           # show the tour, scrolled to section N
+    recto tour-focus             # show the tour where it was left
     recto clear                  # remove the highlight and any annotations
     recto comment-visibility hide # hide non-tour comments from the diff and file tree
     recto comment-visibility show # restore non-tour comments
@@ -61,8 +65,16 @@ clear a draft or resolve a review, and do not call it without an explicit
 workspace-lifecycle request from the user.
 
 PATH is relative to anywhere in the workspace (recto normalizes it to
-the repo root). Line numbers are **new-side** — the line numbers in the
+the repo root). Line numbers are **new-side**: the line numbers in the
 post-change file, the ones you'd see in your editor after the edit.
+
+recto shows one surface at a time, and a tab strip across the top says which
+ones exist right now. The diff is always there, a tour appears once one is laid
+down, and a PR appears once one is attached. The user switches with `shift-1`,
+`shift-2` and `shift-3`, or by clicking a tab, and `u` steps back up a level
+from wherever they are. `ping` reports the current surface as `page`. Both
+`focus` and `annotate` switch to the diff, since neither can mean "look here
+now" while a different page is up.
 
 Annotate SPECs are `PATH:LINE=label` or `PATH:START-END=label`. Argument
 order sets the step numbers, and each call replaces the whole set.
@@ -77,12 +89,93 @@ timeline, and inline review threads. The user toggles between it and the diff
 with `p`, moves among public threads with `t` / `T`, and presses `enter` on an
 anchored thread in the diff to open its full conversation.
 
-Tour stops, published threads, shared review drafts, and private agent notes
-also appear as typed child rows beneath their changed file in the file pane.
+Tour stops, tour pull quotes, published threads, shared review drafts, and
+private agent notes all appear as typed child rows beneath their changed file
+in the file pane.
 Moving onto a child with `j` / `k` reveals its anchor in the diff. `enter`
 opens a published conversation or the matching draft/note editor; on a tour
-stop it returns focus to the revealed span. A double click opens the same
+stop it returns focus to the revealed span, and on a `❝` pull quote it jumps
+into the tour at the section that quotes it. A double click opens the same
 objects directly from either their file-pane row or their inline diff content.
+
+## Write a literate tour
+
+`annotate` labels spans where they sit, which caps a tour at one line of prose
+per site. A literate tour inverts that: the prose is the document, and the diff
+gets quoted into it. Reach for it when the explanation carries the weight and
+the code is the evidence, and for `annotate` when the code carries the weight
+and the labels are signposts. The two coexist and neither clears the other.
+
+Lay one down by piping Markdown:
+
+    recto tour <<'EOF'
+    ## Why the base moved
+
+    Recto used to ask jj for `@-` directly, which broke the moment a stack
+    boundary moved underneath us.
+
+    ```recto src/backend.rs:120-138
+    ```
+
+    So the resolution now happens once, at load.
+    EOF
+
+Top-level headings become the sections, listed in an outline rail with the same
+circled badges the diff draws over tour steps. The user reaches them with `1`
+through `9`, with `]` and `[`, or by clicking the rail, and the status line
+names the one they are in.
+
+Fenced blocks tagged `recto` become pull quotes. Give one a `PATH:LINE` or a
+`PATH:START-END` and recto lifts that source out of the diff, syntax
+highlighted, with its line numbers and no diff tint. The fence body is ignored,
+so leave it empty. `recto` has to stand as its own word in the info string, so
+an unrelated `rectoclip` fence stays an ordinary code block. A span that no
+longer resolves says so in place rather than vanishing, which matters because a
+tour outlives the diff it was written against.
+
+Every quote is a door. `enter` opens the next one below the reader and a click
+opens the one under the pointer; both land in the full diff with that span
+focused, and `u` steps back up into the tour where they left off. Quotes also
+appear as `❝` rows under their file in the navigator, so a reviewer already
+reading the code can reach the prose about it.
+
+Passing an empty body removes the tour. `clear` deliberately does not, and
+neither does a restart: a tour is authored work, and only an explicit request
+should discard it.
+
+### What to actually write
+
+A tour is an argument about a change, not a summary of it. The diff already
+lists what moved. The tour says why it moved, and in what order the pieces
+start making sense. Write the document you would want handed to you before
+reviewing someone else's work.
+
+Aim for four to six sections. The badge keys reach nine, but a tour that needs
+nine is usually a document the reader would rather scroll than be walked
+through. Give each section one point, and a heading that states that point, so
+the outline rail reads as an argument by itself: "Why the base moved" beats
+"Changes to backend.rs".
+
+Order by argument, not by file. The file pane already sorts by path, so a tour
+that walks files in tree order spends the reader's attention on something they
+already had. Start where the change starts making sense, which is often not the
+largest file.
+
+Quote the smallest span that carries the point. A pull quote is evidence for a
+claim, so make the claim first and let the quote land under it. Twenty lines of
+quoted code with no argument around them is just the diff, and the reader can
+have the diff in one keypress. A section with no quote at all is fine when its
+point is about shape rather than about a particular line.
+
+Say plainly what does not matter. "The remaining thirty files are generated
+schema" saves the reader more than another section would, and it tells them you
+looked rather than skipped.
+
+Claim only what you checked. Every quote is a real span in a real diff the
+reader can open in one keypress, so a wrong claim is not just wrong, it is
+visibly wrong, and it costs you the rest of the document. When something comes
+from a PR description or a commit message rather than from code you read,
+attribute it there instead of asserting it yourself.
 
 ## Co-author a public review draft
 
@@ -131,9 +224,27 @@ request to review the current change is a diff tour, so use recto annotations.
 Do not ask the user to change the diff base merely to show current source that
 neovim can already open.
 
-## Pace tours one span at a time
+## Pace a literate tour by following, not leading
 
-Treat every interactive tour as user-paced. Make showing a span and explaining
+`recto tour-focus N` brings the tour up scrolled to section N, numbered from 1
+as the rail badges are. `recto tour-focus` on its own just brings it into view.
+Asking for a section that does not exist is refused with the count, so the
+command is safe to try.
+
+This changes the discipline in the next section rather than obeying it. A span
+tour needs you to move a single pointer, so it has to advance one turn at a
+time. A literate tour is already written down: the reader can move through it
+themselves, at their own speed, and your job is to follow. Lay the whole
+document down at once, then use `tour-focus` to put a section on screen as you
+talk about it, and `focus` to drop into the diff when a quote deserves the
+context around it.
+
+The one-span-per-turn rule below still governs `focus`, because `focus` is
+still a pointer.
+
+## Pace span tours one span at a time
+
+Treat every interactive span tour as user-paced. Make showing a span and explaining
 it one complete assistant turn:
 
 1. `focus` exactly one span.
@@ -161,8 +272,10 @@ and private agent notes from the diff and file tree without touching tour
 annotations or deleting any content. Prefer explicit `hide` and `show` over
 `toggle`, since the user shares this live state with you. Restore comments with
 `recto comment-visibility show` when the tour ends unless the user asks to keep
-them hidden. Visibility is session-only, and PR/thread pages remain available
-when explicitly opened.
+them hidden. Visibility now survives restarts like the rest of the authored
+state, so leaving it hidden leaves it hidden; the status line carries a
+standing "comments hidden" note so the user can see why. PR and thread pages
+remain available when explicitly opened.
 
 ## How to use it in a tour
 
@@ -236,8 +349,9 @@ exception: its scope is the workspace, not the current diff.
   diff" (the file isn't in the diff for the base recto currently shows)
   or "outside any shown hunk" (the file is in the diff but those lines
   aren't part of a changed hunk). For `annotate` this means *no* site
-  resolved. If you expected the file to be there, the user may need to
-  pick a different base with `b`; tell them, don't retry blindly.
+  resolved. For `tour-focus` it means the tour has no such section, and the
+  error names how many it has. If you expected the file to be there, the user
+  may need to pick a different base with `b`; tell them, don't retry blindly.
 - **exit 2** — no recto is listening for this workspace (or you're not
   in a repo). Don't keep trying; just describe the change in text.
 
@@ -267,8 +381,11 @@ It looks like:
         "focus": {"delivery": "live", "scope": "current_diff"},
         "annotate": {"delivery": "live", "scope": "current_diff"}
       },
+      "page": "tour",
       "focus": false,
       "annotations": 0,
+      "tour": true,
+      "tour_sections": 5,
       "comments_visible": true,
       "pending_comments": 2,
       "draft_comments": 1,
@@ -290,6 +407,12 @@ entirely, which reads as zero.
 `comments_visible` reports the shared TUI state controlled by `v` and
 `recto comment-visibility`. Older Recto versions omit it and always show
 comments.
+
+`page` is the surface on screen: `"diff"`, `"tour"`, `"pr"` or `"thread"`.
+`tour` says whether a literate tour is laid down and `tour_sections` counts its
+sections, which is the largest number `tour-focus` will take. Both are counted
+from the document itself, so they answer before the tour page has ever been
+drawn.
 
 `draft_comments` counts the public review comments being co-authored locally.
 They survive Recto restarts. It is safe to follow a nonzero count with
