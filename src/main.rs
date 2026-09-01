@@ -299,6 +299,7 @@ enum Focus {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Page {
     Diff,
+    Tour,
     PullRequest,
     ReviewThread,
 }
@@ -839,6 +840,10 @@ struct App {
     /// width the body wrapped at.
     pr_sections: Vec<(String, usize)>,
     pr_outline_area: Rect,
+    tour_scroll: usize,
+    tour_max_scroll: usize,
+    tour_sections: Vec<(String, usize)>,
+    tour_outline_area: Rect,
     active_thread: Option<usize>,
     thread_scroll: usize,
     thread_max_scroll: usize,
@@ -1018,6 +1023,10 @@ impl App {
             pr_max_scroll: 0,
             pr_sections: Vec::new(),
             pr_outline_area: Rect::default(),
+            tour_scroll: 0,
+            tour_max_scroll: 0,
+            tour_sections: Vec::new(),
+            tour_outline_area: Rect::default(),
             active_thread: None,
             thread_scroll: 0,
             thread_max_scroll: 0,
@@ -2985,8 +2994,6 @@ impl App {
         self.take_diff_focus();
     }
 
-    /// Move among every public thread in the attached snapshot, including
-    /// outdated and left-side conversations that cannot be pinned in this diff.
     /// Switch to the nth tab, 1-based. Out of range is a no-op rather than a
     /// clamp: shift+3 on a two-tab strip asked for a tab that isn't there.
     fn select_tab(&mut self, n: usize) {
@@ -2995,36 +3002,46 @@ impl App {
         }
     }
 
+    /// Which document page's scroll and sections the section keys act on.
+    /// Only the PR page and the tour have sections to move through.
+    fn document_sections(&self) -> &[(String, usize)] {
+        match self.page {
+            Page::Tour => &self.tour_sections,
+            _ => &self.pr_sections,
+        }
+    }
+
+    fn document_scroll(&self) -> usize {
+        match self.page {
+            Page::Tour => self.tour_scroll,
+            _ => self.pr_scroll,
+        }
+    }
+
+    fn set_document_scroll(&mut self, scroll: usize) {
+        match self.page {
+            Page::Tour => self.tour_scroll = scroll.min(self.tour_max_scroll),
+            _ => self.pr_scroll = scroll.min(self.pr_max_scroll),
+        }
+    }
+
+    /// Move one section forward or back on the current document page.
+    fn jump_section(&mut self, delta: isize) {
+        let scroll = section_step(self.document_sections(), self.document_scroll(), delta);
+        if let Some(scroll) = scroll {
+            self.set_document_scroll(scroll);
+        }
+    }
+
     /// Jump straight to a section by its badge number, 0-based internally.
-    fn jump_to_pr_section(&mut self, index: usize) {
-        if let Some((_, offset)) = self.pr_sections.get(index) {
-            self.pr_scroll = (*offset).min(self.pr_max_scroll);
+    fn jump_to_section(&mut self, index: usize) {
+        let scroll = self
+            .document_sections()
+            .get(index)
+            .map(|(_, offset)| *offset);
+        if let Some(scroll) = scroll {
+            self.set_document_scroll(scroll);
         }
-    }
-
-    /// The section the reader is currently inside: the last one whose heading
-    /// has scrolled to or past the top of the body.
-    fn active_pr_section(&self) -> Option<usize> {
-        self.pr_sections
-            .iter()
-            .rposition(|(_, offset)| *offset <= self.pr_scroll)
-    }
-
-    /// Move the PR document one section forward or back. Going back from the
-    /// middle of a section lands on that section's own heading first, the way
-    /// a document outline is normally expected to behave.
-    fn jump_pr_section(&mut self, delta: isize) {
-        if self.pr_sections.is_empty() {
-            return;
-        }
-        let last = self.pr_sections.len() - 1;
-        let target = match (self.active_pr_section(), delta.is_negative()) {
-            (None, _) => 0,
-            (Some(i), false) => (i + 1).min(last),
-            (Some(i), true) if self.pr_scroll > self.pr_sections[i].1 => i,
-            (Some(i), true) => i.saturating_sub(1),
-        };
-        self.pr_scroll = self.pr_sections[target].1.min(self.pr_max_scroll);
     }
 
     /// Replace or remove the literate tour. An empty body removes it, the same
@@ -3036,6 +3053,8 @@ impl App {
         link::Response::ok()
     }
 
+    /// Move among every public thread in the attached snapshot, including
+    /// outdated and left-side conversations that cannot be pinned in this diff.
     fn cycle_public_thread(&mut self, delta: isize) -> bool {
         let Some(len) = self
             .pull_request
@@ -3963,6 +3982,28 @@ fn handle_event(
                         app.select_tab(n);
                     }
                 }
+                Mode::Normal if app.page == Page::Tour => match key.code {
+                    KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
+                    KeyCode::Esc => app.page = Page::Diff,
+                    KeyCode::Char(c @ '1'..='9') => app.jump_to_section(c as usize - '1' as usize),
+                    KeyCode::Char(']') => app.jump_section(1),
+                    KeyCode::Char('[') => app.jump_section(-1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.tour_scroll = (app.tour_scroll + 1).min(app.tour_max_scroll);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.tour_scroll = app.tour_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        app.tour_scroll = (app.tour_scroll + 10).min(app.tour_max_scroll);
+                    }
+                    KeyCode::PageUp => {
+                        app.tour_scroll = app.tour_scroll.saturating_sub(10);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => app.tour_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => app.tour_scroll = app.tour_max_scroll,
+                    _ => {}
+                },
                 Mode::Normal if app.page == Page::PullRequest => match key.code {
                     KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Char('p') | KeyCode::Esc => {
@@ -4011,11 +4052,9 @@ fn handle_event(
                     KeyCode::PageUp => {
                         app.pr_scroll = app.pr_scroll.saturating_sub(10);
                     }
-                    KeyCode::Char(c @ '1'..='9') => {
-                        app.jump_to_pr_section(c as usize - '1' as usize)
-                    }
-                    KeyCode::Char(']') => app.jump_pr_section(1),
-                    KeyCode::Char('[') => app.jump_pr_section(-1),
+                    KeyCode::Char(c @ '1'..='9') => app.jump_to_section(c as usize - '1' as usize),
+                    KeyCode::Char(']') => app.jump_section(1),
+                    KeyCode::Char('[') => app.jump_section(-1),
                     KeyCode::Char('g') | KeyCode::Home => app.pr_scroll = 0,
                     KeyCode::Char('G') | KeyCode::End => app.pr_scroll = app.pr_max_scroll,
                     _ => {}
@@ -4310,6 +4349,32 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         return;
     }
+    if app.page == Page::Tour {
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && app.tour_outline_area.contains(Position {
+                x: m.column,
+                y: m.row,
+            })
+        {
+            if let Some(index) = m
+                .row
+                .saturating_sub(app.tour_outline_area.y)
+                .checked_sub(1)
+                .map(usize::from)
+            {
+                app.jump_to_section(index);
+            }
+            return;
+        }
+        match m.kind {
+            MouseEventKind::ScrollDown => {
+                app.tour_scroll = (app.tour_scroll + 3).min(app.tour_max_scroll)
+            }
+            MouseEventKind::ScrollUp => app.tour_scroll = app.tour_scroll.saturating_sub(3),
+            _ => {}
+        }
+        return;
+    }
     if app.page == Page::PullRequest {
         if m.kind == MouseEventKind::Down(MouseButton::Left)
             && app.pr_outline_area.contains(Position {
@@ -4541,6 +4606,9 @@ const TAB_SEPARATOR: &str = " │ ";
 /// otherwise takes pressing `p` and watching whether anything happens.
 fn tab_entries(app: &App) -> Vec<TabEntry> {
     let mut labels = vec![(Page::Diff, "Diff".to_string())];
+    if app.tour.is_some() {
+        labels.push((Page::Tour, "Tour".to_string()));
+    }
     if let Some(pr) = &app.pull_request {
         labels.push((Page::PullRequest, format!("PR #{}", pr.number)));
     }
@@ -4784,6 +4852,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     }
 
     match app.page {
+        Page::Tour => draw_tour(frame, rows[1], app),
         Page::PullRequest => draw_pull_request(frame, rows[1], app),
         Page::ReviewThread => draw_review_thread(frame, rows[1], app),
         Page::Diff => draw_diff_page(frame, rows[1], app),
@@ -4918,6 +4987,26 @@ impl Document {
     }
 }
 
+/// The section a reader is inside: the last one whose heading has scrolled to
+/// or past the top of the body.
+fn active_section(sections: &[(String, usize)], scroll: usize) -> Option<usize> {
+    sections.iter().rposition(|(_, offset)| *offset <= scroll)
+}
+
+/// Scroll offset one section forward or back. Going back from the middle of a
+/// section lands on that section's own heading first, the way a document
+/// outline is normally expected to behave.
+fn section_step(sections: &[(String, usize)], scroll: usize, delta: isize) -> Option<usize> {
+    let last = sections.len().checked_sub(1)?;
+    let target = match (active_section(sections, scroll), delta.is_negative()) {
+        (None, _) => 0,
+        (Some(i), false) => (i + 1).min(last),
+        (Some(i), true) if scroll > sections[i].1 => i,
+        (Some(i), true) => i.saturating_sub(1),
+    };
+    Some(sections[target].1)
+}
+
 /// Width of the outline rail, and the narrowest page that still gets one.
 /// Below that the document keeps the whole width and the rail's job falls to
 /// `]` / `[`, which work whether or not it is on screen.
@@ -4952,6 +5041,116 @@ fn draw_outline(
             .block(Block::default().padding(ratatui::widgets::Padding::new(1, 1, 1, 0))),
         area,
     );
+}
+
+/// Geometry a document page keeps after a draw, so keys and clicks can act on
+/// what is actually on screen.
+struct DocumentLayout {
+    scroll: usize,
+    max_scroll: usize,
+    sections: Vec<(String, usize)>,
+    outline_area: Rect,
+}
+
+/// Render a sectioned document: outline rail on the left, prose on the right.
+/// The PR page and the tour differ in their title and which scroll they keep,
+/// not in how a sectioned document behaves, so both come through here.
+fn draw_document(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    document: Document,
+    title: &str,
+    border: Color,
+    scroll: usize,
+) -> DocumentLayout {
+    // A single section is a label rather than a choice, the same rule the tab
+    // strip and the side panes use, so it does not earn a rail.
+    let show_outline = document.sections.len() > 1 && area.width >= OUTLINE_MIN_PAGE_WIDTH;
+    let (outline_area, body_area) = if show_outline {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(OUTLINE_WIDTH), Constraint::Min(0)])
+            .split(area);
+        (panes[0], panes[1])
+    } else {
+        (Rect::default(), area)
+    };
+
+    let inner_width = body_area.width.saturating_sub(2);
+    let inner_height = body_area.height.saturating_sub(2) as usize;
+    let visual_rows: usize = document
+        .lines
+        .iter()
+        .map(|line| wrap::row_count(line, inner_width, 0))
+        .sum();
+    let max_scroll = visual_rows.saturating_sub(inner_height);
+    let scroll = scroll.min(max_scroll);
+    // Offsets resolve against the same width the body wraps at, so a jump
+    // lands the heading exactly where the rail says it is.
+    let sections = document.outline(inner_width);
+
+    if show_outline {
+        draw_outline(
+            frame,
+            outline_area,
+            &sections,
+            active_section(&sections, scroll),
+        );
+    }
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border))
+        .title(Span::styled(
+            title.to_string(),
+            Style::default().fg(theme::TEAL),
+        ));
+    frame.render_widget(
+        Paragraph::new(document.lines)
+            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
+            .wrap(Wrap { trim: false })
+            .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
+        body_area,
+    );
+
+    DocumentLayout {
+        scroll,
+        max_scroll,
+        sections,
+        outline_area,
+    }
+}
+
+/// The tour's document. Headings become sections; the prose renders the way it
+/// does everywhere else on the review surface.
+fn tour_document(source: &str) -> Document {
+    let (lines, outline) = markdown::outlined(source);
+    Document {
+        lines,
+        sections: outline
+            .into_iter()
+            .map(|(title, row)| DocumentSection { title, row })
+            .collect(),
+    }
+}
+
+fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(source) = app.tour.clone() else {
+        app.page = Page::Diff;
+        return;
+    };
+    let layout = draw_document(
+        frame,
+        area,
+        tour_document(&source),
+        " Tour ",
+        theme::MAUVE,
+        app.tour_scroll,
+    );
+    app.tour_scroll = layout.scroll;
+    app.tour_max_scroll = layout.max_scroll;
+    app.tour_sections = layout.sections;
+    app.tour_outline_area = layout.outline_area;
 }
 
 fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -4997,56 +5196,18 @@ fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     frame.render_widget(Paragraph::new(header), rows[0]);
 
     let document = pull_request_document(pr, app.review_draft_body.as_ref());
-    // A single section is a label rather than a choice, the same rule the tab
-    // strip and the side panes use, so it does not earn a rail.
-    let show_outline = document.sections.len() > 1 && rows[1].width >= OUTLINE_MIN_PAGE_WIDTH;
-    let (outline_area, body_area) = if show_outline {
-        let panes = Layout::default()
-            .direction(Direction::Horizontal)
-            .constraints([Constraint::Length(OUTLINE_WIDTH), Constraint::Min(0)])
-            .split(rows[1]);
-        (panes[0], panes[1])
-    } else {
-        (Rect::default(), rows[1])
-    };
-
-    let inner_width = body_area.width.saturating_sub(2);
-    let inner_height = body_area.height.saturating_sub(2) as usize;
-    let visual_rows: usize = document
-        .lines
-        .iter()
-        .map(|line| wrap::row_count(line, inner_width, 0))
-        .sum();
-    app.pr_max_scroll = visual_rows.saturating_sub(inner_height);
-    app.pr_scroll = app.pr_scroll.min(app.pr_max_scroll);
-    // Outline offsets are resolved against the same width the body wraps at,
-    // so a jump lands the heading exactly where the rail says it is.
-    app.pr_sections = document.outline(inner_width);
-
-    app.pr_outline_area = outline_area;
-    if show_outline {
-        draw_outline(
-            frame,
-            outline_area,
-            &app.pr_sections,
-            app.active_pr_section(),
-        );
-    }
-
-    let block = Block::default()
-        .borders(Borders::ALL)
-        .border_style(Style::default().fg(theme::SURFACE1))
-        .title(Span::styled(
-            " PR context ",
-            Style::default().fg(theme::TEAL),
-        ));
-    frame.render_widget(
-        Paragraph::new(document.lines)
-            .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
-            .wrap(Wrap { trim: false })
-            .scroll((app.pr_scroll.min(u16::MAX as usize) as u16, 0)),
-        body_area,
+    let layout = draw_document(
+        frame,
+        rows[1],
+        document,
+        " PR context ",
+        theme::SURFACE1,
+        app.pr_scroll,
     );
+    app.pr_scroll = layout.scroll;
+    app.pr_max_scroll = layout.max_scroll;
+    app.pr_sections = layout.sections;
+    app.pr_outline_area = layout.outline_area;
 }
 
 fn pull_request_document(
@@ -5556,7 +5717,7 @@ const HELP_ROWS: &[HelpRow] = &[
     head("Review"),
     bind("p", "open the attached PR description and review timeline"),
     bind("1-9", "jump to section"),
-    bind("] [", "next / prev section of the PR page"),
+    bind("] [", "next / prev section"),
     bind("t T", "next / prev public review thread"),
     bind("enter", "open the public thread anchored at the cursor"),
     bind("double click", "open a review object in files or diff"),
@@ -6845,6 +7006,77 @@ mod tests {
     }
 
     #[test]
+    fn a_tour_earns_a_tab_between_the_diff_and_the_pr() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+        let pages =
+            |app: &App| -> Vec<Page> { tab_entries(app).into_iter().map(|e| e.page).collect() };
+        assert_eq!(pages(&app), vec![Page::Diff, Page::PullRequest]);
+
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb".into(),
+        });
+        assert_eq!(pages(&app), vec![Page::Diff, Page::Tour, Page::PullRequest]);
+
+        app.select_tab(2);
+        assert_eq!(app.page, Page::Tour);
+    }
+
+    #[test]
+    fn the_tour_page_renders_its_sections_with_a_rail() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        let filler = (1..=30)
+            .map(|i| format!("paragraph {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.handle_request(link::Request::Tour {
+            body: format!(
+                "## Why the base moved\n\n{filler}\n\n## What the viewer sees\n\n{filler}"
+            ),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.tour_sections.len(), 2);
+        assert_eq!(app.tour_sections[0].0, "Why the base moved");
+        assert_eq!(app.tour_sections[1].0, "What the viewer sees");
+        assert!(app.tour_outline_area.width > 0, "wide page gets a rail");
+        assert!(app.tour_max_scroll > 0, "document overflows");
+
+        let second = app.tour_sections[1].1;
+        app.jump_to_section(1);
+        assert_eq!(app.tour_scroll, second.min(app.tour_max_scroll));
+        // Section keys act on the page you are on, not on the PR's sections.
+        assert_eq!(app.pr_scroll, 0);
+    }
+
+    /// Taking the tour down while reading it must not strand the viewer on a
+    /// page that no longer has anything to show.
+    #[test]
+    fn removing_the_tour_falls_back_to_the_diff() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb".into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.page, Page::Tour);
+
+        app.handle_request(link::Request::Tour {
+            body: String::new(),
+        });
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.page, Page::Diff);
+    }
+
+    #[test]
     fn a_tab_number_past_the_strip_is_a_no_op() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
@@ -6865,9 +7097,9 @@ mod tests {
         app.pr_sections = vec![("A".into(), 0), ("B".into(), 10), ("C".into(), 20)];
         app.pr_max_scroll = 40;
 
-        app.jump_to_pr_section(2);
+        app.jump_to_section(2);
         assert_eq!(app.pr_scroll, 20);
-        app.jump_to_pr_section(9);
+        app.jump_to_section(9);
         assert_eq!(app.pr_scroll, 20, "no tenth section to land on");
     }
 
@@ -6892,11 +7124,11 @@ mod tests {
         app.pr_sections = vec![("A".into(), 0), ("B".into(), 10)];
 
         app.pr_scroll = 0;
-        assert_eq!(app.active_pr_section(), Some(0));
+        assert_eq!(active_section(&app.pr_sections, app.pr_scroll), Some(0));
         app.pr_scroll = 9;
-        assert_eq!(app.active_pr_section(), Some(0));
+        assert_eq!(active_section(&app.pr_sections, app.pr_scroll), Some(0));
         app.pr_scroll = 10;
-        assert_eq!(app.active_pr_section(), Some(1));
+        assert_eq!(active_section(&app.pr_sections, app.pr_scroll), Some(1));
     }
 
     #[test]
@@ -6906,18 +7138,18 @@ mod tests {
         app.pr_sections = vec![("A".into(), 0), ("B".into(), 10), ("C".into(), 20)];
         app.pr_max_scroll = 40;
 
-        app.jump_pr_section(1);
+        app.jump_section(1);
         assert_eq!(app.pr_scroll, 10);
-        app.jump_pr_section(1);
+        app.jump_section(1);
         assert_eq!(app.pr_scroll, 20);
-        app.jump_pr_section(1);
+        app.jump_section(1);
         assert_eq!(app.pr_scroll, 20, "clamps at the last section");
 
         // Back from mid-section lands on this heading before the previous one.
         app.pr_scroll = 25;
-        app.jump_pr_section(-1);
+        app.jump_section(-1);
         assert_eq!(app.pr_scroll, 20);
-        app.jump_pr_section(-1);
+        app.jump_section(-1);
         assert_eq!(app.pr_scroll, 10);
     }
 

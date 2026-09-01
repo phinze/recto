@@ -12,6 +12,13 @@ use ratatui::text::{Line, Span};
 use crate::theme;
 
 pub fn lines(source: &str) -> Vec<Line<'static>> {
+    outlined(source).0
+}
+
+/// The same render, plus the row each top-level heading landed on. H1 and H2
+/// both count, as one tier: a document reads the same whether its author
+/// reached for `#` or `##`, and deeper headings stay prose.
+pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
     let parser = Parser::new_ext(source, Options::all());
     let mut out = Vec::new();
     let mut current = Vec::new();
@@ -21,6 +28,10 @@ pub fn lines(source: &str) -> Vec<Line<'static>> {
     let mut quote_depth = 0usize;
     let mut in_code_block = false;
     let mut table_cell = 0usize;
+    let mut outline = Vec::new();
+    // Row and accumulating text of the heading being rendered, when the
+    // heading is one the outline cares about.
+    let mut heading: Option<(usize, String)> = None;
 
     for event in parser {
         match event {
@@ -28,6 +39,9 @@ pub fn lines(source: &str) -> Vec<Line<'static>> {
                 Tag::Paragraph => {}
                 Tag::Heading { level, .. } => {
                     finish_line(&mut out, &mut current);
+                    if matches!(level, HeadingLevel::H1 | HeadingLevel::H2) {
+                        heading = Some((out.len(), String::new()));
+                    }
                     styles.push(heading_style(level));
                 }
                 Tag::Emphasis => push_modifier(&mut styles, Modifier::ITALIC),
@@ -91,6 +105,11 @@ pub fn lines(source: &str) -> Vec<Line<'static>> {
                 TagEnd::Paragraph => finish_block(&mut out, &mut current),
                 TagEnd::Heading(_) => {
                     styles.pop();
+                    if let Some((row, title)) = heading.take()
+                        && !title.trim().is_empty()
+                    {
+                        outline.push((title.trim().to_string(), row));
+                    }
                     finish_block(&mut out, &mut current);
                 }
                 TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough | TagEnd::Link => {
@@ -128,6 +147,9 @@ pub fn lines(source: &str) -> Vec<Line<'static>> {
             },
             Event::Text(text) => {
                 let style = current_style(&styles);
+                if let Some((_, title)) = heading.as_mut() {
+                    title.push_str(&text);
+                }
                 for (i, part) in text.split('\n').enumerate() {
                     if i > 0 {
                         finish_line(&mut out, &mut current);
@@ -144,10 +166,15 @@ pub fn lines(source: &str) -> Vec<Line<'static>> {
                     current.push(Span::styled(part.to_string(), style));
                 }
             }
-            Event::Code(code) => current.push(Span::styled(
-                code.to_string(),
-                current_style(&styles).fg(theme::PEACH).bg(theme::SURFACE0),
-            )),
+            Event::Code(code) => {
+                if let Some((_, title)) = heading.as_mut() {
+                    title.push_str(&code);
+                }
+                current.push(Span::styled(
+                    code.to_string(),
+                    current_style(&styles).fg(theme::PEACH).bg(theme::SURFACE0),
+                ));
+            }
             Event::SoftBreak => current.push(Span::raw(" ")),
             Event::HardBreak => finish_line(&mut out, &mut current),
             Event::Rule => {
@@ -180,7 +207,7 @@ pub fn lines(source: &str) -> Vec<Line<'static>> {
     if out.is_empty() {
         out.push(Line::default());
     }
-    out
+    (out, outline)
 }
 
 fn current_style(styles: &[Style]) -> Style {
@@ -228,6 +255,23 @@ mod tests {
         assert_eq!(text[2], "Read this and that.");
         assert_eq!(text[4], "• one");
         assert_eq!(text[5], "• two");
+    }
+
+    #[test]
+    fn the_outline_takes_top_level_headings_as_one_tier() {
+        let (lines, outline) =
+            outlined("# Intro\n\nWords.\n\n## Step one\n\nMore.\n\n### Detail\n\nDeeper.");
+        let titles: Vec<&str> = outline.iter().map(|(title, _)| title.as_str()).collect();
+        assert_eq!(titles, ["Intro", "Step one"], "H3 stays prose");
+        // Each recorded row is the heading's own line.
+        assert_eq!(lines[outline[0].1].to_string(), "Intro");
+        assert_eq!(lines[outline[1].1].to_string(), "Step one");
+    }
+
+    #[test]
+    fn a_heading_title_keeps_its_inline_code() {
+        let (_, outline) = outlined("## The `Document` type");
+        assert_eq!(outline[0].0, "The Document type");
     }
 
     #[test]
