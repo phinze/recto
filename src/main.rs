@@ -4804,9 +4804,32 @@ fn push_status(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
 /// diff-local, while anything waiting on the reviewer — a stale PR, pending
 /// agent notes, an unsent draft — persists across every page, since switching
 /// tabs must not be able to hide it.
+/// Where the reader sits in a sectioned document. The rail says the same thing
+/// when it is on screen; this is the half that survives a narrow page, where
+/// the rail hides and `]` / `[` keep working.
+fn document_status(spans: &mut Vec<Span<'static>>, sections: &[(String, usize)], scroll: usize) {
+    let Some(index) = active_section(sections, scroll) else {
+        return;
+    };
+    push_status(
+        spans,
+        format!("section {}/{}", index + 1, sections.len()),
+        Style::default().fg(theme::MAUVE),
+    );
+    if let Some((title, _)) = sections.get(index) {
+        push_status(spans, title.clone(), Style::default().fg(theme::SUBTEXT0));
+    }
+}
+
 fn status_line(app: &App) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
+    match app.page {
+        Page::Tour => document_status(&mut spans, &app.tour_sections, app.tour_scroll),
+        Page::PullRequest => document_status(&mut spans, &app.pr_sections, app.pr_scroll),
+        Page::ReviewThread => {}
+        Page::Diff => {}
+    }
     if app.page == Page::Diff {
         // Revs *in the diff*, not revs in the panel. The panel window is
         // deliberately deeper than the range so there's something to pick a base
@@ -7334,6 +7357,35 @@ mod tests {
         app.tour_scroll = app.tour_max_scroll;
         let refused = app.open_quote_in_view();
         assert!(!refused.ok || app.page == Page::Diff);
+    }
+
+    /// A narrow page hides the rail, so the status line is the only thing left
+    /// that can say which section you landed on.
+    #[test]
+    fn the_status_line_reports_the_section_in_view() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(50, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb\n\n## Three\n\nc".into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.tour_outline_area,
+            Rect::default(),
+            "too narrow for a rail"
+        );
+
+        let line = status_line(&app);
+        let rendered = format!("{line:?}");
+        assert!(rendered.contains("section 1/3"), "{rendered}");
+
+        app.jump_to_section(2);
+        let rendered = format!("{:?}", status_line(&app));
+        assert!(rendered.contains("section 3/3"), "{rendered}");
+        assert!(rendered.contains("Three"), "{rendered}");
     }
 
     #[test]
