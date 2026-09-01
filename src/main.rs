@@ -3060,6 +3060,22 @@ impl App {
         }
     }
 
+    /// Open the next pull quote at or below the reader's position. After a
+    /// section jump that is the section's own quote, which is what makes
+    /// `enter` mean "show me the code this part is about" without needing a
+    /// separate cursor to move around.
+    fn open_quote_in_view(&mut self) -> link::Response {
+        let spec = self
+            .tour_quotes
+            .iter()
+            .find(|(rows, _)| rows.end > self.tour_scroll)
+            .map(|(_, spec)| spec.clone());
+        match spec {
+            Some(spec) => self.open_quote(&spec),
+            None => link::Response::err("no pull quote below here"),
+        }
+    }
+
     /// Follow a pull quote into the full diff, remembering where in the tour
     /// the reader left so Esc can put them back.
     fn open_quote(&mut self, spec: &str) -> link::Response {
@@ -4072,6 +4088,9 @@ fn handle_event(
                 Mode::Normal if app.page == Page::Tour => match key.code {
                     KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Esc => app.page = Page::Diff,
+                    KeyCode::Enter => {
+                        app.open_quote_in_view();
+                    }
                     KeyCode::Char(c @ '1'..='9') => app.jump_to_section(c as usize - '1' as usize),
                     KeyCode::Char(']') => app.jump_section(1),
                     KeyCode::Char('[') => app.jump_section(-1),
@@ -5908,6 +5927,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("enter", "open selected file or review object"),
     bind("shift-1..9", "switch to that tab"),
     bind("left click", "switch screens on the tab strip"),
+    bind("enter", "open the next tour pull quote in the diff"),
     bind("left click", "open a tour pull quote in the diff"),
     bind("w", "toggle line wrap"),
     bind("W", "toggle ignore whitespace"),
@@ -7270,6 +7290,50 @@ mod tests {
         assert!(app.return_to_tour(), "Esc unwinds back into the tour");
         assert_eq!(app.page, Page::Tour);
         assert!(!app.return_to_tour(), "and the return is spent once used");
+    }
+
+    /// After a section jump the next quote below is that section's own, which
+    /// is what makes a single `enter` binding predictable without a cursor.
+    #[test]
+    fn enter_opens_the_quote_belonging_to_the_section_in_view() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        let terminal_backend = ratatui::backend::TestBackend::new(159, 77);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: concat!(
+                "## First\n\nprose\n\n```recto foo.go:2\n```\n\n",
+                "## Second\n\nprose\n\n```recto foo.go:111\n```\n"
+            )
+            .into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.tour_quotes.len(), 2);
+
+        // From the top, the first quote.
+        assert!(app.open_quote_in_view().ok);
+        assert_eq!(
+            app.focus_span.as_ref().map(|span| span.start),
+            Some(2),
+            "the first section's quote"
+        );
+
+        assert!(app.return_to_tour());
+        app.jump_to_section(1);
+        assert!(app.open_quote_in_view().ok);
+        assert_eq!(
+            app.focus_span.as_ref().map(|span| span.start),
+            Some(111),
+            "the second section's quote"
+        );
+
+        // Past the last quote there is nothing to open, and nothing moves.
+        assert!(app.return_to_tour());
+        app.tour_scroll = app.tour_max_scroll;
+        let refused = app.open_quote_in_view();
+        assert!(!refused.ok || app.page == Page::Diff);
     }
 
     #[test]
