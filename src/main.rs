@@ -5083,11 +5083,17 @@ fn draw_document(
         .iter()
         .map(|line| wrap::row_count(line, inner_width, 0))
         .sum();
-    let max_scroll = visual_rows.saturating_sub(inner_height);
-    let scroll = scroll.min(max_scroll);
     // Offsets resolve against the same width the body wraps at, so a jump
     // lands the heading exactly where the rail says it is.
     let sections = document.outline(inner_width);
+    // A section listed in the rail but impossible to scroll to is a dead
+    // control, which is what a document shorter than its viewport used to
+    // produce: content overflow is zero, so every jump clamped back to the
+    // top. Let the last heading reach the top the way an anchor link does.
+    let max_scroll = visual_rows
+        .saturating_sub(inner_height)
+        .max(sections.last().map_or(0, |(_, offset)| *offset));
+    let scroll = scroll.min(max_scroll);
 
     if show_outline {
         draw_outline(
@@ -7003,6 +7009,32 @@ mod tests {
         assert_eq!(shifted_digit(&key('2', KeyModifiers::SHIFT)), Some(2));
         // A bare digit belongs to the page, not the tab strip.
         assert_eq!(shifted_digit(&key('2', KeyModifiers::NONE)), None);
+    }
+
+    /// The regression this pins: a document shorter than its viewport had no
+    /// scroll range at all, so every badge key and rail click clamped straight
+    /// back to the top while the rail went on looking interactive.
+    #[test]
+    fn sections_stay_reachable_when_the_document_fits() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(159, 77);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb\n\n## Three\n\nc".into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let third = app.tour_sections[2].1;
+        assert!(third > 0, "sections sit at distinct offsets");
+
+        app.jump_to_section(2);
+        assert_eq!(app.tour_scroll, third, "the last section is reachable");
+        assert_eq!(active_section(&app.tour_sections, app.tour_scroll), Some(2));
+
+        app.jump_section(-1);
+        assert_eq!(app.tour_scroll, app.tour_sections[1].1);
     }
 
     #[test]
