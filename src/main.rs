@@ -2914,6 +2914,21 @@ impl App {
 
     /// Move among every public thread in the attached snapshot, including
     /// outdated and left-side conversations that cannot be pinned in this diff.
+    /// Switch to the nth tab, 1-based. Out of range is a no-op rather than a
+    /// clamp: shift+3 on a two-tab strip asked for a tab that isn't there.
+    fn select_tab(&mut self, n: usize) {
+        if let Some(page) = tab_entries(self).get(n - 1).map(|entry| entry.page) {
+            self.page = page;
+        }
+    }
+
+    /// Jump straight to a section by its badge number, 0-based internally.
+    fn jump_to_pr_section(&mut self, index: usize) {
+        if let Some((_, offset)) = self.pr_sections.get(index) {
+            self.pr_scroll = (*offset).min(self.pr_max_scroll);
+        }
+    }
+
     /// The section the reader is currently inside: the last one whose heading
     /// has scrolled to or past the top of the body.
     fn active_pr_section(&self) -> Option<usize> {
@@ -3645,6 +3660,19 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     Ok(())
 }
 
+/// Shift+N as the 1-based tab index it selects. Terminals disagree about how
+/// they report it: most send the shifted punctuation, while the kitty protocol
+/// sends the digit with a SHIFT modifier. Accept either spelling.
+fn shifted_digit(key: &event::KeyEvent) -> Option<usize> {
+    match key.code {
+        KeyCode::Char(c @ '1'..='9') if key.modifiers.contains(event::KeyModifiers::SHIFT) => {
+            Some(c as usize - '0' as usize)
+        }
+        KeyCode::Char(c) => "!@#$%^&*(".find(c).map(|i| i + 1),
+        _ => None,
+    }
+}
+
 fn handle_event(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -3820,6 +3848,13 @@ fn handle_event(
                 Mode::Normal if key.code == KeyCode::Char('v') => {
                     app.set_comment_visibility(None);
                 }
+                // Ahead of the page arms: a tab switch means the same thing
+                // everywhere, and the pages must not shadow it.
+                Mode::Normal if shifted_digit(&key).is_some() => {
+                    if let Some(n) = shifted_digit(&key) {
+                        app.select_tab(n);
+                    }
+                }
                 Mode::Normal if app.page == Page::PullRequest => match key.code {
                     KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Char('p') | KeyCode::Esc => {
@@ -3867,6 +3902,9 @@ fn handle_event(
                     }
                     KeyCode::PageUp => {
                         app.pr_scroll = app.pr_scroll.saturating_sub(10);
+                    }
+                    KeyCode::Char(c @ '1'..='9') => {
+                        app.jump_to_pr_section(c as usize - '1' as usize)
                     }
                     KeyCode::Char(']') => app.jump_pr_section(1),
                     KeyCode::Char('[') => app.jump_pr_section(-1),
@@ -4773,7 +4811,7 @@ impl Document {
 /// Width of the outline rail, and the narrowest page that still gets one.
 /// Below that the document keeps the whole width and the rail's job falls to
 /// `]` / `[`, which work whether or not it is on screen.
-const OUTLINE_WIDTH: u16 = 22;
+const OUTLINE_WIDTH: u16 = 24;
 const OUTLINE_MIN_PAGE_WIDTH: u16 = 60;
 
 fn draw_outline(
@@ -4793,7 +4831,10 @@ fn draw_outline(
             } else {
                 Style::default().fg(theme::SUBTEXT0)
             };
-            ListItem::new(Line::from(Span::styled(title.clone(), style)))
+            ListItem::new(Line::from(vec![
+                Span::styled(format!("{} ", badge(i + 1)), style),
+                Span::styled(title.clone(), style),
+            ]))
         })
         .collect();
     frame.render_widget(
@@ -5385,6 +5426,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("h l  ← →", "scroll diff horizontally"),
     bind("0", "reset horizontal scroll"),
     bind("enter", "open selected file or review object"),
+    bind("shift-1..9", "switch to that tab"),
     bind("left click", "switch screens on the tab strip"),
     bind("w", "toggle line wrap"),
     bind("W", "toggle ignore whitespace"),
@@ -5403,6 +5445,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("1-9", "jump to tour step"),
     head("Review"),
     bind("p", "open the attached PR description and review timeline"),
+    bind("1-9", "jump to section"),
     bind("] [", "next / prev section of the PR page"),
     bind("t T", "next / prev public review thread"),
     bind("enter", "open the public thread anchored at the cursor"),
@@ -6528,6 +6571,47 @@ mod tests {
 
         handle_mouse(&mut app, left_click(diff_col, tab_row));
         assert_eq!(app.page, Page::Diff);
+    }
+
+    #[test]
+    fn shift_digits_are_read_in_both_terminal_spellings() {
+        use event::KeyModifiers;
+        let key = |c, m| event::KeyEvent::new(KeyCode::Char(c), m);
+
+        assert_eq!(shifted_digit(&key('!', KeyModifiers::NONE)), Some(1));
+        assert_eq!(shifted_digit(&key('@', KeyModifiers::NONE)), Some(2));
+        assert_eq!(shifted_digit(&key('(', KeyModifiers::NONE)), Some(9));
+        // The kitty protocol spelling of the same chord.
+        assert_eq!(shifted_digit(&key('2', KeyModifiers::SHIFT)), Some(2));
+        // A bare digit belongs to the page, not the tab strip.
+        assert_eq!(shifted_digit(&key('2', KeyModifiers::NONE)), None);
+    }
+
+    #[test]
+    fn a_tab_number_past_the_strip_is_a_no_op() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+
+        app.select_tab(2);
+        assert_eq!(app.page, Page::PullRequest);
+        app.select_tab(1);
+        assert_eq!(app.page, Page::Diff);
+        app.select_tab(3);
+        assert_eq!(app.page, Page::Diff, "no third tab to land on");
+    }
+
+    #[test]
+    fn a_section_number_scrolls_straight_to_its_heading() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.pr_sections = vec![("A".into(), 0), ("B".into(), 10), ("C".into(), 20)];
+        app.pr_max_scroll = 40;
+
+        app.jump_to_pr_section(2);
+        assert_eq!(app.pr_scroll, 20);
+        app.jump_to_pr_section(9);
+        assert_eq!(app.pr_scroll, 20, "no tenth section to land on");
     }
 
     #[test]
