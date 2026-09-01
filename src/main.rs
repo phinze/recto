@@ -844,6 +844,13 @@ struct App {
     tour_max_scroll: usize,
     tour_sections: Vec<(String, usize)>,
     tour_outline_area: Rect,
+    /// Visual-row range of each rendered pull quote, with the span it names,
+    /// so a click in the tour body can find the code it points at.
+    tour_quotes: Vec<(Range<usize>, String)>,
+    tour_body_area: Rect,
+    /// Tour scroll to come back to after a quote sent the reader to the diff.
+    /// Set on the way in, spent by the first Esc on the way out.
+    tour_return: Option<usize>,
     active_thread: Option<usize>,
     thread_scroll: usize,
     thread_max_scroll: usize,
@@ -1027,6 +1034,9 @@ impl App {
             tour_max_scroll: 0,
             tour_sections: Vec::new(),
             tour_outline_area: Rect::default(),
+            tour_quotes: Vec::new(),
+            tour_body_area: Rect::default(),
+            tour_return: None,
             active_thread: None,
             thread_scroll: 0,
             thread_max_scroll: 0,
@@ -3025,6 +3035,33 @@ impl App {
         }
     }
 
+    /// Follow a pull quote into the full diff, remembering where in the tour
+    /// the reader left so Esc can put them back.
+    fn open_quote(&mut self, spec: &str) -> link::Response {
+        let (path, start, end) = parse_pathspec(spec);
+        let Some(start) = start else {
+            return link::Response::err(format!("quote names no line: {spec}"));
+        };
+        let path = path.to_string();
+        self.tour_return = Some(self.tour_scroll);
+        self.page = Page::Diff;
+        self.focus_target(&path, Some(start), end)
+    }
+
+    /// Step back out of a quote, if one brought us here. Reported so Esc can
+    /// fall through to its usual unwinding when it did not.
+    fn return_to_tour(&mut self) -> bool {
+        let Some(scroll) = self.tour_return.take() else {
+            return false;
+        };
+        if self.tour.is_none() {
+            return false;
+        }
+        self.tour_scroll = scroll;
+        self.page = Page::Tour;
+        true
+    }
+
     /// Move one section forward or back on the current document page.
     fn jump_section(&mut self, delta: isize) {
         let scroll = section_step(self.document_sections(), self.document_scroll(), delta);
@@ -4110,7 +4147,10 @@ fn handle_event(
                         app.page = Page::PullRequest;
                     }
                     KeyCode::Esc => {
-                        if app.search_query.is_some() {
+                        // A quote drilled in from the tour; Esc is the way back
+                        // out before it means anything else.
+                        if app.return_to_tour() {
+                        } else if app.search_query.is_some() {
                             app.clear_search();
                         } else if app.focus_span.is_some() {
                             app.focus_span = None;
@@ -4365,6 +4405,26 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 app.jump_to_section(index);
             }
             return;
+        }
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && app.tour_body_area.contains(Position {
+                x: m.column,
+                y: m.row,
+            })
+        {
+            // Skip the block's top border to get the first content row, then
+            // add the scroll offset to reach the document row under the cursor.
+            let clicked =
+                usize::from(m.row.saturating_sub(app.tour_body_area.y + 1)) + app.tour_scroll;
+            let spec = app
+                .tour_quotes
+                .iter()
+                .find(|(rows, _)| rows.contains(&clicked))
+                .map(|(_, spec)| spec.clone());
+            if let Some(spec) = spec {
+                app.open_quote(&spec);
+                return;
+            }
         }
         match m.kind {
             MouseEventKind::ScrollDown => {
@@ -4932,6 +4992,9 @@ fn draw_mode_overlay(frame: &mut ratatui::Frame, app: &mut App) {
 struct Document {
     lines: Vec<Line<'static>>,
     sections: Vec<DocumentSection>,
+    /// Rows each expanded diff quote occupies, with the pathspec it names.
+    /// Empty for documents that have no quotes, such as the PR page.
+    quotes: Vec<(Range<usize>, String)>,
 }
 
 /// One outline entry. `row` indexes `Document::lines`; the visual row it
@@ -4968,6 +5031,27 @@ impl Document {
 
     fn extend(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
         self.lines.extend(lines);
+    }
+
+    /// Visual-row range of each quote at `width`, for hit-testing a click.
+    /// Quotes are recorded in document order, so one walk resolves them all.
+    fn quote_spans(&self, width: u16) -> Vec<(Range<usize>, String)> {
+        let mut spans = Vec::with_capacity(self.quotes.len());
+        let mut row = 0usize;
+        let mut visual = 0usize;
+        let advance = |row: &mut usize, visual: &mut usize, until: usize| {
+            while *row < until {
+                *visual += wrap::row_count(&self.lines[*row], width, 0);
+                *row += 1;
+            }
+        };
+        for (range, spec) in &self.quotes {
+            advance(&mut row, &mut visual, range.start);
+            let start = visual;
+            advance(&mut row, &mut visual, range.end);
+            spans.push((start..visual, spec.clone()));
+        }
+        spans
     }
 
     /// Title and first visual row of each section at `width`. Sections are
@@ -5050,6 +5134,8 @@ struct DocumentLayout {
     max_scroll: usize,
     sections: Vec<(String, usize)>,
     outline_area: Rect,
+    quotes: Vec<(Range<usize>, String)>,
+    body_area: Rect,
 }
 
 /// Render a sectioned document: outline rail on the left, prose on the right.
@@ -5086,6 +5172,7 @@ fn draw_document(
     // Offsets resolve against the same width the body wraps at, so a jump
     // lands the heading exactly where the rail says it is.
     let sections = document.outline(inner_width);
+    let quotes = document.quote_spans(inner_width);
     // A section listed in the rail but impossible to scroll to is a dead
     // control, which is what a document shorter than its viewport used to
     // produce: content overflow is zero, so every jump clamped back to the
@@ -5124,19 +5211,51 @@ fn draw_document(
         max_scroll,
         sections,
         outline_area,
+        quotes,
+        body_area,
     }
 }
 
-/// The tour's document. Headings become sections; the prose renders the way it
-/// does everywhere else on the review surface.
-fn tour_document(source: &str) -> Document {
-    let (lines, outline) = markdown::outlined(source);
+/// Lift the diff rows a quote names. Reads the pristine render rather than the
+/// woven one, so notes and threads anchored inside a span cannot turn up inside
+/// a quote of it. The rows arrive already syntax- and word-level highlighted,
+/// gutters and signs intact, because they are the rows the diff pane draws.
+fn quote_rows(app: &App, spec: &str) -> Option<Vec<Line<'static>>> {
+    let (path, start, end) = parse_pathspec(spec);
+    let start = start?;
+    let end = end.unwrap_or(start).max(start);
+    let file_idx = app.changes.iter().position(|c| c.path == path)?;
+    let rows = rows_for_span(&app.base_line_info, file_idx, start, end)?;
+    Some(app.base_rendered[rows].to_vec())
+}
+
+/// The tour's document. Headings become sections, fenced `recto` blocks become
+/// pull quotes, and the prose renders the way it does everywhere else.
+fn tour_document(source: &str, app: &App) -> Document {
+    let mut quote = |spec: &str| {
+        let spec = spec.trim();
+        let mut rows = vec![Line::from(Span::styled(
+            format!("  {spec}"),
+            Style::default().fg(theme::OVERLAY0),
+        ))];
+        match quote_rows(app, spec) {
+            Some(quoted) => rows.extend(quoted),
+            // Tours outlive the diff they were written against. Say so in
+            // place: a quote that vanished would leave prose pointing at
+            // nothing, with no hint that anything was missing.
+            None => rows.push(dim_line("  not in this diff")),
+        }
+        rows
+    };
+    let rendered = markdown::with_quotes(source, &mut quote);
     Document {
-        lines,
-        sections: outline
+        lines: rendered.lines,
+        sections: rendered
+            .sections
             .into_iter()
             .map(|(title, row)| DocumentSection { title, row })
             .collect(),
+        quotes: rendered.quotes,
     }
 }
 
@@ -5148,7 +5267,7 @@ fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let layout = draw_document(
         frame,
         area,
-        tour_document(&source),
+        tour_document(&source, app),
         " Tour ",
         theme::MAUVE,
         app.tour_scroll,
@@ -5157,6 +5276,8 @@ fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.tour_max_scroll = layout.max_scroll;
     app.tour_sections = layout.sections;
     app.tour_outline_area = layout.outline_area;
+    app.tour_quotes = layout.quotes;
+    app.tour_body_area = layout.body_area;
 }
 
 fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -5705,6 +5826,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("enter", "open selected file or review object"),
     bind("shift-1..9", "switch to that tab"),
     bind("left click", "switch screens on the tab strip"),
+    bind("left click", "open a tour pull quote in the diff"),
     bind("w", "toggle line wrap"),
     bind("W", "toggle ignore whitespace"),
     head("Focus"),
@@ -7014,6 +7136,77 @@ mod tests {
     /// The regression this pins: a document shorter than its viewport had no
     /// scroll range at all, so every badge key and rail click clamped straight
     /// back to the top while the rail went on looking interactive.
+    /// Put a real rendered diff under an app built on the empty `TestBackend`,
+    /// so spans have somewhere to resolve.
+    fn load_sample_diff(app: &mut App) {
+        let changes = vec![FileChange {
+            path: "foo.go".into(),
+            status: FileStatus::Modified,
+        }];
+        let fetch: Box<FetchContent> = Box::new(|_| None);
+        let rendered = render_diff(TWO_HUNK_DIFF, &changes, &Highlighter::new(), &*fetch);
+        app.changes = changes;
+        app.base_rendered = rendered.lines;
+        app.base_file_starts = rendered.file_starts;
+        app.base_line_info = rendered.line_info;
+        app.file_stats = rendered.file_stats;
+        app.reweave();
+    }
+
+    #[test]
+    fn clicking_a_pull_quote_opens_the_diff_and_esc_comes_back() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        let terminal_backend = ratatui::backend::TestBackend::new(159, 77);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## Step\n\nProse.\n\n```recto foo.go:111\n```\n\nAfter.".into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.tour_quotes.len(), 1);
+        let (rows, spec) = app.tour_quotes[0].clone();
+        assert_eq!(spec, "foo.go:111");
+        // Label row plus at least one lifted diff row.
+        assert!(rows.len() > 1, "the quote expanded to real diff rows");
+
+        // Click the quote's own label row, inside the body block.
+        let x = app.tour_body_area.x + 2;
+        let y = app.tour_body_area.y + 1 + rows.start as u16;
+        handle_mouse(&mut app, left_click(x, y));
+
+        assert_eq!(app.page, Page::Diff, "a quote drills into the full diff");
+        assert_eq!(
+            app.focus_span
+                .as_ref()
+                .map(|span| (span.path.as_str(), span.start)),
+            Some(("foo.go", 111))
+        );
+
+        assert!(app.return_to_tour(), "Esc unwinds back into the tour");
+        assert_eq!(app.page, Page::Tour);
+        assert!(!app.return_to_tour(), "and the return is spent once used");
+    }
+
+    /// Tours outlive the diff they were written against, so a span that no
+    /// longer resolves has to say so rather than leave prose pointing at air.
+    #[test]
+    fn a_quote_that_no_longer_resolves_says_so_in_place() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+
+        let document = tour_document("## Step\n\n```recto src/gone.rs:99\n```", &app);
+        let text: Vec<String> = document.lines.iter().map(Line::to_string).collect();
+        assert!(
+            text.iter().any(|line| line.contains("not in this diff")),
+            "{text:#?}"
+        );
+        assert!(text.iter().any(|line| line.contains("src/gone.rs:99")));
+    }
+
     #[test]
     fn sections_stay_reachable_when_the_document_fits() {
         let backend = Arc::new(TestBackend::new());

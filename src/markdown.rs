@@ -5,20 +5,58 @@
 //! `Paragraph`, so the same body can sit in a full-page description, timeline
 //! card, thread, or eventual authoring preview.
 
-use pulldown_cmark::{Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::theme;
 
 pub fn lines(source: &str) -> Vec<Line<'static>> {
-    outlined(source).0
+    outlined(source).lines
 }
 
-/// The same render, plus the row each top-level heading landed on. H1 and H2
-/// both count, as one tier: a document reads the same whether its author
-/// reached for `#` or `##`, and deeper headings stay prose.
-pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
+/// A rendered document and the structure found while rendering it.
+#[derive(Default)]
+pub struct Rendered {
+    pub lines: Vec<Line<'static>>,
+    /// Title and row of each top-level heading, in document order.
+    pub sections: Vec<(String, usize)>,
+    /// Rows each expanded diff quote occupies, with the pathspec it names.
+    pub quotes: Vec<(std::ops::Range<usize>, String)>,
+}
+
+/// A callback that turns a quote's pathspec into the rows to splice in.
+pub type Quote<'a> = &'a mut dyn FnMut(&str) -> Vec<Line<'static>>;
+
+/// Render with headings recorded. H1 and H2 both count, as one tier: a
+/// document reads the same whether its author reached for `#` or `##`, and
+/// deeper headings stay prose.
+pub fn outlined(source: &str) -> Rendered {
+    render(source, None)
+}
+
+/// Render, additionally expanding fenced blocks tagged `recto` by handing
+/// their pathspec to `quote`. Without a resolver those fences render as the
+/// ordinary code blocks they are, which is what a PR body wants.
+pub fn with_quotes(source: &str, quote: Quote<'_>) -> Rendered {
+    render(source, Some(quote))
+}
+
+/// The pathspec a fence names, if it is a recto quote. `recto` must stand as
+/// its own word so an unrelated `rectoclip` fence stays a code block.
+fn quote_spec(kind: &CodeBlockKind<'_>) -> Option<String> {
+    let CodeBlockKind::Fenced(info) = kind else {
+        return None;
+    };
+    let rest = info.strip_prefix("recto")?;
+    if rest.is_empty() || rest.starts_with(char::is_whitespace) {
+        Some(rest.trim().to_string())
+    } else {
+        None
+    }
+}
+
+fn render(source: &str, mut quote: Option<Quote<'_>>) -> Rendered {
     let parser = Parser::new_ext(source, Options::all());
     let mut out = Vec::new();
     let mut current = Vec::new();
@@ -29,9 +67,13 @@ pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
     let mut in_code_block = false;
     let mut table_cell = 0usize;
     let mut outline = Vec::new();
+    let mut quotes = Vec::new();
     // Row and accumulating text of the heading being rendered, when the
     // heading is one the outline cares about.
     let mut heading: Option<(usize, String)> = None;
+    // Pathspec of the recto fence currently open, if any. Its body is
+    // discarded: the rows come from the diff, not from the document.
+    let mut quoting: Option<String> = None;
 
     for event in parser {
         match event {
@@ -56,10 +98,15 @@ pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
                     finish_line(&mut out, &mut current);
                     quote_depth += 1;
                 }
-                Tag::CodeBlock(_) => {
+                Tag::CodeBlock(kind) => {
                     finish_line(&mut out, &mut current);
-                    in_code_block = true;
-                    styles.push(Style::default().fg(theme::SUBTEXT0).bg(theme::SURFACE0));
+                    match quote_spec(&kind).filter(|_| quote.is_some()) {
+                        Some(spec) => quoting = Some(spec),
+                        None => {
+                            in_code_block = true;
+                            styles.push(Style::default().fg(theme::SUBTEXT0).bg(theme::SURFACE0));
+                        }
+                    }
                 }
                 Tag::List(start) => {
                     finish_line(&mut out, &mut current);
@@ -120,9 +167,18 @@ pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
                     quote_depth = quote_depth.saturating_sub(1);
                 }
                 TagEnd::CodeBlock => {
-                    finish_block(&mut out, &mut current);
-                    styles.pop();
-                    in_code_block = false;
+                    if let Some(spec) = quoting.take() {
+                        let start = out.len();
+                        if let Some(quote) = quote.as_mut() {
+                            out.extend(quote(&spec));
+                        }
+                        quotes.push((start..out.len(), spec));
+                        blank(&mut out);
+                    } else {
+                        finish_block(&mut out, &mut current);
+                        styles.pop();
+                        in_code_block = false;
+                    }
                 }
                 TagEnd::List(_) => {
                     finish_line(&mut out, &mut current);
@@ -146,6 +202,9 @@ pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
                 _ => {}
             },
             Event::Text(text) => {
+                if quoting.is_some() {
+                    continue;
+                }
                 let style = current_style(&styles);
                 if let Some((_, title)) = heading.as_mut() {
                     title.push_str(&text);
@@ -207,7 +266,11 @@ pub fn outlined(source: &str) -> (Vec<Line<'static>>, Vec<(String, usize)>) {
     if out.is_empty() {
         out.push(Line::default());
     }
-    (out, outline)
+    Rendered {
+        lines: out,
+        sections: outline,
+        quotes,
+    }
 }
 
 fn current_style(styles: &[Style]) -> Style {
@@ -258,20 +321,69 @@ mod tests {
     }
 
     #[test]
+    fn a_recto_fence_is_replaced_by_its_quote() {
+        let mut quote = |spec: &str| vec![Line::raw(format!("<{spec}>"))];
+        let rendered = with_quotes(
+            "Before.\n\n```recto src/a.rs:1-2\n```\n\nAfter.",
+            &mut quote,
+        );
+        let text: Vec<String> = rendered.lines.iter().map(Line::to_string).collect();
+
+        assert_eq!(rendered.quotes.len(), 1);
+        assert_eq!(rendered.quotes[0].1, "src/a.rs:1-2");
+        // The recorded rows are where the quote actually landed.
+        assert_eq!(text[rendered.quotes[0].0.start], "<src/a.rs:1-2>");
+        assert!(text.iter().any(|line| line == "Before."), "{text:#?}");
+        assert!(text.iter().any(|line| line == "After."), "{text:#?}");
+    }
+
+    /// `recto` has to stand as its own word, or an unrelated fence would lose
+    /// its body to a quote resolver that knows nothing about it.
+    #[test]
+    fn only_a_standalone_recto_info_string_becomes_a_quote() {
+        let mut quote = |_: &str| vec![Line::raw("QUOTED")];
+        let rendered = with_quotes("```rectoclip\nkeep me\n```", &mut quote);
+        let text: Vec<String> = rendered.lines.iter().map(Line::to_string).collect();
+
+        assert!(rendered.quotes.is_empty());
+        assert!(
+            text.iter().any(|line| line.trim() == "keep me"),
+            "{text:#?}"
+        );
+    }
+
+    /// A PR body has no diff to quote from, so the same fence is just code.
+    #[test]
+    fn without_a_resolver_a_recto_fence_stays_a_code_block() {
+        let rendered = outlined("```recto src/a.rs:1\nbody\n```");
+        let text: Vec<String> = rendered.lines.iter().map(Line::to_string).collect();
+
+        assert!(rendered.quotes.is_empty());
+        assert!(text.iter().any(|line| line.trim() == "body"), "{text:#?}");
+    }
+
+    #[test]
     fn the_outline_takes_top_level_headings_as_one_tier() {
-        let (lines, outline) =
+        let rendered =
             outlined("# Intro\n\nWords.\n\n## Step one\n\nMore.\n\n### Detail\n\nDeeper.");
-        let titles: Vec<&str> = outline.iter().map(|(title, _)| title.as_str()).collect();
+        let titles: Vec<&str> = rendered
+            .sections
+            .iter()
+            .map(|(title, _)| title.as_str())
+            .collect();
         assert_eq!(titles, ["Intro", "Step one"], "H3 stays prose");
         // Each recorded row is the heading's own line.
-        assert_eq!(lines[outline[0].1].to_string(), "Intro");
-        assert_eq!(lines[outline[1].1].to_string(), "Step one");
+        assert_eq!(rendered.lines[rendered.sections[0].1].to_string(), "Intro");
+        assert_eq!(
+            rendered.lines[rendered.sections[1].1].to_string(),
+            "Step one"
+        );
     }
 
     #[test]
     fn a_heading_title_keeps_its_inline_code() {
-        let (_, outline) = outlined("## The `Document` type");
-        assert_eq!(outline[0].0, "The Document type");
+        let rendered = outlined("## The `Document` type");
+        assert_eq!(rendered.sections[0].0, "The Document type");
     }
 
     #[test]
