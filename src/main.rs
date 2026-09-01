@@ -856,6 +856,9 @@ struct App {
     files_area: Rect,
     diff_content_area: Rect,
     commits_area: Rect,
+    /// Columns the tab strip occupied in the latest draw, so a click can be
+    /// routed to a page. Empty when the strip has nothing to choose between.
+    tabs_area: Rect,
     /// The composer body geometry and viewport left behind by the draw pass,
     /// shared by keyboard motion and mouse hit-testing.
     note_layout: NoteLayout,
@@ -1001,6 +1004,7 @@ impl App {
             files_area: Rect::default(),
             diff_content_area: Rect::default(),
             commits_area: Rect::default(),
+            tabs_area: Rect::default(),
             // Plausible stand-in for the one frame between opening the modal
             // and drawing it; the real width lands before any key arrives.
             note_layout: NoteLayout {
@@ -4107,6 +4111,23 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         return;
     }
+    // The tab strip is chrome above every page, so it gets first refusal on a
+    // click before the page-specific handlers below claim the event.
+    if m.kind == MouseEventKind::Down(MouseButton::Left)
+        && app.tabs_area.contains(Position {
+            x: m.column,
+            y: m.row,
+        })
+    {
+        if let Some(page) = tab_entries(app)
+            .iter()
+            .find(|entry| entry.columns.contains(&m.column))
+            .map(|entry| entry.page)
+        {
+            app.page = page;
+        }
+        return;
+    }
     if app.page == Page::PullRequest {
         match m.kind {
             MouseEventKind::ScrollDown => {
@@ -4301,153 +4322,200 @@ fn load_error_footer(error: &str, width: u16) -> (Paragraph<'static>, u16) {
     (Paragraph::new(lines).wrap(Wrap { trim: false }), height)
 }
 
-fn draw(frame: &mut ratatui::Frame, app: &mut App) {
-    match app.page {
-        Page::PullRequest => {
-            draw_pull_request(frame, app);
-            if app.show_help {
-                draw_help(frame, frame.area(), app);
-            }
-            draw_mode_overlay(frame, app);
-            return;
-        }
-        Page::ReviewThread => {
-            draw_review_thread(frame, app);
-            if app.show_help {
-                draw_help(frame, frame.area(), app);
-            }
-            draw_mode_overlay(frame, app);
-            return;
-        }
-        Page::Diff => {}
+/// One entry in the top tab strip. Only peer screens appear here: a review
+/// thread is a drill-down from the pull request, so it renders under the PR
+/// tab rather than claiming one of its own.
+struct TabEntry {
+    page: Page,
+    label: String,
+    /// Columns the label occupies, so a click routes back to a page without
+    /// re-deriving the strip layout.
+    columns: std::ops::Range<u16>,
+}
+
+const TAB_SEPARATOR: &str = " │ ";
+
+/// The peer screens currently reachable. A tab appears only once its surface
+/// exists, so the strip answers "what else is there?" — a question that
+/// otherwise takes pressing `p` and watching whether anything happens.
+fn tab_entries(app: &App) -> Vec<TabEntry> {
+    let mut labels = vec![(Page::Diff, "Diff".to_string())];
+    if let Some(pr) = &app.pull_request {
+        labels.push((Page::PullRequest, format!("PR #{}", pr.number)));
     }
-    let area = frame.area();
 
-    let footer = contextual_footer(app);
-    let error_footer = footer
-        .is_none()
-        .then_some(app.load_error.as_deref())
-        .flatten()
-        .map(|error| load_error_footer(error, area.width));
-    let footer_height = if footer.is_some() {
-        1
-    } else {
-        error_footer.as_ref().map_or(0, |(_, height)| {
-            (*height).min(area.height.saturating_sub(2))
-        })
-    };
-    let rows = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Length(1),
-            Constraint::Min(0),
-            Constraint::Length(footer_height),
-        ])
-        .split(area);
-
-    // Revs *in the diff*, not revs in the panel. The panel window is
-    // deliberately deeper than the range so there's something to pick a base
-    // from, which makes its length a number about the picker rather than
-    // about what you're reading.
-    let n_in_range = app.revs.iter().filter(|r| r.is_in_range).count();
-    let n_files = app.changes.len();
-    let cursor_str = match app.cursor {
-        Cursor::All => format!(
-            "all changes · {n_in_range} rev{}",
-            if n_in_range == 1 { "" } else { "s" }
-        ),
-        Cursor::Rev(i) => {
-            // Position among the revs in the *diff*, not among the rows in the
-            // picker window. Counting against the window gave "rev 4/40" for
-            // the first of two revs you're actually reading, disagreeing with
-            // the "2 revs" this same header shows for the range.
-            let r = &app.revs[i];
-            let place = app.revs[..=i].iter().filter(|x| x.is_in_range).count();
-            if r.is_in_range && n_in_range > 0 {
-                format!(
-                    "rev {}/{} · {} {}",
-                    place, n_in_range, r.short_id, r.summary
-                )
-            } else {
-                // Outside the range there's no "of N" to be part of, so don't
-                // invent one.
-                format!("rev {} {}", r.short_id, r.summary)
-            }
+    let mut entries = Vec::with_capacity(labels.len());
+    let mut x = 1u16;
+    for (i, (page, label)) in labels.into_iter().enumerate() {
+        if i > 0 {
+            x = x.saturating_add(TAB_SEPARATOR.chars().count() as u16);
         }
-    };
-    let mut header_spans = vec![Span::styled(
-        format!(
-            "recto — base: {} · {cursor_str} · {n_files} file{}",
-            app.base_text(app.base()),
-            if n_files == 1 { "" } else { "s" },
-        ),
-        Style::default()
-            .fg(theme::MAUVE)
-            .add_modifier(Modifier::BOLD),
-    )];
-    if app.ignore_ws {
-        header_spans.push(Span::styled(
-            " · ignoring whitespace".to_string(),
+        let width = label.chars().count() as u16;
+        entries.push(TabEntry {
+            page,
+            label,
+            columns: x..x.saturating_add(width),
+        });
+        x = x.saturating_add(width);
+    }
+    entries
+}
+
+/// Which tab a page renders under. Drill-downs borrow their parent's tab.
+fn tab_for_page(page: Page) -> Page {
+    match page {
+        Page::ReviewThread => Page::PullRequest,
+        other => other,
+    }
+}
+
+fn tab_strip(entries: &[TabEntry], active: Page, focused: bool) -> Paragraph<'static> {
+    let mut spans = vec![Span::raw(" ")];
+    for (i, entry) in entries.iter().enumerate() {
+        if i > 0 {
+            spans.push(Span::styled(
+                TAB_SEPARATOR,
+                Style::default().fg(theme::SURFACE1),
+            ));
+        }
+        let style = if !focused {
+            Style::default().fg(theme::OVERLAY0)
+        } else if entry.page == active {
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(theme::SUBTEXT0)
+        };
+        spans.push(Span::styled(entry.label.clone(), style));
+    }
+    Paragraph::new(Line::from(spans))
+}
+
+/// Append one ` · `-delimited status segment. Callers skip segments that don't
+/// apply to the current page, so the separator belongs to the join rather than
+/// to any segment's own text.
+fn push_status(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
+    if !spans.is_empty() {
+        spans.push(Span::styled(" · ", Style::default().fg(theme::SURFACE1)));
+    }
+    spans.push(Span::styled(text, style));
+}
+
+/// The bottom status line. Detail describing *what the diff is showing* is
+/// diff-local, while anything waiting on the reviewer — a stale PR, pending
+/// agent notes, an unsent draft — persists across every page, since switching
+/// tabs must not be able to hide it.
+fn status_line(app: &App) -> Paragraph<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+
+    if app.page == Page::Diff {
+        // Revs *in the diff*, not revs in the panel. The panel window is
+        // deliberately deeper than the range so there's something to pick a base
+        // from, which makes its length a number about the picker rather than
+        // about what you're reading.
+        let n_in_range = app.revs.iter().filter(|r| r.is_in_range).count();
+        let n_files = app.changes.len();
+        let cursor_str = match app.cursor {
+            Cursor::All => format!(
+                "all changes · {n_in_range} rev{}",
+                if n_in_range == 1 { "" } else { "s" }
+            ),
+            Cursor::Rev(i) => {
+                // Position among the revs in the *diff*, not among the rows in the
+                // picker window. Counting against the window gave "rev 4/40" for
+                // the first of two revs you're actually reading, disagreeing with
+                // the "2 revs" this same line shows for the range.
+                let r = &app.revs[i];
+                let place = app.revs[..=i].iter().filter(|x| x.is_in_range).count();
+                if r.is_in_range && n_in_range > 0 {
+                    format!(
+                        "rev {}/{} · {} {}",
+                        place, n_in_range, r.short_id, r.summary
+                    )
+                } else {
+                    // Outside the range there's no "of N" to be part of, so don't
+                    // invent one.
+                    format!("rev {} {}", r.short_id, r.summary)
+                }
+            }
+        };
+        push_status(
+            &mut spans,
+            format!("base: {}", app.base_text(app.base())),
             Style::default().fg(theme::MAUVE),
-        ));
+        );
+        push_status(&mut spans, cursor_str, Style::default().fg(theme::SUBTEXT0));
+        push_status(
+            &mut spans,
+            format!("{n_files} file{}", if n_files == 1 { "" } else { "s" }),
+            Style::default().fg(theme::SUBTEXT0),
+        );
+        if app.ignore_ws {
+            push_status(
+                &mut spans,
+                "ignoring whitespace".to_string(),
+                Style::default().fg(theme::MAUVE),
+            );
+        }
+        if !app.show_comments {
+            push_status(
+                &mut spans,
+                "comments hidden".to_string(),
+                Style::default().fg(theme::OVERLAY0),
+            );
+        }
+        if let Some(span) = &app.focus_span {
+            let label = if span.start == span.end {
+                format!("▸ focus {}:{}", span.path, span.start)
+            } else {
+                format!("▸ focus {}:{}-{}", span.path, span.start, span.end)
+            };
+            push_status(&mut spans, label, Style::default().fg(theme::MAUVE));
+        }
     }
-    if !app.show_comments {
-        header_spans.push(Span::styled(
-            " · comments hidden",
-            Style::default().fg(theme::OVERLAY0),
-        ));
-    }
+
     if let Some(loading) = &app.loading {
         let frame_idx = (loading.started.elapsed().as_millis() / SPINNER_FRAME_MS) as usize
             % SPINNER_FRAMES.len();
-        header_spans.push(Span::styled(
-            format!(" · {} loading {}", SPINNER_FRAMES[frame_idx], loading.label),
+        push_status(
+            &mut spans,
+            format!("{} loading {}", SPINNER_FRAMES[frame_idx], loading.label),
             Style::default().fg(theme::TEAL),
-        ));
+        );
     } else if app.load_error.is_some() {
-        header_spans.push(Span::styled(
-            " · reload failed",
+        push_status(
+            &mut spans,
+            "reload failed".to_string(),
             Style::default().fg(theme::RED),
-        ));
+        );
     }
-    if let Some(span) = &app.focus_span {
-        let label = if span.start == span.end {
-            format!(" · ▸ focus {}:{}", span.path, span.start)
-        } else {
-            format!(" · ▸ focus {}:{}-{}", span.path, span.start, span.end)
-        };
-        header_spans.push(Span::styled(label, Style::default().fg(theme::MAUVE)));
-    }
-    if let Some(pr) = &app.pull_request {
-        if app.review_is_stale() {
-            header_spans.push(Span::styled(
-                format!(
-                    " · STALE PR #{} {} != workspace {}",
-                    pr.number,
-                    short_oid(&pr.head_oid),
-                    short_oid(&app.workspace_revision)
-                ),
-                Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
-            ));
-        } else {
-            header_spans.push(Span::styled(
-                format!(" · PR #{} attached", pr.number),
-                Style::default().fg(theme::TEAL),
-            ));
-        }
+    // The PR tab already says a pull request is attached; staleness is state,
+    // not availability, so it stays down here where the rest of the state is.
+    if let Some(pr) = &app.pull_request
+        && app.review_is_stale()
+    {
+        push_status(
+            &mut spans,
+            format!(
+                "STALE PR #{} {} != workspace {}",
+                pr.number,
+                short_oid(&pr.head_oid),
+                short_oid(&app.workspace_revision)
+            ),
+            Style::default().fg(theme::RED).add_modifier(Modifier::BOLD),
+        );
     }
     // Pending agent notes are invisible once you scroll away from them, and the
     // whole point is that they're waiting on an agent, so keep the count in
     // view until the agent acknowledges it.
     if !app.agent_notes.is_empty() {
         let n = app.agent_notes.len();
-        header_spans.push(Span::styled(
-            format!(
-                " · ❶ {n} agent note{} pending",
-                if n == 1 { "" } else { "s" }
-            ),
+        push_status(
+            &mut spans,
+            format!("❶ {n} agent note{} pending", if n == 1 { "" } else { "s" }),
             Style::default().fg(theme::PEACH),
-        ));
+        );
     }
     if app.review_draft_body.is_some() || !app.review_draft_comments.is_empty() {
         let n = app.review_draft_comments.len();
@@ -4459,21 +4527,86 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
             ),
             (false, n) => format!("{n} inline comment{}", if n == 1 { "" } else { "s" }),
         };
-        header_spans.push(Span::styled(
-            format!(" · ✎ shared {label}"),
+        push_status(
+            &mut spans,
+            format!("✎ shared {label}"),
             Style::default().fg(theme::YELLOW),
-        ));
+        );
     }
+
     if !app.terminal_focused {
         // Recolor in place rather than restyling the Paragraph: per-span fg wins
         // over a base style, so we have to overwrite each span to read as dimmed.
-        for span in &mut header_spans {
+        for span in &mut spans {
             span.style = Style::default().fg(theme::OVERLAY0);
         }
     }
-    let header = Paragraph::new(Line::from(header_spans));
-    frame.render_widget(header, rows[0]);
+    Paragraph::new(Line::from(spans))
+}
 
+fn draw(frame: &mut ratatui::Frame, app: &mut App) {
+    let area = frame.area();
+
+    let tabs = tab_entries(app);
+    // A lone tab is a label, not navigation, so it doesn't earn a row — the
+    // same "appears once there's something to choose" rule the side panes use.
+    let tab_height = u16::from(tabs.len() > 1);
+
+    let contextual = contextual_footer(app);
+    let error_footer = contextual
+        .is_none()
+        .then_some(app.load_error.as_deref())
+        .flatten()
+        .map(|error| load_error_footer(error, area.width));
+    let footer_height = match &error_footer {
+        Some((_, height)) => (*height).min(area.height.saturating_sub(tab_height + 1)),
+        None => 1,
+    };
+
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(tab_height),
+            Constraint::Min(0),
+            Constraint::Length(footer_height),
+        ])
+        .split(area);
+
+    if tab_height > 0 {
+        app.tabs_area = rows[0];
+        frame.render_widget(
+            tab_strip(&tabs, tab_for_page(app.page), app.terminal_focused),
+            rows[0],
+        );
+    } else {
+        app.tabs_area = Rect::default();
+    }
+
+    match app.page {
+        Page::PullRequest => draw_pull_request(frame, rows[1], app),
+        Page::ReviewThread => draw_review_thread(frame, rows[1], app),
+        Page::Diff => draw_diff_page(frame, rows[1], app),
+    }
+
+    if let Some(footer) = contextual {
+        frame.render_widget(footer, rows[2]);
+    } else if let Some((footer, _)) = error_footer {
+        frame.render_widget(footer, rows[2]);
+    } else {
+        frame.render_widget(status_line(app), rows[2]);
+    }
+
+    if let Mode::SearchInput { query } = &app.mode {
+        frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
+    }
+
+    if app.show_help {
+        draw_help(frame, frame.area(), app);
+    }
+    draw_mode_overlay(frame, app);
+}
+
+fn draw_diff_page(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let horizontal_constraints = if app.show_files {
         [Constraint::Percentage(30), Constraint::Percentage(70)]
     } else {
@@ -4483,7 +4616,7 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
     let panes = Layout::default()
         .direction(Direction::Horizontal)
         .constraints(horizontal_constraints)
-        .split(rows[1]);
+        .split(area);
 
     if app.show_files {
         draw_files(frame, panes[0], app);
@@ -4506,21 +4639,6 @@ fn draw(frame: &mut ratatui::Frame, app: &mut App) {
         draw_diff(frame, panes[1], app);
         app.commits_area = Rect::default();
     }
-
-    if let Some(footer) = footer {
-        frame.render_widget(footer, rows[2]);
-    } else if let Some((footer, _)) = error_footer {
-        frame.render_widget(footer, rows[2]);
-    }
-
-    if let Mode::SearchInput { query } = &app.mode {
-        frame.set_cursor_position((1 + query.chars().count() as u16, rows[2].y));
-    }
-
-    if app.show_help {
-        draw_help(frame, frame.area(), app);
-    }
-    draw_mode_overlay(frame, app);
 }
 
 fn draw_mode_overlay(frame: &mut ratatui::Frame, app: &mut App) {
@@ -4533,7 +4651,7 @@ fn draw_mode_overlay(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
-fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
+fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let Some(pr) = &app.pull_request else {
         app.page = Page::Diff;
         return;
@@ -4541,7 +4659,7 @@ fn draw_pull_request(frame: &mut ratatui::Frame, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(frame.area());
+        .split(area);
 
     let header = vec![
         Line::from(vec![
@@ -4682,7 +4800,7 @@ fn pull_request_lines(
     lines
 }
 
-fn draw_review_thread(frame: &mut ratatui::Frame, app: &mut App) {
+fn draw_review_thread(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let Some((pr, thread_idx, thread)) = app.pull_request.as_ref().and_then(|pr| {
         let i = app.active_thread?;
         Some((pr, i, pr.threads.get(i)?))
@@ -4693,7 +4811,7 @@ fn draw_review_thread(frame: &mut ratatui::Frame, app: &mut App) {
     let rows = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(0)])
-        .split(frame.area());
+        .split(area);
     let state = if thread.outdated {
         "outdated"
     } else if thread.resolved {
@@ -5104,6 +5222,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("h l  ← →", "scroll diff horizontally"),
     bind("0", "reset horizontal scroll"),
     bind("enter", "open selected file or review object"),
+    bind("left click", "switch screens on the tab strip"),
     bind("w", "toggle line wrap"),
     bind("W", "toggle ignore whitespace"),
     head("Focus"),
@@ -6172,8 +6291,19 @@ mod tests {
         assert!(!app.wrap);
     }
 
+    fn left_click(column: u16, row: u16) -> event::MouseEvent {
+        event::MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: crossterm::event::KeyModifiers::NONE,
+        }
+    }
+
+    /// The footer row is now always spoken for: idle it carries status, and a
+    /// contextual mode takes it over rather than costing content another row.
     #[test]
-    fn idle_diff_reclaims_the_contextual_footer_row() {
+    fn a_contextual_footer_displaces_the_status_line() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         let terminal_backend = ratatui::backend::TestBackend::new(80, 24);
@@ -6185,7 +6315,67 @@ mod tests {
         app.search_query = Some("needle".into());
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
-        assert_eq!(idle_height, app.diff_content_area.height + 1);
+        assert_eq!(idle_height, app.diff_content_area.height);
+    }
+
+    /// A lone tab is a label rather than a choice, so the strip stays out of
+    /// the way until a second surface exists to switch to.
+    #[test]
+    fn the_tab_strip_costs_a_row_only_once_there_is_somewhere_to_go() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let alone = app.diff_content_area.height;
+        assert_eq!(app.tabs_area, Rect::default());
+
+        app.pull_request = Some(empty_pull_request("base"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.diff_content_area.height + 1, alone);
+        assert_eq!(app.tabs_area.height, 1);
+    }
+
+    #[test]
+    fn clicking_a_tab_switches_pages() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(80, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let entries = tab_entries(&app);
+        let column = |page: Page| {
+            entries
+                .iter()
+                .find(|entry| entry.page == page)
+                .expect("tab present")
+                .columns
+                .start
+        };
+        let (diff_col, pr_col) = (column(Page::Diff), column(Page::PullRequest));
+        let tab_row = app.tabs_area.y;
+
+        handle_mouse(&mut app, left_click(pr_col, tab_row));
+        assert_eq!(app.page, Page::PullRequest);
+
+        handle_mouse(&mut app, left_click(diff_col, tab_row));
+        assert_eq!(app.page, Page::Diff);
+    }
+
+    /// A review thread is a drill-down, not a peer screen, so it borrows the
+    /// PR tab instead of adding a third one nobody navigated to.
+    #[test]
+    fn a_review_thread_renders_under_the_pull_request_tab() {
+        assert_eq!(tab_for_page(Page::ReviewThread), Page::PullRequest);
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+        let pages: Vec<Page> = tab_entries(&app).into_iter().map(|e| e.page).collect();
+        assert_eq!(pages, vec![Page::Diff, Page::PullRequest]);
     }
 
     #[test]
