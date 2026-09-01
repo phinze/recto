@@ -52,6 +52,10 @@ struct Document {
     notes: NoteState,
     #[serde(default)]
     reviews: Vec<ReviewState>,
+    /// The literate tour, when one is laid down. Absent in documents written
+    /// before tours existed, which reads as no tour.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    tour: Option<String>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -74,6 +78,7 @@ impl Document {
                 ..NoteState::default()
             },
             reviews: Vec::new(),
+            tour: None,
         }
     }
 }
@@ -167,6 +172,14 @@ impl Store {
 
     pub fn set_note_composer(&mut self, composer: Option<&NoteDraft>) {
         self.document.notes.composer = composer.cloned();
+    }
+
+    pub fn tour(&self) -> Option<&str> {
+        self.document.tour.as_deref()
+    }
+
+    pub fn set_tour(&mut self, tour: Option<&str>) {
+        self.document.tour = tour.map(str::to_string);
     }
 
     pub fn review(&self, pull_request: &PullRequestRef) -> Option<RestoredReview> {
@@ -386,6 +399,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         workspace_root: workspace_root.to_path_buf(),
         notes: legacy.notes,
         reviews: legacy.reviews,
+        tour: None,
     }))
 }
 
@@ -490,6 +504,26 @@ mod tests {
         assert_eq!(review.next_id, 8);
         assert_eq!(review.composer, Some(review_composer));
         assert!(!workspace.join(".recto").exists());
+    }
+
+    #[test]
+    fn a_tour_round_trips_and_clears() {
+        let (state_home, workspace) = roots("tour");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        store.set_tour(Some("## Why\n\nBecause."));
+        store.save().unwrap();
+
+        let mut restored = Store::load_at(&state_home, &workspace, None).unwrap();
+        assert_eq!(restored.tour(), Some("## Why\n\nBecause."));
+
+        restored.set_tour(None);
+        restored.save().unwrap();
+        assert_eq!(
+            Store::load_at(&state_home, &workspace, None)
+                .unwrap()
+                .tour(),
+            None
+        );
     }
 
     #[test]

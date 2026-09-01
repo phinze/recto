@@ -227,6 +227,11 @@ enum ClientCommand {
         #[arg(required = true)]
         specs: Vec<String>,
     },
+    /// Lay down a literate tour: a Markdown document whose headings become
+    /// navigable sections and whose fenced `recto PATH:SPAN` blocks quote the
+    /// diff inline. Reads BODY, or stdin when BODY is omitted. An empty body
+    /// removes the tour. Coexists with `annotate`.
+    Tour { body: Option<String> },
     /// Clear any active focus highlight and annotations in the running recto.
     Clear,
     /// Control visibility of published threads, shared drafts, and private
@@ -876,6 +881,12 @@ struct App {
     /// Companion-driven tour annotations, in step order. Sticky like
     /// `focus_span`; replaced wholesale by each `annotate` request.
     annotations: Vec<Annotation>,
+    /// The literate tour document, as the Markdown the companion sent. Kept
+    /// raw because the sections and pull quotes it implies are resolved
+    /// against whichever diff is on screen when it renders. Deliberately off
+    /// every clear path, like `agent_notes`: it is too expensive to re-author
+    /// for Esc to be able to discard it.
+    tour: Option<String>,
     /// Private agent notes awaiting acknowledgement, in authoring order. Deliberately not
     /// on any clear path: `clear`, Esc and `q` all drop the agent's tour, and
     /// sweeping up our own undelivered notes alongside it would be data loss.
@@ -966,6 +977,9 @@ impl App {
                 (notes.to_vec(), next_id, composer.cloned())
             })
             .unwrap_or_else(|| (Vec::new(), 1, None));
+        let tour = persistence
+            .as_ref()
+            .and_then(|store| store.tour().map(str::to_string));
         let mut app = Self {
             worker,
             backend,
@@ -1024,6 +1038,7 @@ impl App {
             search_active_idx: None,
             focus_span: None,
             annotations: Vec::new(),
+            tour,
             agent_notes,
             next_agent_note_id,
             review_draft_comments: Vec::new(),
@@ -2072,6 +2087,7 @@ impl App {
             capabilities: link::Capabilities::recto(),
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
+            tour: self.tour.is_some(),
             comments_visible: self.show_comments,
             pending_comments: self.agent_notes.len(),
             draft_comments: self.review_draft_comments.len(),
@@ -2148,6 +2164,7 @@ impl App {
         };
         let store = self.persistence.as_mut().expect("checked above");
         store.set_notes(&self.agent_notes, self.next_agent_note_id);
+        store.set_tour(self.tour.as_deref());
         if let Some(composer) = note_composer {
             store.set_note_composer(composer.as_ref());
         }
@@ -2192,6 +2209,14 @@ impl App {
             link::Request::Annotate { sites } => match self.review_target_error() {
                 Some(error) => link::Response::err(error),
                 None => self.annotate(sites),
+            },
+            // Taking a tour down stays available even against a stale review:
+            // refusing to clean up would strand a document describing code the
+            // workspace has already moved past.
+            link::Request::Tour { body } if body.trim().is_empty() => self.set_tour(body),
+            link::Request::Tour { body } => match self.review_target_error() {
+                Some(error) => link::Response::err(error),
+                None => self.set_tour(body),
             },
             // Deliberately leaves `agent_notes` alone: `clear` is how an agent
             // tidies up its own tour, and it has no business discarding review
@@ -2954,6 +2979,15 @@ impl App {
         self.pr_scroll = self.pr_sections[target].1.min(self.pr_max_scroll);
     }
 
+    /// Replace or remove the literate tour. An empty body removes it, the same
+    /// way an empty review body deletes that draft.
+    fn set_tour(&mut self, body: String) -> link::Response {
+        let body = body.trim().to_string();
+        self.tour = (!body.is_empty()).then_some(body);
+        self.persist_soon();
+        link::Response::ok()
+    }
+
     fn cycle_public_thread(&mut self, delta: isize) -> bool {
         let Some(len) = self
             .pull_request
@@ -3286,6 +3320,27 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
             pull_request: Box::new(github::fetch_pull_request(locator)?),
         }),
+        ClientCommand::Tour { body } => {
+            use std::io::{IsTerminal, Read};
+            let body = match body {
+                Some(body) => body.clone(),
+                None => {
+                    // A tour document is far too long to be comfortable as an
+                    // argument, so a pipe is the expected shape. Refuse rather
+                    // than block forever when nothing is piped in.
+                    let mut stdin = io::stdin();
+                    if stdin.is_terminal() {
+                        return Err(anyhow!(
+                            "recto tour needs a Markdown body as an argument or on stdin"
+                        ));
+                    }
+                    let mut buffer = String::new();
+                    stdin.read_to_string(&mut buffer)?;
+                    buffer
+                }
+            };
+            Ok(link::Request::Tour { body })
+        }
         ClientCommand::Clear => Ok(link::Request::Clear),
         ClientCommand::CommentVisibility { action } => Ok(link::Request::CommentVisibility {
             visible: match action {
@@ -6571,6 +6626,73 @@ mod tests {
 
         handle_mouse(&mut app, left_click(diff_col, tab_row));
         assert_eq!(app.page, Page::Diff);
+    }
+
+    #[test]
+    fn an_empty_tour_body_takes_the_tour_down() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+
+        app.handle_request(link::Request::Tour {
+            body: "## Why the base moved\n\nProse.".into(),
+        });
+        assert_eq!(app.tour.as_deref(), Some("## Why the base moved\n\nProse."));
+        assert!(app.status().tour);
+
+        app.handle_request(link::Request::Tour { body: "   ".into() });
+        assert_eq!(app.tour, None);
+        assert!(!app.status().tour);
+    }
+
+    /// `clear` tidies the agent's own pointer and labels. A tour is authored
+    /// content like an unread agent note, so it is deliberately off that path:
+    /// Esc must not be able to discard a document that cost real work.
+    #[test]
+    fn clear_leaves_the_tour_standing() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## Step one".into(),
+        });
+        app.annotations.push(Annotation {
+            path: "src/main.rs".into(),
+            start: 1,
+            end: 1,
+            label: "step".into(),
+        });
+
+        app.handle_request(link::Request::Clear);
+        assert!(app.annotations.is_empty(), "clear still drops annotations");
+        assert_eq!(app.tour.as_deref(), Some("## Step one"));
+    }
+
+    /// A tour quotes the diff, so a stale review makes its quotes meaningless
+    /// and laying one down is refused like focus and annotate. Taking one down
+    /// stays allowed, or a stale tour could never be cleaned up.
+    #[test]
+    fn a_stale_review_refuses_a_new_tour_but_allows_removing_one() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
+        assert!(
+            app.attach_pull_request(empty_pull_request("base"), false)
+                .ok
+        );
+        app.handle_request(link::Request::Tour {
+            body: "## Before the drift".into(),
+        });
+        backend.set_revision("def456");
+
+        let refused = app.handle_request(link::Request::Tour {
+            body: "## After the drift".into(),
+        });
+        assert!(!refused.ok);
+        assert_eq!(app.tour.as_deref(), Some("## Before the drift"));
+
+        let removed = app.handle_request(link::Request::Tour {
+            body: String::new(),
+        });
+        assert!(removed.ok);
+        assert_eq!(app.tour, None);
     }
 
     #[test]

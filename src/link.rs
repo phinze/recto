@@ -34,6 +34,14 @@ pub enum Request {
     /// Replace the annotation set: labeled spans rendered as numbered inline
     /// notes ("step 1 here, step 2 there"). An empty set clears them.
     Annotate { sites: Vec<Site> },
+    /// Replace the literate tour: one Markdown document whose headings become
+    /// navigable sections and whose fenced `recto PATH:SPAN` blocks quote the
+    /// diff inline. An empty body removes it.
+    ///
+    /// Distinct from `Annotate`, which labels spans where they sit. This is
+    /// prose that the diff is quoted *into*, and the two coexist.
+    #[serde(rename = "tour")]
+    Tour { body: String },
     /// Clear any active focus highlight and annotations.
     Clear,
     /// Show, hide, or toggle non-tour comments in the diff and file tree.
@@ -316,6 +324,10 @@ pub struct Status {
     pub focus: bool,
     /// Number of active tour annotations.
     pub annotations: usize,
+    /// Whether a literate tour document is attached. Older Recto versions omit
+    /// the field, which reads as absent.
+    #[serde(default)]
+    pub tour: bool,
     /// Whether published threads, shared drafts, and private notes are visible
     /// in the diff and file tree. Older Recto versions omitted this and always
     /// showed them.
@@ -714,6 +726,12 @@ fn handle_while_in_editor(
             queue(tx, request.clone());
             Response::ok_note("recto is in an editor; annotations will apply when you return")
         }
+        // Same for a tour: it is a document the TUI renders, so laying one
+        // down while parked is pure state that lands on the way back.
+        Request::Tour { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; the tour will apply when you return")
+        }
         // Adding a comment is pure state, so queuing loses nothing: it lands
         // when the loop resumes. This is the `!recto note …` path out of
         // neovim, so it has to keep working while we're parked here.
@@ -1017,6 +1035,7 @@ mod tests {
             capabilities: Capabilities::recto(),
             focus: false,
             annotations: 0,
+            tour: false,
             comments_visible: true,
             pending_comments: 2,
             draft_comments: 0,
@@ -1092,6 +1111,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                tour: false,
                 comments_visible: true,
                 pending_comments: 0,
                 draft_comments: 0,
@@ -1141,6 +1161,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                tour: false,
                 comments_visible: true,
                 pending_comments: 0,
                 draft_comments: 0,
@@ -1270,6 +1291,7 @@ mod tests {
                 capabilities: Capabilities::recto(),
                 focus: false,
                 annotations: 0,
+                tour: false,
                 comments_visible: true,
                 pending_comments: 3,
                 draft_comments: 0,
