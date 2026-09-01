@@ -726,12 +726,22 @@ struct FocusSpan {
 /// A companion-supplied labeled span — one step of a tour. Stored logically
 /// (path + new-side line range) like [`FocusSpan`]; `reweave` renders the set
 /// as numbered note rows woven into the diff, re-resolving after each reload.
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
 struct Annotation {
     path: String,
     start: u32,
     end: u32,
     label: String,
+}
+
+/// The durable half of a [`FocusSpan`]: the span, without the arrival instant
+/// that drives the flash. Restoring one re-fires that flash, which reads as
+/// "this is where we were" rather than as a highlight that has gone stale.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+struct FocusAnchor {
+    path: String,
+    start: u32,
+    end: u32,
 }
 
 /// A reviewer-authored note waiting to be handed to an agent. Anchored the same
@@ -925,8 +935,9 @@ struct App {
     /// with `-w` (`--ignore-all-space`), collapsing reindentation noise.
     ignore_ws: bool,
     /// Whether non-tour review objects are woven into the diff and file tree.
-    /// Session-only so a tour cannot leave the next Recto launch mysteriously
-    /// missing review context.
+    /// Durable like the rest of the authored state; the status line carries a
+    /// standing "comments hidden" segment so the setting explains itself
+    /// instead of relying on being forgotten.
     show_comments: bool,
     /// Whether the keybinding help overlay is up, plus its vertical scroll
     /// position and the maximum established by the latest draw.
@@ -980,6 +991,16 @@ impl App {
         let tour = persistence
             .as_ref()
             .and_then(|store| store.tour().map(str::to_string));
+        let (annotations, restored_focus, show_comments) = persistence
+            .as_ref()
+            .map(|store| {
+                (
+                    store.annotations().to_vec(),
+                    store.focus().cloned(),
+                    store.comments_visible(),
+                )
+            })
+            .unwrap_or_else(|| (Vec::new(), None, true));
         let mut app = Self {
             worker,
             backend,
@@ -1036,8 +1057,13 @@ impl App {
             search_query: None,
             search_matches: Vec::new(),
             search_active_idx: None,
-            focus_span: None,
-            annotations: Vec::new(),
+            focus_span: restored_focus.map(|anchor| FocusSpan {
+                path: anchor.path,
+                start: anchor.start,
+                end: anchor.end,
+                set_at: Instant::now(),
+            }),
+            annotations,
             tour,
             agent_notes,
             next_agent_note_id,
@@ -1053,7 +1079,7 @@ impl App {
             files_vis: PaneVis::Auto,
             commits_vis: PaneVis::Auto,
             ignore_ws: false,
-            show_comments: true,
+            show_comments,
             show_help: false,
             help_scroll: 0,
             help_max_scroll: 0,
@@ -1066,7 +1092,7 @@ impl App {
         } else {
             Focus::Diff
         };
-        if !app.agent_notes.is_empty() {
+        if !app.agent_notes.is_empty() || !app.annotations.is_empty() || !app.show_comments {
             app.reweave();
         }
         Ok(app)
@@ -1581,6 +1607,7 @@ impl App {
         if self.review_is_stale() {
             self.focus_span = None;
             self.annotations.clear();
+            self.persist_soon();
         }
         self.changes = loaded.changes;
         self.file_rows = build_file_rows(&self.changes);
@@ -2014,6 +2041,7 @@ impl App {
             self.show_comments = visible;
             self.last_review_click = None;
             self.reweave();
+            self.persist_soon();
         }
         link::Response::ok_note(format!(
             "comments {}",
@@ -2165,6 +2193,18 @@ impl App {
         let store = self.persistence.as_mut().expect("checked above");
         store.set_notes(&self.agent_notes, self.next_agent_note_id);
         store.set_tour(self.tour.as_deref());
+        store.set_annotations(&self.annotations);
+        store.set_focus(
+            self.focus_span
+                .as_ref()
+                .map(|span| FocusAnchor {
+                    path: span.path.clone(),
+                    start: span.start,
+                    end: span.end,
+                })
+                .as_ref(),
+        );
+        store.set_comments_visible(self.show_comments);
         if let Some(composer) = note_composer {
             store.set_note_composer(composer.as_ref());
         }
@@ -2227,6 +2267,7 @@ impl App {
                     self.annotations.clear();
                     self.reweave();
                 }
+                self.persist_soon();
                 link::Response::ok()
             }
             link::Request::CommentVisibility { visible } => self.set_comment_visibility(visible),
@@ -2327,6 +2368,7 @@ impl App {
         if self.review_is_stale() {
             self.focus_span = None;
             self.annotations.clear();
+            self.persist_soon();
         }
         self.pr_scroll = 0;
         self.active_thread = None;
@@ -2337,6 +2379,7 @@ impl App {
             // if their spans still exist after the reload.
             self.focus_span = None;
             self.annotations.clear();
+            self.persist_soon();
             self.select_base(Base::Revision(base));
         }
         self.reweave();
@@ -2359,6 +2402,7 @@ impl App {
         let Some(start) = start else {
             // Whole-file focus: jump to the file, no line highlight to carry.
             self.focus_span = None;
+            self.persist_soon();
             self.scroll_to_file(file_idx);
             self.take_diff_focus();
             return link::Response::ok();
@@ -2370,6 +2414,7 @@ impl App {
             end,
             set_at: Instant::now(),
         });
+        self.persist_soon();
 
         match rows_for_span(&self.line_info, file_idx, start, end) {
             Some(rows) => {
@@ -2566,6 +2611,7 @@ impl App {
             })
             .collect();
         self.reweave();
+        self.persist_soon();
         if self.annotations.is_empty() {
             return link::Response::ok();
         }
@@ -4022,9 +4068,11 @@ fn handle_event(
                             app.clear_search();
                         } else if app.focus_span.is_some() {
                             app.focus_span = None;
+                            app.persist_soon();
                         } else if !app.annotations.is_empty() {
                             app.annotations.clear();
                             app.reweave();
+                            app.persist_soon();
                         } else if app.focus == Focus::Commits {
                             app.focus = Focus::Diff;
                         } else {
@@ -6626,6 +6674,47 @@ mod tests {
 
         handle_mouse(&mut app, left_click(diff_col, tab_row));
         assert_eq!(app.page, Page::Diff);
+    }
+
+    /// The restart case Paul actually cares about: an agent lays down a tour,
+    /// the viewer dies, and the typed words are still there on the way back.
+    #[test]
+    fn a_restart_brings_back_the_tour_and_its_annotations() {
+        let root =
+            std::env::temp_dir().join(format!("recto-app-state-{}-durable", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state_home = root.join("state");
+
+        let backend = Arc::new(TestBackend::new());
+        let store = state::Store::load_at(&state_home, &root, None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, Some(store)).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## Why the base moved\n\nProse.".into(),
+        });
+        app.handle_request(link::Request::Annotate {
+            sites: vec![link::Site {
+                path: "src/main.rs".into(),
+                start: 12,
+                end: None,
+                label: "Step 1: the guard".into(),
+            }],
+        });
+        app.handle_request(link::Request::CommentVisibility {
+            visible: Some(false),
+        });
+        app.persist_now().unwrap();
+
+        let reopened = state::Store::load_at(&state_home, &root, None).unwrap();
+        let restarted = App::load(backend, Highlighter::new(), None, Some(reopened)).unwrap();
+
+        assert_eq!(
+            restarted.tour.as_deref(),
+            Some("## Why the base moved\n\nProse.")
+        );
+        assert_eq!(restarted.annotations.len(), 1);
+        assert_eq!(restarted.annotations[0].label, "Step 1: the guard");
+        assert!(!restarted.show_comments, "visibility is durable too");
     }
 
     #[test]

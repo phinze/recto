@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::link::{DraftReviewBody, DraftReviewComment, PullRequestRef};
-use crate::{AgentNote, NoteDraft};
+use crate::{AgentNote, Annotation, FocusAnchor, NoteDraft};
 
 const SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -56,6 +56,17 @@ struct Document {
     /// before tours existed, which reads as no tour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tour: Option<String>,
+    /// Companion tour annotations, in step order.
+    #[serde(default)]
+    annotations: Vec<Annotation>,
+    /// The active companion focus span, minus its arrival instant.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    focus: Option<FocusAnchor>,
+    /// Whether published threads, shared drafts and private notes are woven
+    /// into the diff and file tree. Documents written before this was durable
+    /// omit it, which reads as shown.
+    #[serde(default = "shown")]
+    comments_visible: bool,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -79,6 +90,9 @@ impl Document {
             },
             reviews: Vec::new(),
             tour: None,
+            annotations: Vec::new(),
+            focus: None,
+            comments_visible: true,
         }
     }
 }
@@ -180,6 +194,30 @@ impl Store {
 
     pub fn set_tour(&mut self, tour: Option<&str>) {
         self.document.tour = tour.map(str::to_string);
+    }
+
+    pub fn annotations(&self) -> &[Annotation] {
+        &self.document.annotations
+    }
+
+    pub fn set_annotations(&mut self, annotations: &[Annotation]) {
+        self.document.annotations = annotations.to_vec();
+    }
+
+    pub fn focus(&self) -> Option<&FocusAnchor> {
+        self.document.focus.as_ref()
+    }
+
+    pub fn set_focus(&mut self, focus: Option<&FocusAnchor>) {
+        self.document.focus = focus.cloned();
+    }
+
+    pub fn comments_visible(&self) -> bool {
+        self.document.comments_visible
+    }
+
+    pub fn set_comments_visible(&mut self, visible: bool) {
+        self.document.comments_visible = visible;
     }
 
     pub fn review(&self, pull_request: &PullRequestRef) -> Option<RestoredReview> {
@@ -400,6 +438,9 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         notes: legacy.notes,
         reviews: legacy.reviews,
         tour: None,
+        annotations: Vec::new(),
+        focus: None,
+        comments_visible: true,
     }))
 }
 
@@ -422,6 +463,10 @@ fn protect_state_dirs(workspaces: &Path) -> Result<()> {
 
 fn first_id() -> u64 {
     1
+}
+
+const fn shown() -> bool {
+    true
 }
 
 #[cfg(test)]
@@ -504,6 +549,45 @@ mod tests {
         assert_eq!(review.next_id, 8);
         assert_eq!(review.composer, Some(review_composer));
         assert!(!workspace.join(".recto").exists());
+    }
+
+    /// Durability is the rule now: everything a companion or reviewer put
+    /// there comes back, and only an explicit discard takes it away.
+    #[test]
+    fn companion_state_round_trips_whole() {
+        let (state_home, workspace) = roots("companion");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        let annotation = Annotation {
+            path: "src/link.rs".into(),
+            start: 30,
+            end: 34,
+            label: "Step 2: the new request variant".into(),
+        };
+        let focus = FocusAnchor {
+            path: "src/main.rs".into(),
+            start: 12,
+            end: 18,
+        };
+        store.set_annotations(std::slice::from_ref(&annotation));
+        store.set_focus(Some(&focus));
+        store.set_comments_visible(false);
+        store.save().unwrap();
+
+        let restored = Store::load_at(&state_home, &workspace, None).unwrap();
+        assert_eq!(restored.annotations(), [annotation]);
+        assert_eq!(restored.focus(), Some(&focus));
+        assert!(!restored.comments_visible());
+    }
+
+    /// A document written before any of this was durable still loads, and
+    /// reads as "comments shown" rather than as hidden.
+    #[test]
+    fn a_document_without_companion_state_reads_as_shown() {
+        let (state_home, workspace) = roots("defaults");
+        let store = Store::load_at(&state_home, &workspace, None).unwrap();
+        assert!(store.comments_visible());
+        assert!(store.annotations().is_empty());
+        assert_eq!(store.focus(), None);
     }
 
     #[test]
