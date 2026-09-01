@@ -819,6 +819,11 @@ struct App {
     workspace_revision: String,
     pr_scroll: usize,
     pr_max_scroll: usize,
+    /// Outline entries for the PR document — title and the visual row each
+    /// section starts at. Rebuilt every draw, since the offsets depend on the
+    /// width the body wrapped at.
+    pr_sections: Vec<(String, usize)>,
+    pr_outline_area: Rect,
     active_thread: Option<usize>,
     thread_scroll: usize,
     thread_max_scroll: usize,
@@ -976,6 +981,8 @@ impl App {
             workspace_revision: loaded.workspace_revision,
             pr_scroll: 0,
             pr_max_scroll: 0,
+            pr_sections: Vec::new(),
+            pr_outline_area: Rect::default(),
             active_thread: None,
             thread_scroll: 0,
             thread_max_scroll: 0,
@@ -2907,6 +2914,31 @@ impl App {
 
     /// Move among every public thread in the attached snapshot, including
     /// outdated and left-side conversations that cannot be pinned in this diff.
+    /// The section the reader is currently inside: the last one whose heading
+    /// has scrolled to or past the top of the body.
+    fn active_pr_section(&self) -> Option<usize> {
+        self.pr_sections
+            .iter()
+            .rposition(|(_, offset)| *offset <= self.pr_scroll)
+    }
+
+    /// Move the PR document one section forward or back. Going back from the
+    /// middle of a section lands on that section's own heading first, the way
+    /// a document outline is normally expected to behave.
+    fn jump_pr_section(&mut self, delta: isize) {
+        if self.pr_sections.is_empty() {
+            return;
+        }
+        let last = self.pr_sections.len() - 1;
+        let target = match (self.active_pr_section(), delta.is_negative()) {
+            (None, _) => 0,
+            (Some(i), false) => (i + 1).min(last),
+            (Some(i), true) if self.pr_scroll > self.pr_sections[i].1 => i,
+            (Some(i), true) => i.saturating_sub(1),
+        };
+        self.pr_scroll = self.pr_sections[target].1.min(self.pr_max_scroll);
+    }
+
     fn cycle_public_thread(&mut self, delta: isize) -> bool {
         let Some(len) = self
             .pull_request
@@ -3836,6 +3868,8 @@ fn handle_event(
                     KeyCode::PageUp => {
                         app.pr_scroll = app.pr_scroll.saturating_sub(10);
                     }
+                    KeyCode::Char(']') => app.jump_pr_section(1),
+                    KeyCode::Char('[') => app.jump_pr_section(-1),
                     KeyCode::Char('g') | KeyCode::Home => app.pr_scroll = 0,
                     KeyCode::Char('G') | KeyCode::End => app.pr_scroll = app.pr_max_scroll,
                     _ => {}
@@ -4129,6 +4163,25 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         return;
     }
     if app.page == Page::PullRequest {
+        if m.kind == MouseEventKind::Down(MouseButton::Left)
+            && app.pr_outline_area.contains(Position {
+                x: m.column,
+                y: m.row,
+            })
+        {
+            // The rail is padded one row down so its entries line up with the
+            // body's first content row rather than with its top border.
+            if let Some(index) = m
+                .row
+                .saturating_sub(app.pr_outline_area.y)
+                .checked_sub(1)
+                .map(usize::from)
+                && let Some((_, offset)) = app.pr_sections.get(index)
+            {
+                app.pr_scroll = (*offset).min(app.pr_max_scroll);
+            }
+            return;
+        }
         match m.kind {
             MouseEventKind::ScrollDown => {
                 app.pr_scroll = (app.pr_scroll + 3).min(app.pr_max_scroll)
@@ -4651,6 +4704,105 @@ fn draw_mode_overlay(frame: &mut ratatui::Frame, app: &mut App) {
     }
 }
 
+/// A rendered prose document plus where its structural anchors landed. One
+/// render pass produces both, so the outline, a scroll target and a click
+/// target can never disagree about where a section starts.
+///
+/// The PR page is the first caller. A literate tour wants the same view and
+/// the same rail, differing only in that its anchors will also include diff
+/// pull quotes.
+#[derive(Default)]
+struct Document {
+    lines: Vec<Line<'static>>,
+    sections: Vec<DocumentSection>,
+}
+
+/// One outline entry. `row` indexes `Document::lines`; the visual row it
+/// scrolls to depends on the wrap width and is resolved at draw time.
+struct DocumentSection {
+    title: String,
+    row: usize,
+}
+
+impl Document {
+    fn section(&mut self, title: &str) {
+        if !self.lines.is_empty() {
+            self.lines.push(Line::default());
+        }
+        self.sections.push(DocumentSection {
+            title: title.to_string(),
+            row: self.lines.len(),
+        });
+        self.lines.push(Line::from(Span::styled(
+            title.to_string(),
+            Style::default()
+                .fg(theme::MAUVE)
+                .add_modifier(Modifier::BOLD),
+        )));
+        self.lines.push(Line::from(Span::styled(
+            "────────────────────────────────────────",
+            Style::default().fg(theme::SURFACE1),
+        )));
+    }
+
+    fn push(&mut self, line: Line<'static>) {
+        self.lines.push(line);
+    }
+
+    fn extend(&mut self, lines: impl IntoIterator<Item = Line<'static>>) {
+        self.lines.extend(lines);
+    }
+
+    /// Title and first visual row of each section at `width`. Sections are
+    /// recorded in document order, so one walk over the lines resolves them all.
+    fn outline(&self, width: u16) -> Vec<(String, usize)> {
+        let mut outline = Vec::with_capacity(self.sections.len());
+        let mut row = 0usize;
+        let mut visual = 0usize;
+        for section in &self.sections {
+            while row < section.row {
+                visual += wrap::row_count(&self.lines[row], width, 0);
+                row += 1;
+            }
+            outline.push((section.title.clone(), visual));
+        }
+        outline
+    }
+}
+
+/// Width of the outline rail, and the narrowest page that still gets one.
+/// Below that the document keeps the whole width and the rail's job falls to
+/// `]` / `[`, which work whether or not it is on screen.
+const OUTLINE_WIDTH: u16 = 22;
+const OUTLINE_MIN_PAGE_WIDTH: u16 = 60;
+
+fn draw_outline(
+    frame: &mut ratatui::Frame,
+    area: Rect,
+    sections: &[(String, usize)],
+    active: Option<usize>,
+) {
+    let items: Vec<ListItem> = sections
+        .iter()
+        .enumerate()
+        .map(|(i, (title, _))| {
+            let style = if Some(i) == active {
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(theme::SUBTEXT0)
+            };
+            ListItem::new(Line::from(Span::styled(title.clone(), style)))
+        })
+        .collect();
+    frame.render_widget(
+        List::new(items)
+            .block(Block::default().padding(ratatui::widgets::Padding::new(1, 1, 1, 0))),
+        area,
+    );
+}
+
 fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let Some(pr) = &app.pull_request else {
         app.page = Page::Diff;
@@ -4693,15 +4845,42 @@ fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     ];
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    let lines = pull_request_lines(pr, app.review_draft_body.as_ref());
-    let inner_width = rows[1].width.saturating_sub(2);
-    let inner_height = rows[1].height.saturating_sub(2) as usize;
-    let visual_rows: usize = lines
+    let document = pull_request_document(pr, app.review_draft_body.as_ref());
+    // A single section is a label rather than a choice, the same rule the tab
+    // strip and the side panes use, so it does not earn a rail.
+    let show_outline = document.sections.len() > 1 && rows[1].width >= OUTLINE_MIN_PAGE_WIDTH;
+    let (outline_area, body_area) = if show_outline {
+        let panes = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Length(OUTLINE_WIDTH), Constraint::Min(0)])
+            .split(rows[1]);
+        (panes[0], panes[1])
+    } else {
+        (Rect::default(), rows[1])
+    };
+
+    let inner_width = body_area.width.saturating_sub(2);
+    let inner_height = body_area.height.saturating_sub(2) as usize;
+    let visual_rows: usize = document
+        .lines
         .iter()
         .map(|line| wrap::row_count(line, inner_width, 0))
         .sum();
     app.pr_max_scroll = visual_rows.saturating_sub(inner_height);
     app.pr_scroll = app.pr_scroll.min(app.pr_max_scroll);
+    // Outline offsets are resolved against the same width the body wraps at,
+    // so a jump lands the heading exactly where the rail says it is.
+    app.pr_sections = document.outline(inner_width);
+
+    app.pr_outline_area = outline_area;
+    if show_outline {
+        draw_outline(
+            frame,
+            outline_area,
+            &app.pr_sections,
+            app.active_pr_section(),
+        );
+    }
 
     let block = Block::default()
         .borders(Borders::ALL)
@@ -4711,60 +4890,60 @@ fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
             Style::default().fg(theme::TEAL),
         ));
     frame.render_widget(
-        Paragraph::new(lines)
+        Paragraph::new(document.lines)
             .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
             .wrap(Wrap { trim: false })
             .scroll((app.pr_scroll.min(u16::MAX as usize) as u16, 0)),
-        rows[1],
+        body_area,
     );
 }
 
-fn pull_request_lines(
+fn pull_request_document(
     pr: &link::PullRequest,
     draft_body: Option<&link::DraftReviewBody>,
-) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    section_heading(&mut lines, "Description");
+) -> Document {
+    let mut doc = Document::default();
+    doc.section("Description");
     if pr.body.trim().is_empty() {
-        lines.push(dim_line("No description."));
+        doc.push(dim_line("No description."));
     } else {
-        lines.extend(markdown::lines(&pr.body));
+        doc.extend(markdown::lines(&pr.body));
     }
 
-    section_heading(&mut lines, "Shared review draft");
+    doc.section("Shared review draft");
     if let Some(draft) = draft_body {
         let editor = match draft.last_editor {
             link::DraftEditor::User => "you last edited",
             link::DraftEditor::Agent => "agent last edited",
         };
-        lines.push(Line::from(Span::styled(
+        doc.push(Line::from(Span::styled(
             editor,
             Style::default().fg(theme::YELLOW),
         )));
-        lines.extend(markdown::lines(&draft.body));
+        doc.extend(markdown::lines(&draft.body));
     } else {
-        lines.push(dim_line(
+        doc.push(dim_line(
             "No top-level review drafted. Press c to start one.",
         ));
     }
 
     if !pr.conversation.is_empty() {
-        section_heading(&mut lines, "Conversation");
+        doc.section("Conversation");
         for comment in &pr.conversation {
             message_header(
-                &mut lines,
+                &mut doc.lines,
                 &comment.author,
                 "commented",
                 Some(&comment.created_at),
                 theme::TEAL,
             );
-            lines.extend(markdown::lines(&comment.body));
-            lines.push(Line::default());
+            doc.extend(markdown::lines(&comment.body));
+            doc.push(Line::default());
         }
     }
 
     if !pr.reviews.is_empty() {
-        section_heading(&mut lines, "Reviews");
+        doc.section("Reviews");
         for review in &pr.reviews {
             let (verb, color) = match review.state {
                 link::ReviewState::Approved => ("approved", theme::GREEN),
@@ -4775,29 +4954,29 @@ fn pull_request_lines(
                 link::ReviewState::Unknown => ("reviewed", theme::SUBTEXT0),
             };
             message_header(
-                &mut lines,
+                &mut doc.lines,
                 &review.author,
                 verb,
                 review.submitted_at.as_deref(),
                 color,
             );
             if review.body.trim().is_empty() {
-                lines.push(dim_line("No review summary."));
+                doc.push(dim_line("No review summary."));
             } else {
-                lines.extend(markdown::lines(&review.body));
+                doc.extend(markdown::lines(&review.body));
             }
-            lines.push(Line::default());
+            doc.push(Line::default());
         }
     }
     if !pr.threads.is_empty() {
-        section_heading(&mut lines, "Review threads");
+        doc.section("Review threads");
         for (i, thread) in pr.threads.iter().enumerate() {
-            thread_heading(&mut lines, i + 1, thread);
-            lines.extend(review_thread_lines(thread));
-            lines.push(Line::default());
+            thread_heading(&mut doc.lines, i + 1, thread);
+            doc.extend(review_thread_lines(thread));
+            doc.push(Line::default());
         }
     }
-    lines
+    doc
 }
 
 fn draw_review_thread(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -4916,22 +5095,6 @@ fn thread_anchor_label(thread: &link::ReviewThread) -> String {
         (_, Some(line)) => format!("{}:{line}", thread.path),
         _ => thread.path.clone(),
     }
-}
-
-fn section_heading(lines: &mut Vec<Line<'static>>, title: &str) {
-    if !lines.is_empty() {
-        lines.push(Line::default());
-    }
-    lines.push(Line::from(Span::styled(
-        title.to_string(),
-        Style::default()
-            .fg(theme::MAUVE)
-            .add_modifier(Modifier::BOLD),
-    )));
-    lines.push(Line::from(Span::styled(
-        "────────────────────────────────────────",
-        Style::default().fg(theme::SURFACE1),
-    )));
 }
 
 fn message_header(
@@ -5240,6 +5403,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("1-9", "jump to tour step"),
     head("Review"),
     bind("p", "open the attached PR description and review timeline"),
+    bind("] [", "next / prev section of the PR page"),
     bind("t T", "next / prev public review thread"),
     bind("enter", "open the public thread anchored at the cursor"),
     bind("double click", "open a review object in files or diff"),
@@ -6366,6 +6530,98 @@ mod tests {
         assert_eq!(app.page, Page::Diff);
     }
 
+    #[test]
+    fn a_document_outline_records_where_each_section_starts() {
+        let mut doc = Document::default();
+        doc.section("First");
+        doc.extend(vec![Line::raw("a"), Line::raw("b")]);
+        doc.section("Second");
+        doc.push(Line::raw("c"));
+
+        let outline = doc.outline(80);
+        assert_eq!(outline[0], ("First".to_string(), 0));
+        // heading, rule, two body rows, then the blank that separates sections.
+        assert_eq!(outline[1], ("Second".to_string(), 5));
+    }
+
+    #[test]
+    fn the_outline_highlights_the_section_being_read() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.pr_sections = vec![("A".into(), 0), ("B".into(), 10)];
+
+        app.pr_scroll = 0;
+        assert_eq!(app.active_pr_section(), Some(0));
+        app.pr_scroll = 9;
+        assert_eq!(app.active_pr_section(), Some(0));
+        app.pr_scroll = 10;
+        assert_eq!(app.active_pr_section(), Some(1));
+    }
+
+    #[test]
+    fn section_jumps_step_forward_and_land_on_the_current_heading_first() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.pr_sections = vec![("A".into(), 0), ("B".into(), 10), ("C".into(), 20)];
+        app.pr_max_scroll = 40;
+
+        app.jump_pr_section(1);
+        assert_eq!(app.pr_scroll, 10);
+        app.jump_pr_section(1);
+        assert_eq!(app.pr_scroll, 20);
+        app.jump_pr_section(1);
+        assert_eq!(app.pr_scroll, 20, "clamps at the last section");
+
+        // Back from mid-section lands on this heading before the previous one.
+        app.pr_scroll = 25;
+        app.jump_pr_section(-1);
+        assert_eq!(app.pr_scroll, 20);
+        app.jump_pr_section(-1);
+        assert_eq!(app.pr_scroll, 10);
+    }
+
+    #[test]
+    fn clicking_the_outline_jumps_to_that_section() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        let mut pr = empty_pull_request("base");
+        pr.body = (1..=40)
+            .map(|i| format!("paragraph {i}"))
+            .collect::<Vec<_>>()
+            .join("\n\n");
+        app.pull_request = Some(pr);
+        app.page = Page::PullRequest;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.pr_sections.len(), 2);
+        assert!(app.pr_outline_area.width > 0, "wide page gets a rail");
+        let second = app.pr_sections[1].1;
+        assert!(second > 0 && app.pr_max_scroll > 0, "document overflows");
+
+        // One padding row, then entry index 1.
+        let (x, y) = (app.pr_outline_area.x + 1, app.pr_outline_area.y + 2);
+        handle_mouse(&mut app, left_click(x, y));
+        assert_eq!(app.pr_scroll, second.min(app.pr_max_scroll));
+    }
+
+    /// The rail is the discoverable half of section navigation, not the only
+    /// half: a narrow page drops it and keeps `]` / `[`.
+    #[test]
+    fn a_narrow_pr_page_keeps_its_sections_without_a_rail() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(50, 24);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.pull_request = Some(empty_pull_request("base"));
+        app.page = Page::PullRequest;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.pr_outline_area, Rect::default());
+        assert_eq!(app.pr_sections.len(), 2);
+    }
+
     /// A review thread is a drill-down, not a peer screen, so it borrows the
     /// PR tab instead of adding a third one nobody navigated to.
     #[test]
@@ -6968,7 +7224,8 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             body: "The shared top-level review.".into(),
             last_editor: link::DraftEditor::Agent,
         };
-        let text: Vec<String> = pull_request_lines(&pr, Some(&review_body))
+        let text: Vec<String> = pull_request_document(&pr, Some(&review_body))
+            .lines
             .iter()
             .map(Line::to_string)
             .collect();
