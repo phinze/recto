@@ -366,6 +366,7 @@ enum FileRow {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FileReviewObject {
     TourStop(usize),
+    TourQuote(usize),
     PublishedThread(usize),
     SharedDraft(u64),
     AgentNote(usize),
@@ -423,6 +424,7 @@ fn build_file_rows(changes: &[FileChange]) -> Vec<FileRow> {
 fn build_review_file_rows(
     changes: &[FileChange],
     annotations: &[Annotation],
+    tour_quotes: &[TourQuote],
     threads: &[link::ReviewThread],
     drafts: &[link::DraftReviewComment],
     agent_notes: &[AgentNote],
@@ -446,6 +448,16 @@ fn build_review_file_rows(
                 .map(|(i, _)| FileRow::ReviewObject {
                     file_idx,
                     object: FileReviewObject::TourStop(i),
+                }),
+        );
+        rows.extend(
+            tour_quotes
+                .iter()
+                .enumerate()
+                .filter(|(_, quote)| quote.path == *path)
+                .map(|(i, _)| FileRow::ReviewObject {
+                    file_idx,
+                    object: FileReviewObject::TourQuote(i),
                 }),
         );
         rows.extend(
@@ -851,6 +863,9 @@ struct App {
     /// so a click in the tour body can find the code it points at.
     tour_quotes: Vec<(Range<usize>, String)>,
     tour_body_area: Rect,
+    /// Where each of the tour's quotes points. Derived from `tour`, refreshed
+    /// with it, and independent of any draw.
+    tour_anchors: Vec<TourQuote>,
     /// A section a companion asked for before the tour page had geometry to
     /// resolve it against. Spent by the next draw.
     tour_pending_section: Option<usize>,
@@ -1009,6 +1024,7 @@ impl App {
         let tour = persistence
             .as_ref()
             .and_then(|store| store.tour().map(str::to_string));
+        let tour_anchors = tour.as_deref().map(tour_quote_anchors).unwrap_or_default();
         let (annotations, restored_focus, show_comments) = persistence
             .as_ref()
             .map(|store| {
@@ -1042,6 +1058,7 @@ impl App {
             tour_outline_area: Rect::default(),
             tour_quotes: Vec::new(),
             tour_body_area: Rect::default(),
+            tour_anchors,
             tour_pending_section: None,
             tour_return: None,
             active_thread: None,
@@ -1118,7 +1135,11 @@ impl App {
         } else {
             Focus::Diff
         };
-        if !app.agent_notes.is_empty() || !app.annotations.is_empty() || !app.show_comments {
+        if !app.agent_notes.is_empty()
+            || !app.annotations.is_empty()
+            || !app.tour_anchors.is_empty()
+            || !app.show_comments
+        {
             app.reweave();
         }
         Ok(app)
@@ -1818,6 +1839,7 @@ impl App {
         let rows = build_review_file_rows(
             &self.changes,
             &self.annotations,
+            &self.tour_anchors,
             threads,
             drafts,
             agent_notes,
@@ -1904,6 +1926,10 @@ impl App {
                 .annotations
                 .get(i)
                 .map(|annotation| (annotation.path.clone(), annotation.start, annotation.end)),
+            FileReviewObject::TourQuote(i) => self
+                .tour_anchors
+                .get(i)
+                .map(|quote| (quote.path.clone(), quote.start, quote.end)),
             FileReviewObject::PublishedThread(i) => {
                 self.active_thread = Some(i);
                 self.pull_request
@@ -1959,6 +1985,14 @@ impl App {
             FileReviewObject::TourStop(_) => {
                 self.reveal_file_review_object(object);
                 self.take_diff_focus();
+            }
+            // The file you are reading is the way back into the prose about it.
+            FileReviewObject::TourQuote(i) => {
+                let Some(section) = self.tour_anchors.get(i).map(|quote| quote.section) else {
+                    return;
+                };
+                self.tour_pending_section = Some(section);
+                self.page = Page::Tour;
             }
             FileReviewObject::PublishedThread(i) => {
                 self.active_thread = Some(i);
@@ -3151,6 +3185,12 @@ impl App {
     fn set_tour(&mut self, body: String) -> link::Response {
         let body = body.trim().to_string();
         self.tour = (!body.is_empty()).then_some(body);
+        self.tour_anchors = self
+            .tour
+            .as_deref()
+            .map(tour_quote_anchors)
+            .unwrap_or_default();
+        self.rebuild_file_rows();
         self.persist_soon();
         link::Response::ok()
     }
@@ -5089,6 +5129,43 @@ struct Document {
     quotes: Vec<(Range<usize>, String)>,
 }
 
+/// Where a tour quote points, parsed from the tour source rather than from a
+/// draw, so the file navigator can list quotes before the tour page has ever
+/// been rendered.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TourQuote {
+    path: String,
+    start: u32,
+    end: u32,
+    /// Section the quote sits in, for jumping back into the prose about it.
+    section: usize,
+}
+
+/// Every quote a tour names. The resolver is a no-op because only the anchors
+/// matter here; expanding the code is the draw pass's job.
+fn tour_quote_anchors(source: &str) -> Vec<TourQuote> {
+    let mut skip = |_: &str| Vec::new();
+    let rendered = markdown::with_quotes(source, &mut skip);
+    rendered
+        .quotes
+        .iter()
+        .filter_map(|(rows, spec)| {
+            let (path, start, end) = parse_pathspec(spec);
+            let start = start?;
+            Some(TourQuote {
+                path: path.to_string(),
+                start,
+                end: end.unwrap_or(start).max(start),
+                section: rendered
+                    .sections
+                    .iter()
+                    .rposition(|(_, row)| *row <= rows.start)
+                    .unwrap_or(0),
+            })
+        })
+        .collect()
+}
+
 /// One outline entry. `row` indexes `Document::lines`; the visual row it
 /// scrolls to depends on the wrap width and is resolved at draw time.
 struct DocumentSection {
@@ -6125,6 +6202,18 @@ fn file_review_object_line(app: &App, object: FileReviewObject) -> ListItem<'sta
                         .fg(theme::MAUVE)
                         .add_modifier(Modifier::BOLD),
                 ),
+                Span::styled(format!(" {label}"), Style::default().fg(theme::SUBTEXT0)),
+            ]
+        }
+        FileReviewObject::TourQuote(i) => {
+            let label = app
+                .tour_anchors
+                .get(i)
+                .and_then(|quote| app.tour_sections.get(quote.section))
+                .map_or("tour quote", |(title, _)| title.as_str());
+            vec![
+                Span::raw("  "),
+                Span::styled("❝", Style::default().fg(theme::MAUVE)),
                 Span::styled(format!(" {label}"), Style::default().fg(theme::SUBTEXT0)),
             ]
         }
@@ -7357,6 +7446,45 @@ mod tests {
         app.tour_scroll = app.tour_max_scroll;
         let refused = app.open_quote_in_view();
         assert!(!refused.ok || app.page == Page::Diff);
+    }
+
+    /// The way back: a reviewer already looking at a file can reach the prose
+    /// about it without hunting for the right section in the tab.
+    #[test]
+    fn a_quote_row_jumps_into_the_tour_section_that_owns_it() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.handle_request(link::Request::Tour {
+            body: concat!(
+                "## First\n\nprose\n\n```recto foo.go:2\n```\n\n",
+                "## Second\n\nprose\n\n```recto foo.go:111\n```\n"
+            )
+            .into(),
+        });
+
+        // Anchors come from the source, so they exist before any draw.
+        assert_eq!(app.tour_anchors.len(), 2);
+        assert_eq!(app.tour_anchors[1].section, 1);
+        assert_eq!(app.tour_anchors[1].start, 111);
+
+        // And they are listed under their file in the navigator.
+        let quote_rows: Vec<usize> = app
+            .file_rows
+            .iter()
+            .filter_map(|row| match row {
+                FileRow::ReviewObject {
+                    object: FileReviewObject::TourQuote(i),
+                    ..
+                } => Some(*i),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(quote_rows, vec![0, 1]);
+
+        app.activate_review_object(FileReviewObject::TourQuote(1));
+        assert_eq!(app.page, Page::Tour);
+        assert_eq!(app.tour_pending_section, Some(1));
     }
 
     /// A narrow page hides the rail, so the status line is the only thing left
@@ -8917,8 +9045,22 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             body: "Private direction.".into(),
         }];
 
+        let tour_quotes = [TourQuote {
+            path: "src/link.rs".into(),
+            start: 30,
+            end: 34,
+            section: 1,
+        }];
+
         assert_eq!(
-            build_review_file_rows(&changes, &annotations, &threads, &drafts, &notes),
+            build_review_file_rows(
+                &changes,
+                &annotations,
+                &tour_quotes,
+                &threads,
+                &drafts,
+                &notes
+            ),
             vec![
                 FileRow::Dir("src/".into()),
                 FileRow::File(0),
@@ -8926,6 +9068,10 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 FileRow::ReviewObject {
                     file_idx: 1,
                     object: FileReviewObject::TourStop(0),
+                },
+                FileRow::ReviewObject {
+                    file_idx: 1,
+                    object: FileReviewObject::TourQuote(0),
                 },
                 FileRow::ReviewObject {
                     file_idx: 1,
