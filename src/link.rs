@@ -42,6 +42,13 @@ pub enum Request {
     /// prose that the diff is quoted *into*, and the two coexist.
     #[serde(rename = "tour")]
     Tour { body: String },
+    /// Bring the tour into view, optionally scrolled to a numbered section.
+    /// Sections are numbered from 1, as the outline rail badges are.
+    #[serde(rename = "tour-focus")]
+    TourFocus {
+        #[serde(skip_serializing_if = "Option::is_none")]
+        section: Option<usize>,
+    },
     /// Clear any active focus highlight and annotations.
     Clear,
     /// Show, hide, or toggle non-tour comments in the diff and file tree.
@@ -328,6 +335,14 @@ pub struct Status {
     /// the field, which reads as absent.
     #[serde(default)]
     pub tour: bool,
+    /// Number of sections in that tour, and so the largest number `tour-focus`
+    /// will accept.
+    #[serde(default)]
+    pub tour_sections: usize,
+    /// The surface currently on screen: `"diff"`, `"tour"`, `"pr"` or
+    /// `"thread"`.
+    #[serde(default)]
+    pub page: String,
     /// Whether published threads, shared drafts, and private notes are visible
     /// in the diff and file tree. Older Recto versions omitted this and always
     /// showed them.
@@ -728,7 +743,7 @@ fn handle_while_in_editor(
         }
         // Same for a tour: it is a document the TUI renders, so laying one
         // down while parked is pure state that lands on the way back.
-        Request::Tour { .. } => {
+        Request::Tour { .. } | Request::TourFocus { .. } => {
             queue(tx, request.clone());
             Response::ok_note("recto is in an editor; the tour will apply when you return")
         }
@@ -1036,6 +1051,8 @@ mod tests {
             focus: false,
             annotations: 0,
             tour: false,
+            tour_sections: 0,
+            page: String::new(),
             comments_visible: true,
             pending_comments: 2,
             draft_comments: 0,
@@ -1112,6 +1129,8 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 tour: false,
+                tour_sections: 0,
+                page: String::new(),
                 comments_visible: true,
                 pending_comments: 0,
                 draft_comments: 0,
@@ -1162,6 +1181,8 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 tour: false,
+                tour_sections: 0,
+                page: String::new(),
                 comments_visible: true,
                 pending_comments: 0,
                 draft_comments: 0,
@@ -1292,6 +1313,8 @@ mod tests {
                 focus: false,
                 annotations: 0,
                 tour: false,
+                tour_sections: 0,
+                page: String::new(),
                 comments_visible: true,
                 pending_comments: 3,
                 draft_comments: 0,

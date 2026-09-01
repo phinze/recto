@@ -232,6 +232,9 @@ enum ClientCommand {
     /// diff inline. Reads BODY, or stdin when BODY is omitted. An empty body
     /// removes the tour. Coexists with `annotate`.
     Tour { body: Option<String> },
+    /// Bring the tour into view, optionally scrolled to a numbered SECTION.
+    /// Sections are numbered from 1, matching the outline rail's badges.
+    TourFocus { section: Option<usize> },
     /// Clear any active focus highlight and annotations in the running recto.
     Clear,
     /// Control visibility of published threads, shared drafts, and private
@@ -848,6 +851,9 @@ struct App {
     /// so a click in the tour body can find the code it points at.
     tour_quotes: Vec<(Range<usize>, String)>,
     tour_body_area: Rect,
+    /// A section a companion asked for before the tour page had geometry to
+    /// resolve it against. Spent by the next draw.
+    tour_pending_section: Option<usize>,
     /// Tour scroll to come back to after a quote sent the reader to the diff.
     /// Set on the way in, spent by the first Esc on the way out.
     tour_return: Option<usize>,
@@ -1036,6 +1042,7 @@ impl App {
             tour_outline_area: Rect::default(),
             tour_quotes: Vec::new(),
             tour_body_area: Rect::default(),
+            tour_pending_section: None,
             tour_return: None,
             active_thread: None,
             thread_scroll: 0,
@@ -2135,6 +2142,19 @@ impl App {
             focus: self.focus_span.is_some(),
             annotations: self.annotations.len(),
             tour: self.tour.is_some(),
+            // Counted from the document, not from the last draw: a companion
+            // may ask before the tour page has ever been rendered.
+            tour_sections: self
+                .tour
+                .as_deref()
+                .map_or(0, |source| markdown::outlined(source).sections.len()),
+            page: match self.page {
+                Page::Diff => "diff",
+                Page::Tour => "tour",
+                Page::PullRequest => "pr",
+                Page::ReviewThread => "thread",
+            }
+            .to_string(),
             comments_visible: self.show_comments,
             pending_comments: self.agent_notes.len(),
             draft_comments: self.review_draft_comments.len(),
@@ -2273,6 +2293,7 @@ impl App {
             // Taking a tour down stays available even against a stale review:
             // refusing to clean up would strand a document describing code the
             // workspace has already moved past.
+            link::Request::TourFocus { section } => self.focus_tour_section(section),
             link::Request::Tour { body } if body.trim().is_empty() => self.set_tour(body),
             link::Request::Tour { body } => match self.review_target_error() {
                 Some(error) => link::Response::err(error),
@@ -2422,6 +2443,7 @@ impl App {
 
         let Some(start) = start else {
             // Whole-file focus: jump to the file, no line highlight to carry.
+            self.page = Page::Diff;
             self.focus_span = None;
             self.persist_soon();
             self.scroll_to_file(file_idx);
@@ -2429,6 +2451,8 @@ impl App {
             return link::Response::ok();
         };
         let end = end.unwrap_or(start).max(start);
+        // "Look here now" cannot mean anything while a different page is up.
+        self.page = Page::Diff;
         self.focus_span = Some(FocusSpan {
             path: path.to_string(),
             start,
@@ -2637,6 +2661,7 @@ impl App {
             return link::Response::ok();
         }
         if let Some(rows) = self.annotation_rows().into_iter().next() {
+            self.page = Page::Diff;
             self.reveal_span(&rows);
             self.take_diff_focus();
         }
@@ -3081,6 +3106,30 @@ impl App {
         }
     }
 
+    /// Bring the tour into view, optionally at a numbered section.
+    ///
+    /// Section offsets depend on the wrap width, which only the draw pass
+    /// knows, so the number is validated against the document's heading count
+    /// — which needs no geometry — and the scroll itself is left for the next
+    /// draw to apply.
+    fn focus_tour_section(&mut self, section: Option<usize>) -> link::Response {
+        let Some(source) = self.tour.as_deref() else {
+            return link::Response::err("no tour is laid down");
+        };
+        let count = markdown::outlined(source).sections.len();
+        if let Some(n) = section {
+            if n == 0 || n > count {
+                return link::Response::err(format!(
+                    "tour has {count} section{}; no section {n}",
+                    if count == 1 { "" } else { "s" }
+                ));
+            }
+            self.tour_pending_section = Some(n - 1);
+        }
+        self.page = Page::Tour;
+        link::Response::ok()
+    }
+
     /// Replace or remove the literate tour. An empty body removes it, the same
     /// way an empty review body deletes that draft.
     fn set_tour(&mut self, body: String) -> link::Response {
@@ -3450,6 +3499,7 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
             };
             Ok(link::Request::Tour { body })
         }
+        ClientCommand::TourFocus { section } => Ok(link::Request::TourFocus { section: *section }),
         ClientCommand::Clear => Ok(link::Request::Clear),
         ClientCommand::CommentVisibility { action } => Ok(link::Request::CommentVisibility {
             visible: match action {
@@ -5307,6 +5357,9 @@ fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.tour_outline_area = layout.outline_area;
     app.tour_quotes = layout.quotes;
     app.tour_body_area = layout.body_area;
+    if let Some(index) = app.tour_pending_section.take() {
+        app.jump_to_section(index);
+    }
 }
 
 fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -7217,6 +7270,76 @@ mod tests {
         assert!(app.return_to_tour(), "Esc unwinds back into the tour");
         assert_eq!(app.page, Page::Tour);
         assert!(!app.return_to_tour(), "and the return is spent once used");
+    }
+
+    #[test]
+    fn tour_focus_validates_against_the_documents_headings() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb\n\n## Three\n\nc".into(),
+        });
+
+        // Counted from the document, so it answers before any draw.
+        let status = app.handle_request(link::Request::Ping).status.unwrap();
+        assert_eq!(status.tour_sections, 3);
+        assert_eq!(status.page, "diff");
+
+        let past_the_end = app.handle_request(link::Request::TourFocus { section: Some(4) });
+        assert!(!past_the_end.ok);
+        assert_eq!(app.page, Page::Diff, "a refused focus moves nothing");
+
+        let ok = app.handle_request(link::Request::TourFocus { section: Some(3) });
+        assert!(ok.ok);
+        assert_eq!(app.page, Page::Tour);
+        assert_eq!(app.tour_pending_section, Some(2));
+    }
+
+    /// The offsets a section jump needs only exist after a draw, so the request
+    /// defers the scroll rather than silently landing on nothing.
+    #[test]
+    fn a_deferred_section_lands_on_the_next_draw() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(159, 77);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb\n\n## Three\n\nc".into(),
+        });
+
+        assert!(
+            app.handle_request(link::Request::TourFocus { section: Some(3) })
+                .ok
+        );
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        assert_eq!(app.tour_pending_section, None, "spent by the draw");
+        assert_eq!(app.tour_scroll, app.tour_sections[2].1);
+        assert_eq!(active_section(&app.tour_sections, app.tour_scroll), Some(2));
+    }
+
+    /// "Look here now" cannot mean anything while another page is up.
+    #[test]
+    fn focus_brings_the_diff_back_into_view() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.handle_request(link::Request::Tour {
+            body: "## One\n\na\n\n## Two\n\nb".into(),
+        });
+        assert!(
+            app.handle_request(link::Request::TourFocus { section: None })
+                .ok
+        );
+        assert_eq!(app.page, Page::Tour);
+
+        let focused = app.handle_request(link::Request::Focus {
+            path: "foo.go".into(),
+            start: Some(111),
+            end: None,
+        });
+        assert!(focused.ok);
+        assert_eq!(app.page, Page::Diff);
     }
 
     /// The quote is source, not diff: no added/removed tint, no marker, no
