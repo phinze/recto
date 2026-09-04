@@ -8,6 +8,7 @@
 
 pub(crate) mod diff;
 pub(crate) mod document;
+pub(crate) mod overlay;
 pub(crate) mod panes;
 
 use ratatui::style::{Modifier, Style};
