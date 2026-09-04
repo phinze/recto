@@ -6,7 +6,8 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, Clear, Paragraph, Wrap};
 
-use crate::{App, ComposerKind, NoteDraft, NoteLayout, theme};
+use crate::app::{App, ComposerKind, NoteDraft, NoteLayout};
+use crate::theme;
 
 fn quit_loss_summary(
     agent_notes: usize,

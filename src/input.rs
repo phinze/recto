@@ -13,12 +13,13 @@ use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::Position;
 
+use crate::Action;
+use crate::app::{
+    App, ComposerEdit, ComposerKind, Cursor, FileRow, Focus, Mode, NoteDraft, NoteLayout, Page,
+    PaneVis, ReviewClickSurface, WHEEL_STEP, file_row_selectable,
+};
 use crate::ui::chrome::tab_entries;
 use crate::ui::document::outline_index_at;
-use crate::{
-    Action, App, ComposerEdit, ComposerKind, Cursor, FileRow, Focus, Mode, NoteDraft, NoteLayout,
-    Page, PaneVis, ReviewClickSurface, WHEEL_STEP, file_row_selectable,
-};
 use crate::{link, run_editor};
 
 /// Shift+N as the 1-based tab index it selects. Terminals disagree about how

@@ -15,8 +15,8 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::app::{AgentNote, Annotation, FocusAnchor, NoteDraft};
 use crate::link::{DraftReviewBody, DraftReviewComment, PullRequest, PullRequestRef};
-use crate::{AgentNote, Annotation, FocusAnchor, NoteDraft};
 
 const SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -487,7 +487,7 @@ const fn shown() -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::{ComposerEdit, ComposerKind};
+    use crate::app::{ComposerEdit, ComposerKind};
 
     fn roots(name: &str) -> (PathBuf, PathBuf) {
         let root = std::env::temp_dir().join(format!(

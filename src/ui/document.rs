@@ -13,8 +13,9 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
 
+use crate::app::{App, Page};
 use crate::ui::diff::{badge, gutter_signature, rows_for_span};
-use crate::{App, Page, link, markdown, parse_pathspec, theme, wrap};
+use crate::{link, markdown, parse_pathspec, theme, wrap};
 
 /// A rendered prose document plus where its structural anchors landed. One
 /// render pass produces both, so the outline, a scroll target and a click

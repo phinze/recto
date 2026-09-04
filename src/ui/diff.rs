@@ -8,12 +8,13 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Paragraph;
 
+use crate::app::{
+    AgentNote, App, FOCUS_FLASH, FOCUS_FLASH_ALPHA, FOCUS_PULSE_DEPTH, FOCUS_PULSE_PERIOD, Focus,
+    Mode,
+};
 use crate::diff::{LineInfo, sticky_line};
 use crate::ui::pane_block;
-use crate::{
-    AgentNote, App, FOCUS_FLASH, FOCUS_FLASH_ALPHA, FOCUS_PULSE_DEPTH, FOCUS_PULSE_PERIOD, Focus,
-    Mode, link, markdown, theme, wrap,
-};
+use crate::{link, markdown, theme, wrap};
 
 pub(crate) fn draw_diff(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let diff_focused = app.focus == Focus::Diff && matches!(app.mode, Mode::Normal);

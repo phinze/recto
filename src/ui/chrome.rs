@@ -7,13 +7,14 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Paragraph, Wrap};
 
+use crate::app::{App, Cursor, Mode, Page, SPINNER_FRAME_MS, SPINNER_FRAMES};
 use crate::ui::diff::draw_diff;
 use crate::ui::document::{
     active_section, draw_pull_request, draw_review_thread, draw_tour, short_oid,
 };
 use crate::ui::overlay::{draw_help, draw_note_input, draw_quit_confirm};
 use crate::ui::panes::{draw_commits, draw_files};
-use crate::{App, Cursor, Mode, Page, SPINNER_FRAME_MS, SPINNER_FRAMES, theme, wrap};
+use crate::{theme, wrap};
 
 fn contextual_footer(app: &App) -> Option<Paragraph<'static>> {
     match &app.mode {

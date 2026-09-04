@@ -13,7 +13,7 @@ use anyhow::{Result, anyhow};
 use crossterm::event::{self, MouseButton, MouseEventKind};
 use ratatui::text::Line;
 
-use crate::App;
+use crate::app::App;
 use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope};
 use crate::diff::{FetchContent, Gutter, diff_body_line, render_diff};
 use crate::highlight::Highlighter;

@@ -6,10 +6,11 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{List, ListItem};
 
+use crate::app::{App, Cursor, FileReviewObject, FileRow, Focus, Mode};
 use crate::diff::file_row_line;
 use crate::ui::diff::{agent_note_badge, badge};
 use crate::ui::pane_block;
-use crate::{App, Cursor, FileReviewObject, FileRow, Focus, Mode, link, theme};
+use crate::{link, theme};
 
 pub(crate) fn draw_files(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.files_area = area;
