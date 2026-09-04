@@ -12,8 +12,8 @@ use anyhow::Result;
 use ratatui::text::Line;
 
 use crate::app::{
-    AgentNote, Annotation, App, ComposerKind, Cursor, FileReviewObject, Focus, FocusAnchor,
-    FocusSpan, Mode, Page, SCROLLOFF, STATE_DEBOUNCE,
+    AgentNote, Annotation, App, ComposerKind, FileReviewObject, Focus, FocusAnchor, FocusSpan,
+    Mode, Page, SCROLLOFF, STATE_DEBOUNCE,
 };
 use crate::backend::Base;
 use crate::ui::diff::{
@@ -27,9 +27,9 @@ impl App {
     /// currently showing, so an agent knows what `focus`/`annotate` can resolve
     /// without firing a throwaway request to find out.
     pub(crate) fn status(&self) -> link::Status {
-        let scope = match self.cursor {
-            Cursor::All => "range",
-            Cursor::Rev(_) => "rev",
+        let scope = match self.loaded_scope {
+            crate::backend::Scope::Range(_) => "range",
+            crate::backend::Scope::Rev(_) => "rev",
         };
         let workspace_root = self.backend.root().to_string_lossy().into_owned();
         let workspace_revision = self
@@ -42,8 +42,16 @@ impl App {
             backend: self.backend.kind().to_string(),
             workspace_root,
             workspace_revision: workspace_revision.clone(),
-            base: self.backend.base_label(self.base()),
+            base: self.backend.base_label(&self.loaded_base),
             scope: scope.to_string(),
+            loading_base: self.loading.as_ref().and_then(|loading| {
+                if let crate::backend::Scope::Range(base) = &loading.request.scope {
+                    Some(self.backend.base_label(base))
+                } else {
+                    None
+                }
+            }),
+            load_error: self.load_error.clone(),
             files: self.changes.iter().map(|c| c.path.clone()).collect(),
             surface: link::Surface::Recto,
             capabilities: link::Capabilities::recto(),
@@ -187,6 +195,7 @@ impl App {
     pub(crate) fn handle_request(&mut self, request: link::Request) -> link::Response {
         match request {
             link::Request::Ping => link::Response::ok_status(self.status()),
+            link::Request::SetBase { revision } => self.set_base_from_companion(revision),
             link::Request::AttachPr { pull_request } => {
                 self.attach_pull_request(*pull_request, true)
             }
@@ -251,6 +260,36 @@ impl App {
                 }
             },
         }
+    }
+
+    /// Start a range load for a companion-requested base. The response carries
+    /// status so the CLI can wait for the background worker without mistaking
+    /// the requested base for the diff that is still on screen.
+    fn set_base_from_companion(&mut self, revision: String) -> link::Response {
+        let base = Base::Revision(revision);
+        let label = self.backend.base_label(&base);
+        let already_loading = self.loading.as_ref().is_some_and(|loading| {
+            matches!(
+                &loading.request.scope,
+                crate::backend::Scope::Range(loading_base)
+                    if self.backend.base_label(loading_base) == label
+            )
+        });
+        let already_loaded = self.backend.base_label(&self.loaded_base) == label
+            && matches!(self.loaded_scope, crate::backend::Scope::Range(_));
+
+        if !(already_loading || already_loaded && self.loading.is_none()) {
+            self.select_base(base);
+        }
+        if self.loading.is_none() && !already_loaded {
+            self.restore_loaded_selection();
+            return link::Response::err(
+                self.load_error
+                    .clone()
+                    .unwrap_or_else(|| format!("could not load base {label}")),
+            );
+        }
+        link::Response::ok_status(self.status())
     }
 
     /// Attach a public PR snapshot and, for a live client request, move the

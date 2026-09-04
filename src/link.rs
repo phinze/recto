@@ -24,6 +24,9 @@ pub use crate::backend::repository_root as workspace_root;
 #[derive(Debug, Clone, Deserialize, Serialize)]
 #[serde(tag = "cmd", rename_all = "lowercase")]
 pub enum Request {
+    /// Retarget the running diff to an arbitrary jj revset or git ref.
+    #[serde(rename = "base")]
+    SetBase { revision: String },
     /// Scroll to and highlight a span. `start`/`end` are new-side (post-image)
     /// line numbers; both absent means "whole file".
     Focus {
@@ -314,10 +317,16 @@ pub struct Status {
     /// attached review this must equal `pull_request.head_oid`.
     #[serde(default)]
     pub workspace_revision: String,
-    /// The base label shown in the header (e.g. `@-`, `trunk()`, `HEAD`).
+    /// Base of the diff currently on screen (e.g. `@-`, `trunk()`, `HEAD`).
     pub base: String,
     /// `"range"` for the whole base diff, or `"rev"` when narrowed to one rev.
     pub scope: String,
+    /// Base currently being loaded, if a range retarget has not settled yet.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub loading_base: Option<String>,
+    /// Most recent diff-load failure. Cleared when another load begins.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub load_error: Option<String>,
     /// Changed paths in the current diff. On the recto surface these bound both
     /// commands; a live neovim can focus any workspace path instead.
     pub files: Vec<String>,
@@ -704,6 +713,10 @@ fn handle_while_in_editor(
             });
             resp
         }
+        Request::SetBase { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; the base will change when you return")
+        }
         // Attaching public context only mutates TUI state. Queue it just like a
         // private note and let it become visible when the editor hands back.
         Request::AttachPr { .. } => {
@@ -944,6 +957,16 @@ mod tests {
     }
 
     #[test]
+    fn base_wire_format() {
+        let request: Request = serde_json::from_str(r#"{"cmd":"base","revision":"trunk()"}"#)
+            .expect("parse base request");
+        assert!(matches!(
+            request,
+            Request::SetBase { revision } if revision == "trunk()"
+        ));
+    }
+
+    #[test]
     fn comment_visibility_wire_format() {
         let hide: Request = serde_json::from_str(r#"{"cmd":"comment-visibility","visible":false}"#)
             .expect("parse hide");
@@ -1045,6 +1068,8 @@ mod tests {
             workspace_revision: "abc123".into(),
             base: "@-".into(),
             scope: "range".into(),
+            loading_base: Some("trunk()".into()),
+            load_error: None,
             files: vec!["src/main.rs".into(), "src/link.rs".into()],
             surface: Surface::Recto,
             capabilities: Capabilities::recto(),
@@ -1066,6 +1091,7 @@ mod tests {
         assert_eq!(status.backend, "jj");
         assert_eq!(status.workspace_revision, "abc123");
         assert_eq!(status.base, "@-");
+        assert_eq!(status.loading_base.as_deref(), Some("trunk()"));
         assert_eq!(status.files, vec!["src/main.rs", "src/link.rs"]);
         assert_eq!(status.pending_comments, 2);
         assert!(status.comments_visible);
@@ -1098,6 +1124,8 @@ mod tests {
         // A recto too old to know about comments simply has none pending.
         assert_eq!(old.pending_comments, 0);
         assert_eq!(old.draft_comments, 0);
+        assert!(old.loading_base.is_none());
+        assert!(old.load_error.is_none());
 
         // A bare ok() stays status-free on the wire for older clients.
         assert!(
@@ -1123,6 +1151,8 @@ mod tests {
                 workspace_revision: "abc123".into(),
                 base: "HEAD".into(),
                 scope: "range".into(),
+                loading_base: None,
+                load_error: None,
                 files: vec!["a.rs".into()],
                 surface: Surface::Recto,
                 capabilities: Capabilities::recto(),
@@ -1175,6 +1205,8 @@ mod tests {
                 workspace_revision: "abc123".into(),
                 base: "@-".into(),
                 scope: "range".into(),
+                loading_base: None,
+                load_error: None,
                 files: vec!["changed.rs".into()],
                 surface: Surface::Recto,
                 capabilities: Capabilities::recto(),
@@ -1205,6 +1237,64 @@ mod tests {
             status.capabilities.annotate,
             Capability::deferred(TargetScope::CurrentDiff)
         );
+    }
+
+    #[test]
+    fn base_change_in_editor_is_deferred_to_the_main_loop() {
+        let editor = EditorLink::default();
+        editor.enter(
+            None,
+            Status {
+                version: "0.1.0".into(),
+                pid: 7,
+                backend: "jj".into(),
+                workspace_root: "/tmp/repo".into(),
+                workspace_revision: "abc123".into(),
+                base: "@-".into(),
+                scope: "range".into(),
+                loading_base: None,
+                load_error: None,
+                files: Vec::new(),
+                surface: Surface::Recto,
+                capabilities: Capabilities::recto(),
+                focus: false,
+                annotations: 0,
+                tour: false,
+                tour_sections: 0,
+                page: String::new(),
+                comments_visible: true,
+                pending_comments: 0,
+                draft_comments: 0,
+                draft_body: false,
+                pull_request: None,
+                stale_review: false,
+            },
+        );
+        let (tx, rx) = mpsc::channel::<Incoming>();
+
+        let response = handle_while_in_editor(
+            &Request::SetBase {
+                revision: "trunk()".into(),
+            },
+            &tx,
+            &editor,
+        );
+
+        assert!(response.ok);
+        assert!(
+            response.status.is_none(),
+            "the base cannot load while parked"
+        );
+        assert!(
+            response
+                .note
+                .as_deref()
+                .is_some_and(|note| note.contains("when you return"))
+        );
+        assert!(matches!(
+            rx.try_recv().expect("base request queued").request,
+            Request::SetBase { revision } if revision == "trunk()"
+        ));
     }
 
     /// Pin the comment wire shape alongside `annotate`'s: reviewers reach this
@@ -1307,6 +1397,8 @@ mod tests {
                 workspace_revision: "abc123".into(),
                 base: "@-".into(),
                 scope: "range".into(),
+                loading_base: None,
+                load_error: None,
                 files: vec!["a.rs".into()],
                 surface: Surface::Recto,
                 capabilities: Capabilities::recto(),

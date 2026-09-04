@@ -327,6 +327,13 @@ pub(crate) struct App {
     pub(crate) backend: Arc<dyn Backend>,
     pub(crate) bases: Vec<Base>,
     pub(crate) base_idx: usize,
+    /// Base whose diff is actually installed in `changes`/`rendered`. During
+    /// an asynchronous retarget `base_idx` already names the requested base,
+    /// so companion status needs this separate, settled value.
+    pub(crate) loaded_base: Base,
+    /// Scope whose diff is actually installed. Like `loaded_base`, this stays
+    /// put until the worker result lands.
+    pub(crate) loaded_scope: Scope,
     /// Index into `revs` of the row being considered as a new base, while the
     /// `b` picker is up. `None` when not picking. Deliberately separate from
     /// `cursor`; see `begin_base_pick`.
@@ -498,9 +505,10 @@ impl App {
             0
         };
         let fixed_bases = bases.len();
+        let loaded_base = bases[base_idx].clone();
         let initial_req = DiffRequest {
             generation: 0,
-            scope: Scope::Range(bases[base_idx].clone()),
+            scope: Scope::Range(loaded_base.clone()),
             ignore_ws: false,
         };
         let loaded = load_diff(&*backend, &hl, &initial_req)?;
@@ -537,6 +545,8 @@ impl App {
             backend,
             bases,
             base_idx,
+            loaded_base,
+            loaded_scope: initial_req.scope,
             base_pick: None,
             fixed_bases,
             revs,
@@ -916,6 +926,7 @@ impl App {
                 Err(error) => {
                     self.loading = None;
                     self.load_error = Some(error.to_string());
+                    self.restore_loaded_selection();
                 }
             }
             if self.reload_pending {
@@ -924,6 +935,30 @@ impl App {
             }
         }
         changed
+    }
+
+    /// A requested base/cursor becomes the navigation target before its diff
+    /// finishes loading. If that load fails, put the controls back on the
+    /// scope whose rows are still on screen instead of leaving the header and
+    /// future reloads pointed at a view that never landed.
+    fn restore_loaded_selection(&mut self) {
+        self.bases.truncate(self.fixed_bases);
+        self.base_idx = match self.bases.iter().position(|base| base == &self.loaded_base) {
+            Some(index) => index,
+            None => {
+                self.bases.push(self.loaded_base.clone());
+                self.bases.len() - 1
+            }
+        };
+        self.cursor = match &self.loaded_scope {
+            Scope::Range(_) => Cursor::All,
+            Scope::Rev(id) => self
+                .revs
+                .iter()
+                .position(|rev| &rev.id == id)
+                .map(Cursor::Rev)
+                .unwrap_or(Cursor::All),
+        };
     }
 
     /// Whether time alone can change the next frame. Static screens redraw
@@ -955,11 +990,13 @@ impl App {
         // survive a reshuffle, so drop it rather than point it at a stale line.
         self.diff_cursor = None;
         self.last_review_click = None;
-        if let Scope::Range(base) = &scope
-            && let Some(i) = self.bases.iter().position(|b| b == base)
-        {
-            self.base_idx = i;
+        if let Scope::Range(base) = &scope {
+            self.loaded_base = base.clone();
+            if let Some(i) = self.bases.iter().position(|b| b == base) {
+                self.base_idx = i;
+            }
         }
+        self.loaded_scope = scope;
         if let Some(revs) = loaded.revs {
             self.revs = revs;
             if let Cursor::Rev(i) = self.cursor
@@ -2179,6 +2216,44 @@ mod tests {
         assert_eq!(app.base(), &Base::Revision("stack-base".into()));
         assert!(matches!(app.page, Page::PullRequest));
         assert!(app.loading.is_some());
+    }
+
+    #[test]
+    fn companion_base_reports_the_loaded_diff_until_retarget_settles() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let response = app.handle_request(link::Request::SetBase {
+            revision: "other".into(),
+        });
+
+        let loading = response.status.expect("retarget status");
+        assert_eq!(loading.base, "base");
+        assert_eq!(loading.loading_base.as_deref(), Some("other"));
+
+        settle_load(&mut app);
+        let settled = app.status();
+        assert_eq!(settled.base, "other");
+        assert_eq!(settled.scope, "range");
+        assert!(settled.loading_base.is_none());
+        assert!(settled.load_error.is_none());
+    }
+
+    #[test]
+    fn failed_companion_base_keeps_the_loaded_diff_and_reports_the_error() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
+        backend.fail.store(true, Ordering::SeqCst);
+        let response = app.handle_request(link::Request::SetBase {
+            revision: "missing".into(),
+        });
+
+        assert!(response.ok, "the background load was accepted");
+        settle_load(&mut app);
+        let status = app.status();
+        assert_eq!(status.base, "base");
+        assert_eq!(app.base(), &Base::Revision("base".into()));
+        assert!(status.loading_base.is_none());
+        assert_eq!(status.load_error.as_deref(), Some("synthetic load failure"));
     }
 
     #[test]

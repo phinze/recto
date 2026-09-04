@@ -22,6 +22,7 @@ beside its task-level agent. When `RIG_BASEDIR` is set, route every command
 through Rig and name the repo subdirectory from the generated rig instructions:
 
     rig recto cloud ping
+    rig recto cloud base 'trunk()'
     rig recto cloud focus src/app.rs:42-58
     rig recto brand annotate 'docs/index.md:10=Update the headline'
     rig recto cloud notes
@@ -42,6 +43,7 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto focus PATH:START-END   # highlight lines START..END
     recto focus PATH:LINE        # highlight a single line
     recto focus PATH             # scroll to the file, no line span
+    recto base REVSET            # retarget the diff and wait for it to load
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
     recto tour < FILE            # lay down a literate tour (Markdown on stdin)
     recto tour BODY              # the same, as an argument; empty removes it
@@ -67,6 +69,13 @@ workspace-lifecycle request from the user.
 PATH is relative to anywhere in the workspace (recto normalizes it to
 the repo root). Line numbers are **new-side**: the line numbers in the
 post-change file, the ones you'd see in your editor after the edit.
+
+`base` accepts the same backend-native value as startup's `--base`: a jj
+revset such as `@-` or `fork_point(trunk() | @)`, or a git ref such as `HEAD`.
+Against the live Recto surface the command returns only after the new range is
+on screen, so a following `focus` or `annotate` cannot race the old diff. While
+Recto is parked in an editor, the command queues the retarget and says that it
+will apply when the user returns.
 
 recto shows one surface at a time, and a tab strip across the top says which
 ones exist right now. The diff is always there, a tour appears once one is laid
@@ -352,8 +361,10 @@ exception: its scope is the workspace, not the current diff.
   or "outside any shown hunk" (the file is in the diff but those lines
   aren't part of a changed hunk). For `annotate` this means *no* site
   resolved. For `tour-focus` it means the tour has no such section, and the
-  error names how many it has. If you expected the file to be there, the user
-  may need to pick a different base with `b`; tell them, don't retry blindly.
+  error names how many it has. A failed `base` command also exits 1 with the
+  backend's load error. If you know the intended base, retarget with `base` and
+  retry once. Do not guess a succession of broader bases just to make a target
+  appear.
 - **exit 2** — no recto is listening for this workspace (or you're not
   in a repo). Don't keep trying; just describe the change in text.
 
@@ -399,6 +410,11 @@ shows. It bounds commands only when their capability scope is `current_diff`.
 When focus scope is `workspace`, a path absent from `files` is still a valid
 focus target. `scope` is `"range"` for the whole base diff or `"rev"` when
 narrowed to a single revision.
+
+During a background range load, `base` and `files` continue to describe the
+settled diff and `loading_base` names the requested target. If that load fails,
+`loading_base` disappears and `load_error` carries the backend error. Both
+fields are absent in the ordinary settled state and in older versions.
 
 `pending_comments` is the backward-compatible wire field that tells you the user left agent notes. They have no
 way to push into your session, so a ping you were already going to run is the

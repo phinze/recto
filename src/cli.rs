@@ -8,6 +8,7 @@
 
 use std::io;
 use std::path::Path;
+use std::time::{Duration, Instant};
 
 use anyhow::{Result, anyhow};
 use clap::{Subcommand, ValueEnum};
@@ -23,6 +24,9 @@ pub(crate) enum ClientCommand {
         #[command(subcommand)]
         command: StateCommand,
     },
+    /// Retarget the running diff to a jj revset or git ref. Waits for the new
+    /// range to finish loading before returning.
+    Base { revision: String },
     /// Focus a file or span in the running recto. PATHSPEC is `path`,
     /// `path:LINE`, or `path:START-END` (new-side line numbers).
     Focus { pathspec: String },
@@ -119,8 +123,28 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             return 2;
         }
     };
+    let requested_base = match &command {
+        ClientCommand::Base { revision } => Some(revision.as_str()),
+        _ => None,
+    };
     match link::send(&socket, &request) {
         Ok(resp) if resp.ok => {
+            if let Some(revision) = requested_base {
+                // A live TUI returns its status so this client can wait for the
+                // asynchronous diff load. An editor-handoff response has no
+                // status because the main loop cannot load until it resumes;
+                // its note makes that deferral explicit instead.
+                if let Some(status) = resp.status
+                    && let Err((code, error)) = wait_for_base(&socket, revision, status)
+                {
+                    eprintln!("recto: {error}");
+                    return code;
+                }
+                if let Some(note) = resp.note {
+                    eprintln!("recto: {note}");
+                }
+                return 0;
+            }
             // Status (from `ping`) is the machine-readable payload: emit it as
             // JSON on stdout, keeping human notes on stderr so a script can read
             // one without the other.
@@ -184,6 +208,62 @@ fn run_state_command(command: &StateCommand) -> i32 {
     }
 }
 
+/// Wait until a live viewer has installed the requested range. `base` requests
+/// start a background load so the TUI stays responsive; hiding that detail in
+/// the CLI keeps the next companion command from racing the old diff.
+fn wait_for_base(
+    socket: &Path,
+    revision: &str,
+    mut status: link::Status,
+) -> std::result::Result<(), (i32, String)> {
+    let deadline = Instant::now() + Duration::from_secs(30);
+    loop {
+        if status.scope == "range" && status.base == revision && status.loading_base.is_none() {
+            return Ok(());
+        }
+
+        match status.loading_base.as_deref() {
+            Some(base) if base == revision => {}
+            Some(base) => {
+                return Err((
+                    1,
+                    format!("base retarget to {revision} was superseded by {base}"),
+                ));
+            }
+            None => {
+                return Err((
+                    1,
+                    status.load_error.unwrap_or_else(|| {
+                        format!("base retarget to {revision} did not reach the current diff")
+                    }),
+                ));
+            }
+        }
+
+        if Instant::now() >= deadline {
+            return Err((1, format!("timed out loading base {revision}")));
+        }
+        std::thread::sleep(Duration::from_millis(50));
+        let response = link::send(socket, &link::Request::Ping)
+            .map_err(|error| (2, format!("could not check base retarget: {error}")))?;
+        if !response.ok {
+            return Err((
+                1,
+                format!(
+                    "could not check base retarget: {}",
+                    response.error.unwrap_or_else(|| "request refused".into())
+                ),
+            ));
+        }
+        status = response.status.ok_or_else(|| {
+            (
+                2,
+                "could not check base retarget: recto ping returned no status".into(),
+            )
+        })?;
+    }
+}
+
 /// Turn a CLI subcommand into a wire [`link::Request`], normalizing focus paths
 /// to workspace-root-relative so the agent can pass whatever form it used.
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
@@ -191,6 +271,9 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         ClientCommand::State { .. } => {
             Err(anyhow!("state commands do not use the workspace socket"))
         }
+        ClientCommand::Base { revision } => Ok(link::Request::SetBase {
+            revision: revision.clone(),
+        }),
         ClientCommand::Ping => Ok(link::Request::Ping),
         ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
             pull_request: Box::new(github::fetch_pull_request(locator)?),
@@ -377,6 +460,19 @@ fn normalize_path(cwd: &Path, root: &Path, raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn base_command_carries_the_revision() {
+        let request = build_request(&ClientCommand::Base {
+            revision: "@--".into(),
+        })
+        .unwrap();
+
+        assert!(matches!(
+            request,
+            link::Request::SetBase { revision } if revision == "@--"
+        ));
+    }
 
     #[test]
     fn review_body_command_preserves_markdown() {

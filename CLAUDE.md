@@ -45,9 +45,10 @@ and `]` / `[` to move between sections, and the status line naming the section
 in view. `u` steps back up a level from anywhere.
 
 The editor handoff and workspace socket make Recto a shared review surface for
-the user and a companion agent. Either side can focus code, the agent can lay
-down an annotated tour or a literate one, and the user can leave private agent
-notes or co-author a local GitHub review draft. A literate tour is Markdown
+the user and a companion agent. Either side can focus code, the agent can
+retarget the diff base or lay down an annotated or literate tour, and the user
+can leave private agent notes or co-author a local GitHub review draft. A
+literate tour is Markdown
 whose headings become sections and whose fenced `recto PATH:SPAN` blocks become
 pull quotes lifted from the diff; a quote opens the full diff at its span and
 `u` comes back. Public PR descriptions and conversations can be attached as
