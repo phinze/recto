@@ -867,9 +867,9 @@ struct App {
     tour_max_scroll: usize,
     tour_sections: Vec<(String, usize)>,
     tour_outline_area: Rect,
-    /// Visual-row range of each rendered pull quote, with the span it names,
-    /// so a click in the tour body can find the code it points at.
-    tour_quotes: Vec<(Range<usize>, String)>,
+    /// Every pull quote as the last draw laid it out, so a click in the tour
+    /// body can find the code it points at.
+    tour_quotes: Vec<QuoteSpan>,
     tour_body_area: Rect,
     /// Where each of the tour's quotes points. Derived from `tour`, refreshed
     /// with it, and independent of any draw.
@@ -3130,8 +3130,8 @@ impl App {
         let spec = self
             .tour_quotes
             .iter()
-            .find(|(rows, _)| rows.end > self.tour_scroll)
-            .map(|(_, spec)| spec.clone());
+            .find(|quote| quote.rows.end > self.tour_scroll)
+            .map(|quote| quote.spec.clone());
         match spec {
             Some(spec) => self.open_quote(&spec),
             None => link::Response::err("no pull quote below here"),
@@ -4585,11 +4585,20 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             // add the scroll offset to reach the document row under the cursor.
             let clicked =
                 usize::from(m.row.saturating_sub(app.tour_body_area.y + 1)) + app.tour_scroll;
+            // Content starts past the border and the block's padding.
+            let content_x = app.tour_body_area.x + 2;
             let spec = app
                 .tour_quotes
                 .iter()
-                .find(|(rows, _)| rows.contains(&clicked))
-                .map(|(_, spec)| spec.clone());
+                .find(|quote| quote.rows.contains(&clicked))
+                // A label row goes to the source end to end; a code row only
+                // where its line number is, so the code stays readable with a
+                // mouse resting on it.
+                .filter(|quote| {
+                    clicked < quote.code
+                        || (m.column >= content_x && m.column < content_x + quote.gutter)
+                })
+                .map(|quote| quote.spec.clone());
             if let Some(spec) = spec {
                 app.open_quote(&spec);
                 return;
@@ -5313,7 +5322,18 @@ impl Document {
             quotes: self
                 .quotes
                 .iter()
-                .map(|(range, spec)| (at(range.start)..at(range.end), spec.clone()))
+                .map(|(range, spec)| {
+                    // The label is the quote's first source row; everything
+                    // after it is lifted code, and leads with the gutter the
+                    // click has to land on.
+                    let first_code = range.start + 1;
+                    QuoteSpan {
+                        rows: at(range.start)..at(range.end),
+                        code: at(first_code.min(range.end)),
+                        gutter: hang.get(first_code).copied().flatten().unwrap_or(0) as u16,
+                        spec: spec.clone(),
+                    }
+                })
                 .collect(),
             rows,
         }
@@ -5325,7 +5345,19 @@ impl Document {
 struct WrappedDocument {
     rows: Vec<Line<'static>>,
     sections: Vec<(String, usize)>,
-    quotes: Vec<(Range<usize>, String)>,
+    quotes: Vec<QuoteSpan>,
+}
+
+/// A pull quote as drawn, and what part of it is a click target. `rows` covers
+/// the whole block; `code` is where the lifted source starts, so the rows
+/// before it are the label. On a code row only the `gutter` columns count —
+/// reading the code itself shouldn't navigate.
+#[derive(Clone, Debug)]
+struct QuoteSpan {
+    rows: Range<usize>,
+    code: usize,
+    gutter: u16,
+    spec: String,
 }
 
 /// The section a reader is inside: the last one whose heading has scrolled to
@@ -5391,7 +5423,7 @@ struct DocumentLayout {
     max_scroll: usize,
     sections: Vec<(String, usize)>,
     outline_area: Rect,
-    quotes: Vec<(Range<usize>, String)>,
+    quotes: Vec<QuoteSpan>,
     body_area: Rect,
 }
 
@@ -6121,7 +6153,10 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("shift-1..9", "switch to that tab"),
     bind("left click", "switch screens on the tab strip"),
     bind("enter", "open the next tour pull quote in the diff"),
-    bind("left click", "open a tour pull quote in the diff"),
+    bind(
+        "left click",
+        "open a tour quote: its label, or a code gutter",
+    ),
     bind("w", "toggle line wrap"),
     bind("W", "toggle ignore whitespace"),
     head("Focus"),
@@ -7477,8 +7512,11 @@ mod tests {
         load_diff_fixture(&mut app, WIDE_DIFF);
 
         let wrapped = tour_document("## Step\n\n```recto foo.go:2\n```\n", &app).wrap(40);
-        let (rows, _) = wrapped.quotes[0].clone();
-        let text: Vec<String> = wrapped.rows[rows].iter().map(Line::to_string).collect();
+        let quote = wrapped.quotes[0].clone();
+        let text: Vec<String> = wrapped.rows[quote.rows]
+            .iter()
+            .map(Line::to_string)
+            .collect();
 
         // Label, the code row, and at least one continuation of it.
         assert!(text.len() > 2, "{text:#?}");
@@ -7512,17 +7550,37 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         assert_eq!(app.tour_quotes.len(), 1);
-        let (rows, spec) = app.tour_quotes[0].clone();
-        assert_eq!(spec, "foo.go:111");
+        let quote = app.tour_quotes[0].clone();
+        assert_eq!(quote.spec, "foo.go:111");
         // Label row plus at least one lifted diff row.
-        assert!(rows.len() > 1, "the quote expanded to real diff rows");
+        assert!(quote.rows.len() > 1, "the quote expanded to real diff rows");
+        assert!(quote.gutter > 0, "lifted rows carry a line-number gutter");
 
-        // Click the quote's own label row, inside the body block.
-        let x = app.tour_body_area.x + 2;
-        let y = app.tour_body_area.y + 1 + rows.start as u16;
-        handle_mouse(&mut app, left_click(x, y));
+        // Content starts past the border and the block's padding; the first
+        // body row sits one below the border.
+        let content_x = app.tour_body_area.x + 2;
+        let code_y = app.tour_body_area.y + 1 + quote.code as u16;
 
-        assert_eq!(app.page, Page::Diff, "a quote drills into the full diff");
+        // Resting the mouse on the code and clicking is how a reader loses
+        // their place, so the code is not a target.
+        handle_mouse(&mut app, left_click(content_x + quote.gutter, code_y));
+        assert_eq!(app.page, Page::Tour, "the code itself does not navigate");
+
+        // The gutter beside it does.
+        handle_mouse(&mut app, left_click(content_x + quote.gutter - 1, code_y));
+        assert_eq!(app.page, Page::Diff, "a quote gutter drills into the diff");
+        assert!(app.return_to_tour());
+
+        // And so does the label row, end to end, so the affordance is
+        // findable without hunting for the narrow band.
+        let label_y = app.tour_body_area.y + 1 + quote.rows.start as u16;
+        handle_mouse(&mut app, left_click(content_x + quote.gutter + 4, label_y));
+
+        assert_eq!(
+            app.page,
+            Page::Diff,
+            "a quote label drills into the full diff"
+        );
         assert_eq!(
             app.focus_span
                 .as_ref()
