@@ -7,6 +7,7 @@
 //! `pub(crate)` and is the module's whole API.
 
 pub(crate) mod diff;
+pub(crate) mod document;
 pub(crate) mod panes;
 
 use ratatui::style::{Modifier, Style};
