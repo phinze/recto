@@ -798,9 +798,10 @@ mod tests {
     use textwrap::core::display_width;
 
     use super::*;
+    use crate::draw;
     use crate::highlight::Highlighter;
+    use crate::input::handle_mouse;
     use crate::testing::*;
-    use crate::{draw, handle_mouse};
 
     /// A quoted line wider than the page hangs under the code it continues
     /// and carries the diff pane's wrap cue. Flowing back to the margin would
