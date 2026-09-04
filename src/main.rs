@@ -5270,42 +5270,62 @@ impl Document {
         self.lines.extend(lines);
     }
 
-    /// Visual-row range of each quote at `width`, for hit-testing a click.
-    /// Quotes are recorded in document order, so one walk resolves them all.
-    fn quote_spans(&self, width: u16) -> Vec<(Range<usize>, String)> {
-        let mut spans = Vec::with_capacity(self.quotes.len());
-        let mut row = 0usize;
-        let mut visual = 0usize;
-        let advance = |row: &mut usize, visual: &mut usize, until: usize| {
-            while *row < until {
-                *visual += wrap::row_count(&self.lines[*row], width, 0);
-                *row += 1;
+    /// Lay the document out at `width`: the visual rows to render, and the
+    /// offsets the outline rail and quote hit-testing address them by.
+    ///
+    /// Prose flows back to the margin the way a paragraph should. A quote's
+    /// rows hang behind their own gutter instead, which is why the wrap
+    /// happens here rather than inside `Paragraph`: ratatui would drop every
+    /// continuation to column 0 and give no sign it was one.
+    fn wrap(&self, width: u16) -> WrappedDocument {
+        let mut hang = vec![None; self.lines.len()];
+        for (range, _) in &self.quotes {
+            for row in range.clone() {
+                // Every quote row leads with its gutter span — the label's
+                // indent, or the line-number column — so the code hangs
+                // exactly where it started.
+                hang[row] = self.lines[row].spans.first().map(Span::width);
             }
-        };
-        for (range, spec) in &self.quotes {
-            advance(&mut row, &mut visual, range.start);
-            let start = visual;
-            advance(&mut row, &mut visual, range.end);
-            spans.push((start..visual, spec.clone()));
         }
-        spans
-    }
 
-    /// Title and first visual row of each section at `width`. Sections are
-    /// recorded in document order, so one walk over the lines resolves them all.
-    fn outline(&self, width: u16) -> Vec<(String, usize)> {
-        let mut outline = Vec::with_capacity(self.sections.len());
-        let mut row = 0usize;
-        let mut visual = 0usize;
-        for section in &self.sections {
-            while row < section.row {
-                visual += wrap::row_count(&self.lines[row], width, 0);
-                row += 1;
+        let mut rows: Vec<Line<'static>> = Vec::with_capacity(self.lines.len());
+        // Where each source row begins, plus a sentinel so a range ending at
+        // the last line still resolves.
+        let mut starts = Vec::with_capacity(self.lines.len() + 1);
+        for (i, line) in self.lines.iter().enumerate() {
+            starts.push(rows.len());
+            match hang[i] {
+                Some(indent) => {
+                    rows.extend(wrap::wrap_line(line, width, &wrap::indent_prefix(indent)))
+                }
+                None => rows.extend(wrap::wrap_line(line, width, &[])),
             }
-            outline.push((section.title.clone(), visual));
         }
-        outline
+        starts.push(rows.len());
+        let at = |row: usize| starts.get(row).copied().unwrap_or(rows.len());
+
+        WrappedDocument {
+            sections: self
+                .sections
+                .iter()
+                .map(|section| (section.title.clone(), at(section.row)))
+                .collect(),
+            quotes: self
+                .quotes
+                .iter()
+                .map(|(range, spec)| (at(range.start)..at(range.end), spec.clone()))
+                .collect(),
+            rows,
+        }
     }
+}
+
+/// A document laid out at one width. `sections` and `quotes` index `rows`, so
+/// a rail jump and a click hit-test both address exactly what was drawn.
+struct WrappedDocument {
+    rows: Vec<Line<'static>>,
+    sections: Vec<(String, usize)>,
+    quotes: Vec<(Range<usize>, String)>,
 }
 
 /// The section a reader is inside: the last one whose heading has scrolled to
@@ -5399,17 +5419,17 @@ fn draw_document(
         (Rect::default(), area)
     };
 
-    let inner_width = body_area.width.saturating_sub(2);
+    // Borders take two columns and the block's horizontal padding two more.
+    // Offsets resolve against the same rows the body renders, so a jump lands
+    // the heading exactly where the rail says it is.
+    let inner_width = body_area.width.saturating_sub(4);
     let inner_height = body_area.height.saturating_sub(2) as usize;
-    let visual_rows: usize = document
-        .lines
-        .iter()
-        .map(|line| wrap::row_count(line, inner_width, 0))
-        .sum();
-    // Offsets resolve against the same width the body wraps at, so a jump
-    // lands the heading exactly where the rail says it is.
-    let sections = document.outline(inner_width);
-    let quotes = document.quote_spans(inner_width);
+    let WrappedDocument {
+        rows,
+        sections,
+        quotes,
+    } = document.wrap(inner_width);
+    let visual_rows = rows.len();
     // A section listed in the rail but impossible to scroll to is a dead
     // control, which is what a document shorter than its viewport used to
     // produce: content overflow is zero, so every jump clamped back to the
@@ -5436,9 +5456,8 @@ fn draw_document(
             Style::default().fg(theme::TEAL),
         ));
     frame.render_widget(
-        Paragraph::new(document.lines)
+        Paragraph::new(rows)
             .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
-            .wrap(Wrap { trim: false })
             .scroll((scroll.min(u16::MAX as usize) as u16, 0)),
         body_area,
     );
@@ -5500,16 +5519,22 @@ fn quote_rows(app: &App, spec: &str) -> Option<Vec<Line<'static>>> {
 fn tour_document(source: &str, app: &App) -> Document {
     let mut quote = |spec: &str| {
         let spec = spec.trim();
-        let mut rows = vec![Line::from(Span::styled(
-            format!("  {spec}"),
-            Style::default().fg(theme::OVERLAY0),
-        ))];
+        let dim = Style::default().fg(theme::OVERLAY0);
+        // The label's indent is its own span, so `Document::wrap` can hang a
+        // long pathspec behind it the way it hangs the code below.
+        let mut rows = vec![Line::from(vec![
+            Span::styled("  ", dim),
+            Span::styled(spec.to_string(), dim),
+        ])];
         match quote_rows(app, spec) {
             Some(quoted) => rows.extend(quoted),
             // Tours outlive the diff they were written against. Say so in
             // place: a quote that vanished would leave prose pointing at
             // nothing, with no hint that anything was missing.
-            None => rows.push(dim_line("  not in this diff")),
+            None => rows.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::styled("not in this diff", dim),
+            ])),
         }
         rows
     };
@@ -7003,6 +7028,7 @@ mod tests {
     use super::*;
     use std::sync::Mutex;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use textwrap::core::display_width;
 
     struct TestBackend {
         loads: AtomicUsize,
@@ -7422,18 +7448,54 @@ mod tests {
     /// Put a real rendered diff under an app built on the empty `TestBackend`,
     /// so spans have somewhere to resolve.
     fn load_sample_diff(app: &mut App) {
+        load_diff_fixture(app, TWO_HUNK_DIFF);
+    }
+
+    fn load_diff_fixture(app: &mut App, diff: &str) {
         let changes = vec![FileChange {
             path: "foo.go".into(),
             status: FileStatus::Modified,
         }];
         let fetch: Box<FetchContent> = Box::new(|_| None);
-        let rendered = render_diff(TWO_HUNK_DIFF, &changes, &Highlighter::new(), &*fetch);
+        let rendered = render_diff(diff, &changes, &Highlighter::new(), &*fetch);
         app.changes = changes;
         app.base_rendered = rendered.lines;
         app.base_file_starts = rendered.file_starts;
         app.base_line_info = rendered.line_info;
         app.file_stats = rendered.file_stats;
         app.reweave();
+    }
+
+    /// A quoted line wider than the page hangs under the code it continues
+    /// and carries the diff pane's wrap cue. Flowing back to the margin would
+    /// park continuations under the line numbers, where they read as source
+    /// rows of their own.
+    #[test]
+    fn a_long_quoted_line_hangs_under_its_code() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_diff_fixture(&mut app, WIDE_DIFF);
+
+        let wrapped = tour_document("## Step\n\n```recto foo.go:2\n```\n", &app).wrap(40);
+        let (rows, _) = wrapped.quotes[0].clone();
+        let text: Vec<String> = wrapped.rows[rows].iter().map(Line::to_string).collect();
+
+        // Label, the code row, and at least one continuation of it.
+        assert!(text.len() > 2, "{text:#?}");
+        assert!(text[1].starts_with("  2  "), "{text:#?}");
+        for row in &text[2..] {
+            assert!(
+                row.starts_with("     ↪ "),
+                "continuation lost its hanging gutter: {row:?}"
+            );
+        }
+        for row in &text {
+            assert!(display_width(row) <= 40, "row overflows the page: {row:?}");
+        }
+        assert!(
+            text.last().is_some_and(|row| row.ends_with("mike")),
+            "{text:#?}"
+        );
     }
 
     #[test]
@@ -7957,7 +8019,7 @@ mod tests {
         doc.section("Second");
         doc.push(Line::raw("c"));
 
-        let outline = doc.outline(80);
+        let outline = doc.wrap(80).sections;
         assert_eq!(outline[0], ("First".to_string(), 0));
         // heading, rule, two body rows, then the blank that separates sections.
         assert_eq!(outline[1], ("Second".to_string(), 5));
@@ -9364,6 +9426,18 @@ index 1111111..2222222 100644
 +added at new line 111
  ctx at new line 112
  ctx at new line 113
+";
+
+    /// One added line far wider than any page, for wrap behavior.
+    const WIDE_DIFF: &str = "\
+diff --git a/foo.go b/foo.go
+index 1111111..2222222 100644
+--- a/foo.go
++++ b/foo.go
+@@ -1,2 +1,3 @@
+ ctx a
++alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike
+ ctx b
 ";
 
     #[test]

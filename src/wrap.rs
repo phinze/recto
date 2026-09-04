@@ -62,6 +62,17 @@ pub fn note_prefix(line: &Line<'static>) -> Vec<Span<'static>> {
     ]
 }
 
+/// Continuation prefix for a row that hangs at a fixed column: `width` blank
+/// columns then the same wrap cue every other continuation carries. Pull
+/// quotes use this to hang their code under itself rather than under the line
+/// numbers beside it.
+pub fn indent_prefix(width: usize) -> Vec<Span<'static>> {
+    vec![
+        Span::raw(" ".repeat(width)),
+        Span::styled(CONTINUATION, Style::default().fg(theme::OVERLAY0)),
+    ]
+}
+
 /// Wrap a styled line to `width` columns, hanging continuations behind
 /// `prefix`. The first row keeps the line's own leading spans; continuation
 /// rows start with `prefix` and the text resumes where the break landed.
