@@ -17,6 +17,7 @@ use crate::App;
 use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope};
 use crate::diff::{FetchContent, Gutter, diff_body_line, render_diff};
 use crate::highlight::Highlighter;
+use crate::link;
 
 pub(crate) struct TestBackend {
     pub(crate) loads: AtomicUsize,
@@ -165,3 +166,24 @@ index 1111111..2222222 100644
 +alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike
  ctx b
 ";
+
+pub(crate) fn empty_pull_request(base_oid: &str) -> link::PullRequest {
+    link::PullRequest {
+        repository: "owner/repo".into(),
+        number: 42,
+        title: "Review me".into(),
+        body: String::new(),
+        author: link::Actor {
+            login: "author".into(),
+            name: None,
+        },
+        base_ref: "main".into(),
+        base_oid: base_oid.into(),
+        head_ref: "feature".into(),
+        head_oid: "abc123".into(),
+        url: "https://github.com/owner/repo/pull/42".into(),
+        conversation: Vec::new(),
+        reviews: Vec::new(),
+        threads: Vec::new(),
+    }
+}

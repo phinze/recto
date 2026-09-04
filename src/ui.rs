@@ -6,6 +6,7 @@
 //! its entry point, and the geometry a click is resolved against — is marked
 //! `pub(crate)` and is the module's whole API.
 
+pub(crate) mod chrome;
 pub(crate) mod diff;
 pub(crate) mod document;
 pub(crate) mod overlay;
