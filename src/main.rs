@@ -8,6 +8,8 @@ mod highlight;
 mod link;
 mod markdown;
 mod state;
+#[cfg(test)]
+mod testing;
 mod theme;
 mod ui;
 mod watch;
@@ -45,7 +47,7 @@ use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope, detect_b
 use crate::cli::{ClientCommand, run_client};
 use crate::diff::{FetchContent, LineInfo, render_diff};
 #[cfg(test)]
-use crate::diff::{Gutter, augment_hunk_header, diff_body_line, hunk_header, parse_hunk_starts};
+use crate::diff::{augment_hunk_header, hunk_header, parse_hunk_starts};
 use crate::ui::diff::{
     SNIPPET_CONTEXT, agent_note_index_at, agent_note_line, badge, body_text, draw_diff,
     gutter_signature, note_line, review_draft_line, review_thread_line, review_thread_span,
@@ -5981,79 +5983,9 @@ fn draw_help(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
-    use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+    use crate::testing::*;
+    use std::sync::atomic::Ordering;
     use textwrap::core::display_width;
-
-    struct TestBackend {
-        loads: AtomicUsize,
-        fail: AtomicBool,
-        revision: Mutex<String>,
-    }
-
-    impl TestBackend {
-        fn new() -> Self {
-            Self {
-                loads: AtomicUsize::new(0),
-                fail: AtomicBool::new(false),
-                revision: Mutex::new("abc123".into()),
-            }
-        }
-
-        fn set_revision(&self, revision: &str) {
-            *self.revision.lock().unwrap() = revision.into();
-        }
-    }
-
-    impl Backend for TestBackend {
-        fn root(&self) -> &Path {
-            Path::new(".")
-        }
-
-        fn kind(&self) -> &'static str {
-            "test"
-        }
-
-        fn workspace_revision(&self) -> Result<String> {
-            Ok(self.revision.lock().unwrap().clone())
-        }
-
-        fn base_label(&self, base: &Base) -> String {
-            match base {
-                Base::Revision(revision) => revision.clone(),
-                Base::MergeBase { against } => format!("merge({})", self.base_label(against)),
-            }
-        }
-
-        fn base_display(&self, base: &Base) -> String {
-            self.base_label(base)
-        }
-
-        fn list_changes(&self, _scope: &Scope, _ignore_ws: bool) -> Result<Vec<FileChange>> {
-            self.loads.fetch_add(1, Ordering::SeqCst);
-            if self.fail.load(Ordering::SeqCst) {
-                Err(anyhow!("synthetic load failure"))
-            } else {
-                Ok(Vec::new())
-            }
-        }
-
-        fn unified_diff(&self, _scope: &Scope, _ignore_ws: bool) -> Result<String> {
-            Ok(String::new())
-        }
-
-        fn list_revs(&self, _base: &Base) -> Result<Vec<Rev>> {
-            Ok(Vec::new())
-        }
-
-        fn default_bases(&self) -> Vec<Base> {
-            vec![Base::Revision("base".into())]
-        }
-
-        fn file_content(&self, _rev: &str, _path: &str) -> Result<String> {
-            Ok(String::new())
-        }
-    }
 
     fn test_request(generation: u64) -> DiffRequest {
         DiffRequest {
@@ -6159,15 +6091,6 @@ mod tests {
         assert!(app.wrap);
         app.toggle_wrap();
         assert!(!app.wrap);
-    }
-
-    fn left_click(column: u16, row: u16) -> event::MouseEvent {
-        event::MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column,
-            row,
-            modifiers: crossterm::event::KeyModifiers::NONE,
-        }
     }
 
     /// The footer row is now always spoken for: idle it carries status, and a
@@ -6395,30 +6318,6 @@ mod tests {
         assert_eq!(shifted_digit(&key('2', KeyModifiers::SHIFT)), Some(2));
         // A bare digit belongs to the page, not the tab strip.
         assert_eq!(shifted_digit(&key('2', KeyModifiers::NONE)), None);
-    }
-
-    /// The regression this pins: a document shorter than its viewport had no
-    /// scroll range at all, so every badge key and rail click clamped straight
-    /// back to the top while the rail went on looking interactive.
-    /// Put a real rendered diff under an app built on the empty `TestBackend`,
-    /// so spans have somewhere to resolve.
-    fn load_sample_diff(app: &mut App) {
-        load_diff_fixture(app, TWO_HUNK_DIFF);
-    }
-
-    fn load_diff_fixture(app: &mut App, diff: &str) {
-        let changes = vec![FileChange {
-            path: "foo.go".into(),
-            status: FileStatus::Modified,
-        }];
-        let fetch: Box<FetchContent> = Box::new(|_| None);
-        let rendered = render_diff(diff, &changes, &Highlighter::new(), &*fetch);
-        app.changes = changes;
-        app.base_rendered = rendered.lines;
-        app.base_file_starts = rendered.file_starts;
-        app.base_line_info = rendered.line_info;
-        app.file_stats = rendered.file_stats;
-        app.reweave();
     }
 
     /// A quoted line wider than the page hangs under the code it continues
@@ -8101,20 +8000,6 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
         assert_eq!(rows_for_span(&sample_line_info(), 0, 50, 60), None);
     }
 
-    /// Render a body row the way `render_diff` does, so the gutter readers are
-    /// tested against real output rather than a hand-built approximation.
-    fn body_row(line: &str, old_no: Option<u32>, new_no: Option<u32>) -> Line<'static> {
-        diff_body_line(
-            line,
-            "rs",
-            &Highlighter::new(),
-            old_no,
-            new_no,
-            Gutter { old_w: 3, new_w: 3 },
-            None,
-        )
-    }
-
     /// The snippet reader recovers a row's diff sign from which line-number
     /// columns are populated, and quotes the new-side number only. Removed rows
     /// have no new-side number, which is what tells them apart from context.
@@ -8298,40 +8183,6 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             at + DOUBLE_CLICK_WINDOW + Duration::from_millis(1),
         ));
     }
-
-    /// A file with two hunks far apart on the new side. The second hunk's
-    /// header (`+110`) must re-seed the line counter; if it doesn't, every
-    /// line in the second hunk is mislabeled with numbers continuing from the
-    /// first hunk, and `recto focus path:<line-in-hunk-2>` reports "not in
-    /// current diff" — the runner.go / registration.go symptom.
-    const TWO_HUNK_DIFF: &str = "\
-diff --git a/foo.go b/foo.go
-index 1111111..2222222 100644
---- a/foo.go
-+++ b/foo.go
-@@ -1,3 +1,4 @@
- ctx a
-+added at new line 2
- ctx b
- ctx c
-@@ -100,3 +110,4 @@
- ctx at new line 110
-+added at new line 111
- ctx at new line 112
- ctx at new line 113
-";
-
-    /// One added line far wider than any page, for wrap behavior.
-    const WIDE_DIFF: &str = "\
-diff --git a/foo.go b/foo.go
-index 1111111..2222222 100644
---- a/foo.go
-+++ b/foo.go
-@@ -1,2 +1,3 @@
- ctx a
-+alpha bravo charlie delta echo foxtrot golf hotel india juliett kilo lima mike
- ctx b
-";
 
     #[test]
     fn hunk_starts_ignore_section_heading() {
