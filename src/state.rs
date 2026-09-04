@@ -521,7 +521,7 @@ mod tests {
             error: None,
             editing: None,
         };
-        store.set_notes(&[note.clone()], 5);
+        store.set_notes(std::slice::from_ref(&note), 5);
         store.set_note_composer(Some(&note_composer));
 
         let pull_request = PullRequestRef {

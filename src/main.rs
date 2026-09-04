@@ -59,6 +59,10 @@ struct LoadedDiff {
 use crate::highlight::{Highlighter, ext_for_path};
 
 const SCROLLOFF: u16 = 3;
+/// Rows a wheel tick moves a document page. The diff pane has always moved
+/// one row per tick, so anything larger makes the same wheel feel different
+/// depending on which page happens to be showing.
+const WHEEL_STEP: u16 = 1;
 const POLL_INTERVAL: Duration = Duration::from_millis(50);
 const RELOAD_DEBOUNCE: Duration = Duration::from_millis(150);
 const STATE_DEBOUNCE: Duration = Duration::from_millis(150);
@@ -4525,9 +4529,14 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     if app.show_help {
         match m.kind {
             MouseEventKind::ScrollDown => {
-                app.help_scroll = app.help_scroll.saturating_add(3).min(app.help_max_scroll)
+                app.help_scroll = app
+                    .help_scroll
+                    .saturating_add(WHEEL_STEP)
+                    .min(app.help_max_scroll)
             }
-            MouseEventKind::ScrollUp => app.help_scroll = app.help_scroll.saturating_sub(3),
+            MouseEventKind::ScrollUp => {
+                app.help_scroll = app.help_scroll.saturating_sub(WHEEL_STEP)
+            }
             _ => {}
         }
         return;
@@ -4588,9 +4597,12 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         match m.kind {
             MouseEventKind::ScrollDown => {
-                app.tour_scroll = (app.tour_scroll + 3).min(app.tour_max_scroll)
+                app.tour_scroll =
+                    (app.tour_scroll + usize::from(WHEEL_STEP)).min(app.tour_max_scroll)
             }
-            MouseEventKind::ScrollUp => app.tour_scroll = app.tour_scroll.saturating_sub(3),
+            MouseEventKind::ScrollUp => {
+                app.tour_scroll = app.tour_scroll.saturating_sub(usize::from(WHEEL_STEP))
+            }
             _ => {}
         }
         return;
@@ -4617,9 +4629,11 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         match m.kind {
             MouseEventKind::ScrollDown => {
-                app.pr_scroll = (app.pr_scroll + 3).min(app.pr_max_scroll)
+                app.pr_scroll = (app.pr_scroll + usize::from(WHEEL_STEP)).min(app.pr_max_scroll)
             }
-            MouseEventKind::ScrollUp => app.pr_scroll = app.pr_scroll.saturating_sub(3),
+            MouseEventKind::ScrollUp => {
+                app.pr_scroll = app.pr_scroll.saturating_sub(usize::from(WHEEL_STEP))
+            }
             _ => {}
         }
         return;
@@ -4627,9 +4641,12 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     if app.page == Page::ReviewThread {
         match m.kind {
             MouseEventKind::ScrollDown => {
-                app.thread_scroll = (app.thread_scroll + 3).min(app.thread_max_scroll)
+                app.thread_scroll =
+                    (app.thread_scroll + usize::from(WHEEL_STEP)).min(app.thread_max_scroll)
             }
-            MouseEventKind::ScrollUp => app.thread_scroll = app.thread_scroll.saturating_sub(3),
+            MouseEventKind::ScrollUp => {
+                app.thread_scroll = app.thread_scroll.saturating_sub(usize::from(WHEEL_STEP))
+            }
             _ => {}
         }
         return;
