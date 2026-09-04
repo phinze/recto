@@ -187,3 +187,11 @@ pub(crate) fn empty_pull_request(base_oid: &str) -> link::PullRequest {
         threads: Vec::new(),
     }
 }
+
+/// A modified file at `path`, for building change lists.
+pub(crate) fn change(path: &str) -> FileChange {
+    FileChange {
+        path: path.to_string(),
+        status: FileStatus::Modified,
+    }
+}
