@@ -4565,11 +4565,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 y: m.row,
             })
         {
-            if let Some(index) = m
-                .row
-                .saturating_sub(app.tour_outline_area.y)
-                .checked_sub(1)
-                .map(usize::from)
+            if let Some(index) = outline_index_at(&app.tour_sections, app.tour_outline_area, m.row)
             {
                 app.jump_to_section(index);
             }
@@ -4623,13 +4619,7 @@ fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 y: m.row,
             })
         {
-            // The rail is padded one row down so its entries line up with the
-            // body's first content row rather than with its top border.
-            if let Some(index) = m
-                .row
-                .saturating_sub(app.pr_outline_area.y)
-                .checked_sub(1)
-                .map(usize::from)
+            if let Some(index) = outline_index_at(&app.pr_sections, app.pr_outline_area, m.row)
                 && let Some((_, offset)) = app.pr_sections.get(index)
             {
                 app.pr_scroll = (*offset).min(app.pr_max_scroll);
@@ -5386,16 +5376,66 @@ fn section_step(sections: &[(String, usize)], scroll: usize, delta: isize) -> Op
 const OUTLINE_WIDTH: u16 = 24;
 const OUTLINE_MIN_PAGE_WIDTH: u16 = 60;
 
+/// The rail's entries laid out at `width`: badge and title, wrapped rather
+/// than clipped, with continuations hanging under the title. Rows carry no
+/// color of their own so the caller can tint a whole entry at once.
+///
+/// An entry is as tall as its title needs, so the draw and the click
+/// hit-test both come through here rather than each assuming a row apiece.
+fn outline_entries(sections: &[(String, usize)], width: u16) -> Vec<Vec<Line<'static>>> {
+    let mut entries: Vec<Vec<Line<'static>>> = sections
+        .iter()
+        .enumerate()
+        .map(|(i, (title, _))| {
+            let marker = Span::raw(format!("{} ", badge(i + 1)));
+            let indent = Span::raw(" ".repeat(marker.width()));
+            let line = Line::from(vec![marker, Span::raw(title.clone())]);
+            wrap::wrap_line(&line, width, &[indent])
+        })
+        .collect();
+    // Once titles run to several rows the badges stop being enough to tell
+    // entries apart, so give every one a trailing blank. The gap belongs to
+    // the entry above it, which is also where a click in it should land.
+    if entries.iter().any(|entry| entry.len() > 1) {
+        for entry in entries.iter_mut().rev().skip(1) {
+            entry.push(Line::default());
+        }
+    }
+    entries
+}
+
+/// Inner width of the rail, inside its horizontal padding.
+fn outline_width(area: Rect) -> u16 {
+    area.width.saturating_sub(2)
+}
+
+/// Which entry a click at `row` landed on. The rail is padded one row down so
+/// its entries line up with the body's first content row rather than with its
+/// top border.
+fn outline_index_at(sections: &[(String, usize)], area: Rect, row: u16) -> Option<usize> {
+    let mut remaining = usize::from(row.checked_sub(area.y + 1)?);
+    for (i, entry) in outline_entries(sections, outline_width(area))
+        .iter()
+        .enumerate()
+    {
+        if remaining < entry.len() {
+            return Some(i);
+        }
+        remaining -= entry.len();
+    }
+    None
+}
+
 fn draw_outline(
     frame: &mut ratatui::Frame,
     area: Rect,
     sections: &[(String, usize)],
     active: Option<usize>,
 ) {
-    let items: Vec<ListItem> = sections
-        .iter()
+    let items: Vec<ListItem> = outline_entries(sections, outline_width(area))
+        .into_iter()
         .enumerate()
-        .map(|(i, (title, _))| {
+        .map(|(i, rows)| {
             let style = if Some(i) == active {
                 Style::default()
                     .fg(theme::MAUVE)
@@ -5403,10 +5443,8 @@ fn draw_outline(
             } else {
                 Style::default().fg(theme::SUBTEXT0)
             };
-            ListItem::new(Line::from(vec![
-                Span::styled(format!("{} ", badge(i + 1)), style),
-                Span::styled(title.clone(), style),
-            ]))
+            let rows: Vec<Line<'static>> = rows.into_iter().map(|row| row.style(style)).collect();
+            ListItem::new(rows)
         })
         .collect();
     frame.render_widget(
@@ -7534,6 +7572,46 @@ mod tests {
             text.last().is_some_and(|row| row.ends_with("mike")),
             "{text:#?}"
         );
+    }
+
+    /// The rail wraps a long title instead of clipping it, and every row an
+    /// entry occupies — the rows its title spilled onto, and the gap that
+    /// separates it from the next — jumps to that entry's section.
+    #[test]
+    fn a_wrapped_outline_entry_is_clickable_on_every_row() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let terminal_backend = ratatui::backend::TestBackend::new(90, 30);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.handle_request(link::Request::Tour {
+            body: concat!(
+                "## A first section title long enough to wrap the rail\n\nprose\n\n",
+                "## A second section title, also long enough to wrap\n\nmore prose\n",
+            )
+            .into(),
+        });
+        app.page = Page::Tour;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let entries = outline_entries(&app.tour_sections, outline_width(app.tour_outline_area));
+        assert_eq!(entries.len(), 2);
+        assert!(
+            entries[0].len() > 1,
+            "the first title wrapped: {entries:#?}"
+        );
+        let second = app.tour_sections[1].1;
+        assert!(second > 0, "the second section is somewhere below the top");
+
+        let x = app.tour_outline_area.x + 2;
+        let first_row = app.tour_outline_area.y + 1;
+
+        // The second entry starts after every row the first one occupies.
+        handle_mouse(&mut app, left_click(x, first_row + entries[0].len() as u16));
+        assert_eq!(app.tour_scroll, second);
+
+        // And a row the first title spilled onto still belongs to it.
+        handle_mouse(&mut app, left_click(x, first_row + 1));
+        assert_eq!(app.tour_scroll, 0);
     }
 
     #[test]
