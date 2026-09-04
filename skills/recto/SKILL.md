@@ -133,9 +133,11 @@ an unrelated `rectoclip` fence stays an ordinary code block. A span that no
 longer resolves says so in place rather than vanishing, which matters because a
 tour outlives the diff it was written against.
 
-Every quote is a door. `enter` opens the next one below the reader and a click
-opens the one under the pointer; both land in the full diff with that span
-focused, and `u` steps back up into the tour where they left off. Quotes also
+Every quote is a door. `enter` opens the next one below the reader, and a click
+opens the one under the pointer — anywhere on its label row, or on a code row's
+line-number gutter, so that resting the pointer on the code and clicking does
+not navigate. Both land in the full diff with that span focused, and `u` steps
+back up into the tour where they left off. Quotes also
 appear as `❝` rows under their file in the navigator, so a reviewer already
 reading the code can reach the prose about it.
 
