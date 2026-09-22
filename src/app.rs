@@ -2232,6 +2232,28 @@ mod tests {
     }
 
     #[test]
+    fn attaching_keeps_the_current_base_when_the_pr_base_is_unfetched() {
+        let backend = Arc::new(TestBackend::new());
+        backend.set_unfetched("38f8a041cb");
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let before = app.base().clone();
+        let response = app.handle_request(link::Request::AttachPr {
+            pull_request: Box::new(empty_pull_request("38f8a041cb")),
+        });
+
+        // The snapshot still attaches; only the retarget is refused, and the
+        // error names the OID so the reader knows what to fetch.
+        assert!(!response.ok);
+        let error = response.error.expect("refusal");
+        assert!(error.contains("38f8a041cb"), "{error}");
+        assert!(error.contains("opened owner/repo#42"), "{error}");
+        assert_eq!(app.base(), &before);
+        assert!(app.loading.is_none());
+        assert!(app.pull_request.is_some());
+        assert!(matches!(app.page, Page::PullRequest));
+    }
+
+    #[test]
     fn attached_pull_request_base_reads_as_its_branch_name() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();

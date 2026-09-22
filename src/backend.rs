@@ -30,7 +30,7 @@ impl Base {
     /// The leaf revision string that anchors this base. Used by the git backend
     /// for `git log <ref>..HEAD`, where merge-base/three-dot semantics already
     /// fall out of `<ref>..HEAD` (commits reachable from HEAD but not the ref).
-    fn anchor_ref(&self) -> String {
+    pub(crate) fn anchor_ref(&self) -> String {
         match self {
             Base::Revision(r) => r.clone(),
             Base::MergeBase { against } => against.anchor_ref(),
@@ -124,6 +124,12 @@ pub trait Backend: Send + Sync {
     /// this `HEAD`; jj review workspaces put a fresh working-copy commit above
     /// the fetched PR head, so their published revision is `@-`.
     fn workspace_revision(&self) -> Result<String>;
+    /// Whether this workspace can actually diff from `base`. An attached PR's
+    /// base OID comes from GitHub, so it only names a usable base once the base
+    /// branch has been fetched here. Asking about the whole base rather than
+    /// the commit underneath it matters: a shallow Git checkout can hold both
+    /// endpoints while their common ancestor is still missing.
+    fn resolves(&self, base: &Base) -> bool;
     /// Label for a base in the backend's own vocabulary — the exact string
     /// you could paste into `jj diff --from` or `git diff`. This is what
     /// `--base` is matched against and what the companion status reports.
@@ -145,6 +151,12 @@ pub trait Backend: Send + Sync {
     /// copy — i.e. `Scope::Rev`, where reading disk would land on whatever
     /// `@` happens to be instead of the rev being viewed.
     fn file_content(&self, rev: &str, path: &str) -> Result<String>;
+}
+
+/// First 12 characters of an object id, the width jj and git use for short ids
+/// in their own output. Anything shorter than that is already short.
+pub(crate) fn short_oid(oid: &str) -> &str {
+    oid.get(..12).unwrap_or(oid)
 }
 
 /// Walk up from `start` looking for the nearest jj or git repository root.
@@ -301,6 +313,10 @@ impl Backend for JjBackend {
                 revisions.len()
             )),
         }
+    }
+
+    fn resolves(&self, base: &Base) -> bool {
+        !self.resolve_commit_id(&Self::revset(base)).is_empty()
     }
 
     fn base_label(&self, base: &Base) -> String {
@@ -556,6 +572,16 @@ impl Backend for GitBackend {
     fn workspace_revision(&self) -> Result<String> {
         self.run(&["rev-parse", "HEAD"])
             .map(|revision| revision.trim().to_string())
+    }
+
+    fn resolves(&self, base: &Base) -> bool {
+        // `range_base` is what a load would run, so running it here answers the
+        // real question. `^{commit}` on the result so a fetched-but-dangling
+        // tag or tree cannot pass for something we could diff from.
+        match self.range_base(base) {
+            Ok(revision) => self.ref_exists(&format!("{revision}^{{commit}}")),
+            Err(_) => false,
+        }
     }
 
     fn base_label(&self, base: &Base) -> String {
@@ -1187,6 +1213,31 @@ mod tests {
             .unwrap();
         assert!(changes.iter().any(|change| change.path == "src/main.rs"));
         assert!(changes.iter().all(|change| !change.path.starts_with("../")));
+    }
+
+    #[test]
+    fn git_resolves_rejects_a_base_whose_merge_base_is_unreachable() {
+        let repo = TempRepo::new("git-unrelated");
+        repo.run("git", &["init", "-b", "main"]);
+        repo.run("git", &["config", "user.name", "Recto Test"]);
+        repo.run("git", &["config", "user.email", "recto@example.invalid"]);
+        repo.run("git", &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.0.join("a.txt"), "a\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "trunk"]);
+        // An unrelated root stands in for a shallow checkout: both endpoints
+        // are present, but no common ancestor is.
+        repo.run("git", &["checkout", "--orphan", "elsewhere"]);
+        std::fs::write(repo.0.join("b.txt"), "b\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "unrelated"]);
+
+        let backend = GitBackend::new(repo.0.clone());
+        // The commit is right there, so asking only whether it exists would
+        // say yes; the base built on it still cannot be loaded.
+        assert!(backend.ref_exists("main"));
+        assert!(backend.resolves(&Base::Revision("main".into())));
+        assert!(!backend.resolves(&Base::branch_point("main")));
     }
 
     #[test]

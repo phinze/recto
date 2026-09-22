@@ -23,6 +23,9 @@ pub(crate) struct TestBackend {
     pub(crate) loads: AtomicUsize,
     pub(crate) fail: AtomicBool,
     pub(crate) revision: Mutex<String>,
+    /// Revisions this workspace cannot reach, standing in for a base branch
+    /// that was never fetched. Empty means everything resolves.
+    pub(crate) unfetched: Mutex<Vec<String>>,
 }
 
 impl TestBackend {
@@ -31,11 +34,16 @@ impl TestBackend {
             loads: AtomicUsize::new(0),
             fail: AtomicBool::new(false),
             revision: Mutex::new("abc123".into()),
+            unfetched: Mutex::new(Vec::new()),
         }
     }
 
     pub(crate) fn set_revision(&self, revision: &str) {
         *self.revision.lock().unwrap() = revision.into();
+    }
+
+    pub(crate) fn set_unfetched(&self, revision: &str) {
+        self.unfetched.lock().unwrap().push(revision.into());
     }
 }
 
@@ -50,6 +58,11 @@ impl Backend for TestBackend {
 
     fn workspace_revision(&self) -> Result<String> {
         Ok(self.revision.lock().unwrap().clone())
+    }
+
+    fn resolves(&self, base: &Base) -> bool {
+        let anchor = base.anchor_ref();
+        !self.unfetched.lock().unwrap().iter().any(|r| r == &anchor)
     }
 
     fn base_label(&self, base: &Base) -> String {

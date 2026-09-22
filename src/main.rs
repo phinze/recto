@@ -36,7 +36,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::app::{App, POLL_INTERVAL, RELOAD_DEBOUNCE};
-use crate::backend::{Base, detect_backend};
+use crate::backend::{Base, detect_backend, short_oid};
 use crate::cli::{ClientCommand, run_client};
 use crate::highlight::Highlighter;
 use crate::input::handle_event;
@@ -158,11 +158,24 @@ fn main() -> Result<()> {
     // An explicit base remains an escape hatch. Otherwise a review rig starts
     // where the branch forked off its PR's base, which is the commit GitHub
     // compares from too.
+    // `App::load` loads synchronously, so an unfetched base OID here would
+    // take the whole viewer down instead of showing one bad range. Fall back
+    // to the default and say so in the startup notice.
     let initial_base = match cli.base {
         Some(revision) => Some(Base::Revision(revision)),
-        None => pull_request
-            .as_ref()
-            .map(|pr| Base::branch_point(pr.base_oid.clone())),
+        None => pull_request.as_ref().and_then(|pr| {
+            let base = Base::branch_point(pr.base_oid.clone());
+            if backend.resolves(&base) {
+                Some(base)
+            } else {
+                startup_notices.push(format!(
+                    "base {} ({}) is not in this workspace; showing the default range instead",
+                    pr.base_ref,
+                    short_oid(&pr.base_oid),
+                ));
+                None
+            }
+        }),
     };
     let hl = Highlighter::new();
     let mut app = App::load(backend, hl, initial_base, persistence).unwrap_or_else(|e| {

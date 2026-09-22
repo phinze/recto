@@ -15,7 +15,7 @@ use crate::app::{
     AgentNote, Annotation, App, ComposerKind, FileReviewObject, Focus, FocusAnchor, FocusSpan,
     Mode, Page, SCROLLOFF, STATE_DEBOUNCE,
 };
-use crate::backend::Base;
+use crate::backend::{Base, short_oid};
 use crate::ui::diff::{
     SNIPPET_CONTEXT, agent_note_index_at, agent_note_line, body_text, gutter_signature, note_line,
     review_draft_line, review_thread_line, review_thread_span, rows_for_span,
@@ -351,6 +351,21 @@ impl App {
 
         let base = Base::branch_point(pull_request.base_oid.clone());
         let base_changed = self.backend.base_label(self.base()) != self.backend.base_label(&base);
+        // A base OID GitHub knows is not necessarily one this workspace has
+        // fetched. Retargeting onto it anyway would trade a readable diff for
+        // a revset error, and quietly falling back to trunk is the silent
+        // base-picking that made this class of bug hard to spot. Stay put and
+        // name what is missing.
+        let unfetched = (select_base && !self.backend.resolves(&base)).then(|| {
+            format!(
+                "base {} ({}) is not in this workspace, so the diff still \
+                 shows {}; fetch it and reattach, or set a base with \
+                 `recto base`",
+                pull_request.base_ref,
+                short_oid(&pull_request.base_oid),
+                self.base_text(self.base()),
+            )
+        });
         let label = format!("{}#{}", pull_request.repository, pull_request.number);
         self.pull_request = Some(pull_request);
         if self.review_is_stale() {
@@ -361,7 +376,7 @@ impl App {
         self.pr_scroll = 0;
         self.active_thread = None;
         self.page = Page::PullRequest;
-        if select_base && base_changed {
+        if select_base && base_changed && unfetched.is_none() {
             // A tour resolved against the old range must not survive onto a
             // different PR diff. Authored notes remain anchored and visible
             // if their spans still exist after the reload.
@@ -372,9 +387,18 @@ impl App {
         }
         self.reweave();
         self.persist_soon();
-        match self.stale_review_error() {
-            Some(warning) => link::Response::ok_note(format!("opened {label}; {warning}")),
-            None => link::Response::ok_note(format!("opened {label}")),
+        let refused_base = unfetched.is_some();
+        let mut notes = vec![format!("opened {label}")];
+        notes.extend(unfetched);
+        notes.extend(self.stale_review_error());
+        let message = notes.join("; ");
+        // The snapshot is attached either way, but a companion that went on to
+        // annotate would be pointing at a diff this PR never described, so the
+        // unusable base is an error rather than an aside.
+        if refused_base {
+            link::Response::err(message)
+        } else {
+            link::Response::ok_note(message)
         }
     }
 
