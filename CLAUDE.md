@@ -52,7 +52,9 @@ literate tour is Markdown
 whose headings become sections and whose fenced `recto PATH:SPAN` blocks become
 pull quotes lifted from the diff; a quote opens the full diff at its span and
 `u` comes back. Public PR descriptions and conversations can be attached as
-read-only context. Recto atomically saves authored state beneath
+read-only context, and attaching one moves the diff to where the branch forked
+off the PR's base branch, matching GitHub's own three-dot rendering.
+Recto atomically saves authored state beneath
 `$XDG_STATE_HOME/recto/workspaces/`, keyed by the canonical workspace root, so
 standalone and Rig-launched viewers have the same restart behavior. Durability
 is the rule rather than the exception there: tours, annotations, focus, comment

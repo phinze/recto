@@ -398,7 +398,12 @@ impl App {
         if refused_base {
             link::Response::err(message)
         } else {
-            link::Response::ok_note(message)
+            // Status rides along so the CLI can wait out the retarget this
+            // attach just started, the way `recto base` already does.
+            link::Response {
+                status: Some(self.status()),
+                ..link::Response::ok_note(message)
+            }
         }
     }
 

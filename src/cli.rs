@@ -123,19 +123,24 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             return 2;
         }
     };
-    let requested_base = match &command {
-        ClientCommand::Base { revision } => Some(revision.as_str()),
+    // Both of these move the range, and both do it asynchronously. Hiding that
+    // in the client keeps the next companion command from racing the old diff.
+    // `base` knows the revision it asked for; `pr` derives its base from the
+    // PR, so its target has to come back from the viewer.
+    let retarget = match &command {
+        ClientCommand::Base { revision } => Some(Some(revision.as_str())),
+        ClientCommand::Pr { .. } => Some(None),
         _ => None,
     };
     match link::send(&socket, &request) {
         Ok(resp) if resp.ok => {
-            if let Some(revision) = requested_base {
+            if let Some(requested) = retarget {
                 // A live TUI returns its status so this client can wait for the
                 // asynchronous diff load. An editor-handoff response has no
                 // status because the main loop cannot load until it resumes;
                 // its note makes that deferral explicit instead.
                 if let Some(status) = resp.status
-                    && let Err((code, error)) = wait_for_base(&socket, revision, status)
+                    && let Err((code, error)) = wait_for_range(&socket, requested, status)
                 {
                     eprintln!("recto: {error}");
                     return code;
@@ -208,14 +213,27 @@ fn run_state_command(command: &StateCommand) -> i32 {
     }
 }
 
-/// Wait until a live viewer has installed the requested range. `base` requests
-/// start a background load so the TUI stays responsive; hiding that detail in
-/// the CLI keeps the next companion command from racing the old diff.
-fn wait_for_base(
+/// Wait until a live viewer has installed the requested range. Retargets start
+/// a background load so the TUI stays responsive; hiding that detail in the CLI
+/// keeps the next companion command from racing the old diff.
+///
+/// `revision` is what the caller asked for, when it named one. `recto pr`
+/// names no revision, so its target is read off the load the viewer reports
+/// having started; nothing in flight there means the attach wanted a range
+/// that was already on screen.
+fn wait_for_range(
     socket: &Path,
-    revision: &str,
+    revision: Option<&str>,
     mut status: link::Status,
 ) -> std::result::Result<(), (i32, String)> {
+    let target = match revision {
+        Some(revision) => revision.to_string(),
+        None => match status.loading_base.clone() {
+            Some(base) => base,
+            None => return Ok(()),
+        },
+    };
+    let revision = target.as_str();
     let deadline = Instant::now() + Duration::from_secs(30);
     loop {
         if status.scope == "range" && status.base == revision && status.loading_base.is_none() {
@@ -460,6 +478,24 @@ fn normalize_path(cwd: &Path, root: &Path, raw: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_attach_that_moved_no_base_finishes_without_polling() {
+        use std::sync::Arc;
+
+        use crate::app::App;
+        use crate::highlight::Highlighter;
+        use crate::testing::TestBackend;
+
+        // `pr` names no revision, so its target is whatever load the viewer
+        // started. An attach whose base was already on screen starts none, and
+        // the wait has to finish there instead of polling a socket for a
+        // retarget that will never arrive.
+        let app = App::load(Arc::new(TestBackend::new()), Highlighter::new(), None, None).unwrap();
+        let status = app.status();
+        assert!(status.loading_base.is_none());
+        assert!(wait_for_range(Path::new("/nonexistent.sock"), None, status).is_ok());
+    }
 
     #[test]
     fn base_command_carries_the_revision() {

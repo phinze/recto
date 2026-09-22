@@ -2232,6 +2232,21 @@ mod tests {
     }
 
     #[test]
+    fn attaching_pull_request_reports_the_load_it_started() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let response = app.handle_request(link::Request::AttachPr {
+            pull_request: Box::new(empty_pull_request("stack-base")),
+        });
+
+        // Without this the client has nothing to wait on, and a `ping` right
+        // after the attach reads the pre-retarget diff.
+        let status = response.status.expect("attach status");
+        assert_eq!(status.base, "base");
+        assert_eq!(status.loading_base.as_deref(), Some("merge(stack-base)"));
+    }
+
+    #[test]
     fn attaching_keeps_the_current_base_when_the_pr_base_is_unfetched() {
         let backend = Arc::new(TestBackend::new());
         backend.set_unfetched("38f8a041cb");

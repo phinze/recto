@@ -89,7 +89,14 @@ Annotate SPECs are `PATH:LINE=label` or `PATH:START-END=label`. Argument
 order sets the step numbers, and each call replaces the whole set.
 
 `recto pr` fetches the PR through `gh`, attaches a read-only snapshot, and
-switches the diff to GitHub's recorded base commit. A full
+switches the diff to where the branch forked off the PR's base branch. That is
+the same three-dot comparison GitHub's Files-changed tab renders, so the file
+sets agree, and it stays right whether the PR sits on trunk or on another
+unmerged branch. Like `base`, the command returns only once the new range is on
+screen, so a following `ping`, `focus` or `annotate` cannot race the old diff.
+If the base branch has never been fetched into this workspace, Recto attaches
+the snapshot but refuses to move the diff and says which commit is missing:
+fetch it and reattach, or pick a base yourself with `recto base`. A full
 `https://github.com/OWNER/REPO/pull/NUMBER` URL works too. In a Rig review
 workspace, Recto asks `rig info --format=json` for the current repository's PR
 and performs the same attachment automatically on startup. Other Recto
