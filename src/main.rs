@@ -36,7 +36,7 @@ use crossterm::{
 use ratatui::{Terminal, backend::CrosstermBackend};
 
 use crate::app::{App, POLL_INTERVAL, RELOAD_DEBOUNCE};
-use crate::backend::detect_backend;
+use crate::backend::{Base, detect_backend};
 use crate::cli::{ClientCommand, run_client};
 use crate::highlight::Highlighter;
 use crate::input::handle_event;
@@ -156,10 +156,14 @@ fn main() -> Result<()> {
             .and_then(|store| store.pull_request().cloned()),
     };
     // An explicit base remains an escape hatch. Otherwise a review rig starts
-    // from GitHub's recorded base commit instead of a moving branch name.
-    let initial_base = cli
-        .base
-        .or_else(|| pull_request.as_ref().map(|pr| pr.base_oid.clone()));
+    // where the branch forked off its PR's base, which is the commit GitHub
+    // compares from too.
+    let initial_base = match cli.base {
+        Some(revision) => Some(Base::Revision(revision)),
+        None => pull_request
+            .as_ref()
+            .map(|pr| Base::branch_point(pr.base_oid.clone())),
+    };
     let hl = Highlighter::new();
     let mut app = App::load(backend, hl, initial_base, persistence).unwrap_or_else(|e| {
         eprintln!("recto: {e}");

@@ -16,6 +16,17 @@ pub enum Base {
 }
 
 impl Base {
+    /// Where a branch forked off `revision`. The base for an attached pull
+    /// request: GitHub's Files-changed tab renders the same three-dot
+    /// comparison, so anchoring on the base branch's moving tip instead would
+    /// drag that branch's own commits in, inverted, the moment the PR falls
+    /// behind it.
+    pub fn branch_point(revision: impl Into<String>) -> Self {
+        Base::MergeBase {
+            against: Box::new(Base::Revision(revision.into())),
+        }
+    }
+
     /// The leaf revision string that anchors this base. Used by the git backend
     /// for `git log <ref>..HEAD`, where merge-base/three-dot semantics already
     /// fall out of `<ref>..HEAD` (commits reachable from HEAD but not the ref).

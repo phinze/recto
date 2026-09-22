@@ -490,15 +490,16 @@ impl App {
     pub(crate) fn load(
         backend: Arc<dyn Backend>,
         hl: Highlighter,
-        initial: Option<String>,
+        initial: Option<Base>,
         persistence: Option<state::Store>,
     ) -> Result<Self> {
         let mut bases = backend.default_bases();
-        let base_idx = if let Some(r) = initial {
-            if let Some(i) = bases.iter().position(|b| backend.base_label(b) == r) {
+        let base_idx = if let Some(initial) = initial {
+            let label = backend.base_label(&initial);
+            if let Some(i) = bases.iter().position(|b| backend.base_label(b) == label) {
                 i
             } else {
-                bases.insert(0, Base::Revision(r));
+                bases.insert(0, initial);
                 0
             }
         } else {
@@ -710,6 +711,16 @@ impl App {
             && let Some(rev) = self.revs.iter().find(|rev| &rev.id == r)
         {
             return rev.short_id.clone();
+        }
+        // An attached PR's base is a bare OID, and "branch point off
+        // 38f8a041cb…" tells a reader nothing they can act on. The PR knows
+        // which branch that OID was the tip of, so name the branch.
+        if let Base::MergeBase { against } = base
+            && let Base::Revision(oid) = against.as_ref()
+            && let Some(pr) = self.pull_request.as_ref()
+            && &pr.base_oid == oid
+        {
+            return format!("branch point off {}", pr.base_ref);
         }
         self.backend.base_display(base)
     }
@@ -2205,17 +2216,36 @@ mod tests {
     }
 
     #[test]
-    fn attaching_pull_request_selects_its_exact_base() {
+    fn attaching_pull_request_selects_its_branch_point() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         let response = app.handle_request(link::Request::AttachPr {
             pull_request: Box::new(empty_pull_request("stack-base")),
         });
 
+        // The base branch's *tip*, `stack-base` itself, would render that
+        // branch's own commits in reverse once the PR falls behind it.
         assert!(response.ok);
-        assert_eq!(app.base(), &Base::Revision("stack-base".into()));
+        assert_eq!(app.base(), &Base::branch_point("stack-base"));
         assert!(matches!(app.page, Page::PullRequest));
         assert!(app.loading.is_some());
+    }
+
+    #[test]
+    fn attached_pull_request_base_reads_as_its_branch_name() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let base = Base::branch_point("38f8a041cb");
+
+        // Before the PR lands there is nothing to name the OID with.
+        assert_eq!(app.base_text(&base), "merge(38f8a041cb)");
+        assert!(
+            app.handle_request(link::Request::AttachPr {
+                pull_request: Box::new(empty_pull_request("38f8a041cb")),
+            })
+            .ok
+        );
+        assert_eq!(app.base_text(&base), "branch point off main");
     }
 
     #[test]

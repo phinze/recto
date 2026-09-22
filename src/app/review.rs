@@ -293,9 +293,9 @@ impl App {
     }
 
     /// Attach a public PR snapshot and, for a live client request, move the
-    /// diff to GitHub's recorded base commit. Startup review-rig restoration has
-    /// already loaded that base, so it skips the second load while sharing all
-    /// of the draft-safety and presentation behavior here.
+    /// diff to where the branch forked off the PR's base. Startup review-rig
+    /// restoration has already loaded that base, so it skips the second load
+    /// while sharing all of the draft-safety and presentation behavior here.
     pub(crate) fn attach_pull_request(
         &mut self,
         pull_request: link::PullRequest,
@@ -349,8 +349,8 @@ impl App {
             }
         }
 
-        let base = pull_request.base_oid.clone();
-        let base_changed = self.backend.base_label(self.base()) != base;
+        let base = Base::branch_point(pull_request.base_oid.clone());
+        let base_changed = self.backend.base_label(self.base()) != self.backend.base_label(&base);
         let label = format!("{}#{}", pull_request.repository, pull_request.number);
         self.pull_request = Some(pull_request);
         if self.review_is_stale() {
@@ -368,7 +368,7 @@ impl App {
             self.focus_span = None;
             self.annotations.clear();
             self.persist_soon();
-            self.select_base(Base::Revision(base));
+            self.select_base(base);
         }
         self.reweave();
         self.persist_soon();
