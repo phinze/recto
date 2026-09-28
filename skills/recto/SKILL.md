@@ -1,6 +1,12 @@
 ---
 name: recto
-description: Drive a running recto diff viewer from a companion session: scroll to and highlight code, write a literate tour of prose and quoted diff, lay down numbered tour stops, collect private agent notes, and co-author durable local review drafts. Load whenever you are explaining or reviewing changes where recto might be open, when asked to point at code, when the user says they left notes, or while collaboratively writing PR review comments.
+description: >-
+  Drive a running recto diff viewer from a companion session: scroll to and
+  highlight code, write a literate tour of prose and quoted diff, lay down
+  numbered tour stops, collect private agent notes, and co-author durable
+  local review drafts. Load whenever you are explaining or reviewing changes
+  where recto might be open, when asked to point at code, when the user says
+  they left notes, or while collaboratively writing PR review comments.
 ---
 
 # recto
