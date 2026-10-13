@@ -162,6 +162,7 @@ always land together. To ship a rev:
 
 1. Advance `main` and push: `jj bookmark move main --to @ && jj git
    push --bookmark main`. After this the rev is no longer reorganizable.
-2. In nix-config: `nix flake update recto`.
-3. `nh os switch` (or the host equivalent) to build and activate. If
-   that goes green, commit the nix-config lock bump and push.
+2. `nix-config-sync kick`. The sync on foxtrotbase bumps the `recto`
+   input, builds, pushes the bump, and activates it. Don't bump the input
+   or switch by hand. The `nix-config` skill covers watching the run and
+   the Mac.
