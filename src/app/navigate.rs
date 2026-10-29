@@ -57,24 +57,28 @@ impl App {
     }
 
     /// Which document page's scroll and sections the section keys act on.
-    /// Only the PR page and the tour have sections to move through.
-    fn document_sections(&self) -> &[(String, usize)] {
+    /// Only the documents (tour, review slate, PR) have sections to move
+    /// through.
+    pub(crate) fn document_sections(&self) -> &[(String, usize)] {
         match self.page {
             Page::Tour => &self.tour_sections,
+            Page::Review => &self.review_sections,
             _ => &self.pr_sections,
         }
     }
 
-    fn document_scroll(&self) -> usize {
+    pub(crate) fn document_scroll(&self) -> usize {
         match self.page {
             Page::Tour => self.tour_scroll,
+            Page::Review => self.review_scroll,
             _ => self.pr_scroll,
         }
     }
 
-    fn set_document_scroll(&mut self, scroll: usize) {
+    pub(crate) fn set_document_scroll(&mut self, scroll: usize) {
         match self.page {
             Page::Tour => self.tour_scroll = scroll.min(self.tour_max_scroll),
+            Page::Review => self.review_scroll = scroll.min(self.review_max_scroll),
             _ => self.pr_scroll = scroll.min(self.pr_max_scroll),
         }
     }
@@ -95,21 +99,21 @@ impl App {
         }
     }
 
-    /// Follow a pull quote into the full diff, remembering where in the tour
-    /// the reader left so Esc can put them back.
+    /// Follow a quote into the full diff, remembering which document the
+    /// reader left and where, so Esc or `u` can put them back.
     pub(crate) fn open_quote(&mut self, spec: &str) -> link::Response {
         let (path, start, end) = parse_pathspec(spec);
         let Some(start) = start else {
             return link::Response::err(format!("quote names no line: {spec}"));
         };
         let path = path.to_string();
-        self.tour_return = Some(self.tour_scroll);
+        self.quote_return = Some((self.page, self.document_scroll()));
         self.page = Page::Diff;
         self.focus_target(&path, Some(start), end)
     }
 
-    /// Step back up one level of the review surface: a quote to the tour it
-    /// came from, the tour or PR to the diff, a thread to its PR.
+    /// Step back up one level of the review surface: a quote to the document
+    /// it came from, any document to the diff, a thread to its PR.
     ///
     /// Unlike Esc this only ever navigates. It will not clear a search, drop a
     /// highlight, discard annotations or reach the quit confirmation, so it
@@ -117,24 +121,30 @@ impl App {
     pub(crate) fn go_up(&mut self) {
         match self.page {
             Page::Diff => {
-                self.return_to_tour();
+                self.return_from_quote();
             }
-            Page::Tour | Page::PullRequest => self.page = Page::Diff,
+            Page::Tour | Page::Review | Page::PullRequest => self.page = Page::Diff,
             Page::ReviewThread => self.page = Page::PullRequest,
         }
     }
 
     /// Step back out of a quote, if one brought us here. Reported so Esc can
     /// fall through to its usual unwinding when it did not.
-    pub(crate) fn return_to_tour(&mut self) -> bool {
-        let Some(scroll) = self.tour_return.take() else {
+    pub(crate) fn return_from_quote(&mut self) -> bool {
+        let Some((page, scroll)) = self.quote_return.take() else {
             return false;
         };
-        if self.tour.is_none() {
+        // The document may have gone while the reader was in the diff.
+        let still_there = match page {
+            Page::Tour => self.tour.is_some(),
+            Page::Review => self.pull_request.is_some(),
+            _ => false,
+        };
+        if !still_there {
             return false;
         }
-        self.tour_scroll = scroll;
-        self.page = Page::Tour;
+        self.page = page;
+        self.set_document_scroll(scroll);
         true
     }
 

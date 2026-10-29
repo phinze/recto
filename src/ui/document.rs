@@ -489,6 +489,201 @@ pub(crate) fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     }
 }
 
+/// The marker a public body carries for its authorship class, read off the
+/// text rather than inferred: the slate shows it so a mismatch with what was
+/// agreed is easy to catch on the final read.
+fn authorship_marker(body: &str) -> &'static str {
+    let body = body.trim();
+    if body.starts_with('🤖') {
+        "🤖"
+    } else if body.ends_with("--p+🤖") {
+        "--p+🤖"
+    } else if body
+        .split("\n---\n")
+        .skip(1)
+        .any(|rest| rest.trim_start().starts_with('🤖'))
+    {
+        "split 🤖"
+    } else {
+        "no marker"
+    }
+}
+
+fn editor_label(editor: link::DraftEditor) -> &'static str {
+    match editor {
+        link::DraftEditor::User => "you edited",
+        link::DraftEditor::Agent => "agent edited",
+    }
+}
+
+/// One snippet row: the diff row under its own gutter, tint kept, since a
+/// review comment is about the change rather than the resulting source. The
+/// gutter is a single span so a wrapped row hangs behind it, and it turns
+/// yellow on the rows the comment is actually about.
+fn snippet_line(row: &Line<'static>, width: usize, commented: bool) -> Option<Line<'static>> {
+    let (sign, number) = gutter_signature(row)?;
+    let number = number.map_or(String::new(), |n| n.to_string());
+    let (bar, color) = if commented {
+        ("▌", theme::YELLOW)
+    } else {
+        (" ", theme::OVERLAY0)
+    };
+    let mut spans = vec![Span::styled(
+        format!("{bar} {number:>width$} {sign} "),
+        Style::default().fg(color),
+    )];
+    spans.extend(row.spans.iter().skip(4).cloned());
+    Some(Line::from(spans))
+}
+
+/// The review slate: the summary, then every inline draft with the code it
+/// points at, in the order they will post. Section 0 is the summary and
+/// section `n` is draft `✎n`, which is what lets the section in view name
+/// the item the edit keys act on.
+fn review_document(app: &App) -> Document {
+    let mut doc = Document::default();
+    let dim = Style::default().fg(theme::OVERLAY0);
+    doc.section("Summary");
+    match &app.review_draft_body {
+        Some(draft) => {
+            doc.push(Line::from(Span::styled(
+                format!(
+                    "{} · {}",
+                    authorship_marker(&draft.body),
+                    editor_label(draft.last_editor)
+                ),
+                dim,
+            )));
+            doc.push(Line::default());
+            doc.extend(markdown::lines(&draft.body));
+        }
+        None => doc.push(dim_line("No summary yet. Press c to write one.")),
+    }
+    if app.review_draft_comments.is_empty() {
+        doc.push(Line::default());
+        doc.push(dim_line(
+            "No inline comments yet. Press c on a diff line to start one.",
+        ));
+    }
+    for (i, comment) in app.review_draft_comments.iter().enumerate() {
+        let span = if comment.start == comment.end {
+            comment.start.to_string()
+        } else {
+            format!("{}-{}", comment.start, comment.end)
+        };
+        let name = comment.path.rsplit('/').next().unwrap_or(&comment.path);
+        doc.section(&format!("✎{} {name}:{span}", i + 1));
+        let label = Line::from(vec![
+            Span::styled("  ", dim),
+            Span::styled(
+                format!(
+                    "{}:{span} · {} · {}",
+                    comment.path,
+                    authorship_marker(&comment.body),
+                    editor_label(comment.last_editor)
+                ),
+                dim,
+            ),
+        ]);
+        let snippet = app
+            .snippet_rows(&comment.path, comment.start, comment.end)
+            .map(|(rows, span)| {
+                let width = comment.end.to_string().len() + 1;
+                rows.filter_map(|row| {
+                    snippet_line(&app.base_rendered[row], width, span.contains(&row))
+                })
+                .collect::<Vec<_>>()
+            })
+            .filter(|rows| !rows.is_empty());
+        let first = doc.lines.len();
+        doc.push(label);
+        match snippet {
+            Some(rows) => {
+                doc.extend(rows);
+                doc.quotes.push((
+                    first..doc.lines.len(),
+                    format!("{}:{}-{}", comment.path, comment.start, comment.end),
+                ));
+            }
+            // The comment outlived the diff it was anchored to. Say so where
+            // the code would be: it cannot post until it is re-anchored.
+            None => doc.push(Line::from(vec![
+                Span::styled("  ", dim),
+                Span::styled(
+                    "not in this diff · re-anchor or delete before posting",
+                    Style::default().fg(theme::RED),
+                ),
+            ])),
+        }
+        doc.push(Line::default());
+        doc.extend(markdown::lines(&comment.body));
+    }
+    doc
+}
+
+pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
+    let Some(pr) = &app.pull_request else {
+        app.page = Page::Diff;
+        return;
+    };
+    let rows = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(0)])
+        .split(area);
+
+    let blockers = app.review_blockers();
+    let status = if blockers.is_empty() {
+        Span::styled("ready to post", Style::default().fg(theme::GREEN))
+    } else {
+        Span::styled(
+            format!(
+                "{} blocker{}: {}",
+                blockers.len(),
+                if blockers.len() == 1 { "" } else { "s" },
+                blockers.join(", ")
+            ),
+            Style::default().fg(theme::RED),
+        )
+    };
+    let header = vec![
+        Line::from(vec![
+            Span::styled(
+                format!("{}#{}", pr.repository, pr.number),
+                Style::default()
+                    .fg(theme::MAUVE)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "  review draft",
+                Style::default()
+                    .fg(theme::TEXT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("  head {}", short_oid(&pr.head_oid)),
+                Style::default().fg(theme::OVERLAY0),
+            ),
+        ]),
+        Line::from(status),
+    ];
+    frame.render_widget(Paragraph::new(header), rows[0]);
+
+    let layout = draw_document(
+        frame,
+        rows[1],
+        review_document(app),
+        " Review ",
+        theme::YELLOW,
+        app.review_scroll,
+    );
+    app.review_scroll = layout.scroll;
+    app.review_max_scroll = layout.max_scroll;
+    app.review_sections = layout.sections;
+    app.review_outline_area = layout.outline_area;
+    app.review_quotes = layout.quotes;
+    app.review_body_area = layout.body_area;
+}
+
 pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     let Some(pr) = &app.pull_request else {
         app.page = Page::Diff;

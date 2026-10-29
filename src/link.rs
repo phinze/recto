@@ -348,8 +348,8 @@ pub struct Status {
     /// will accept.
     #[serde(default)]
     pub tour_sections: usize,
-    /// The surface currently on screen: `"diff"`, `"tour"`, `"pr"` or
-    /// `"thread"`.
+    /// The surface currently on screen: `"diff"`, `"tour"`, `"review"`,
+    /// `"pr"` or `"thread"`.
     #[serde(default)]
     pub page: String,
     /// Whether published threads, shared drafts, and private notes are visible

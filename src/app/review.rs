@@ -12,14 +12,15 @@ use anyhow::Result;
 use ratatui::text::Line;
 
 use crate::app::{
-    AgentNote, Annotation, App, ComposerKind, FileReviewObject, Focus, FocusAnchor, FocusSpan,
-    Mode, Page, SCROLLOFF, STATE_DEBOUNCE,
+    AgentNote, Annotation, App, ComposerEdit, ComposerKind, FileReviewObject, Focus, FocusAnchor,
+    FocusSpan, Mode, NoteDraft, Page, SCROLLOFF, STATE_DEBOUNCE,
 };
 use crate::backend::{Base, short_oid};
 use crate::ui::diff::{
     SNIPPET_CONTEXT, agent_note_index_at, agent_note_line, body_text, gutter_signature, note_line,
     review_draft_line, review_thread_line, review_thread_span, rows_for_span,
 };
+use crate::ui::document::active_section;
 use crate::{link, markdown};
 
 impl App {
@@ -67,6 +68,7 @@ impl App {
             page: match self.page {
                 Page::Diff => "diff",
                 Page::Tour => "tour",
+                Page::Review => "review",
                 Page::PullRequest => "pr",
                 Page::ReviewThread => "thread",
             }
@@ -973,6 +975,107 @@ impl App {
         }
     }
 
+    /// The slate item in view: 0 is the summary, `n` is draft `✎n`. It is the
+    /// same rule that names the section in the status line, so the edit keys
+    /// act on exactly what the reader is told they are looking at.
+    pub(crate) fn review_item_in_view(&self) -> usize {
+        active_section(&self.review_sections, self.review_scroll).unwrap_or(0)
+    }
+
+    /// A composer on the top-level body, prefilled with what is there.
+    pub(crate) fn review_body_composer(&self) -> NoteDraft {
+        let body = self
+            .review_draft_body
+            .as_ref()
+            .map(|draft| draft.body.clone())
+            .unwrap_or_default();
+        NoteDraft {
+            kind: ComposerKind::ReviewBody,
+            anchor: None,
+            caret: body.chars().count(),
+            body,
+            error: None,
+            editing: self
+                .review_draft_body
+                .as_ref()
+                .map(|_| ComposerEdit::ReviewBody),
+        }
+    }
+
+    /// Open the composer on the slate item in view.
+    pub(crate) fn edit_review_item_in_view(&mut self) {
+        let draft = match self.review_item_in_view() {
+            0 => self.review_body_composer(),
+            n => {
+                let Some(comment) = self.review_draft_comments.get(n - 1) else {
+                    return;
+                };
+                NoteDraft {
+                    kind: ComposerKind::ReviewComment,
+                    anchor: Some((comment.path.clone(), comment.start)),
+                    caret: comment.body.chars().count(),
+                    body: comment.body.clone(),
+                    error: None,
+                    editing: Some(ComposerEdit::ReviewComment(comment.id)),
+                }
+            }
+        };
+        self.mode = Mode::NoteInput(draft);
+    }
+
+    /// Follow the item in view into the diff at its span; `u` comes back.
+    pub(crate) fn open_review_item_in_view(&mut self) -> link::Response {
+        let Some(comment) = self
+            .review_item_in_view()
+            .checked_sub(1)
+            .and_then(|i| self.review_draft_comments.get(i))
+        else {
+            return link::Response::err("the summary has no code to open");
+        };
+        if !self.review_draft_anchored(comment) {
+            return link::Response::err("this comment is not in the current diff");
+        }
+        let spec = format!("{}:{}-{}", comment.path, comment.start, comment.end);
+        self.open_quote(&spec)
+    }
+
+    /// Whether a draft's span still resolves in the current diff. An
+    /// unanchored draft cannot post until it is re-anchored or deleted.
+    pub(crate) fn review_draft_anchored(&self, comment: &link::DraftReviewComment) -> bool {
+        self.changes
+            .iter()
+            .position(|c| c.path == comment.path)
+            .is_some_and(|i| {
+                rows_for_span(&self.base_line_info, i, comment.start, comment.end).is_some()
+            })
+    }
+
+    /// What stands between the slate and posting it. Mechanical checks only:
+    /// a stale head, a loud `TODO`, a comment with nowhere to land. Whether the
+    /// review says the right thing is not something Recto can count.
+    pub(crate) fn review_blockers(&self) -> Vec<String> {
+        let mut blockers = Vec::new();
+        if self.review_is_stale() {
+            blockers.push("stale head".to_string());
+        }
+        if self
+            .review_draft_body
+            .as_ref()
+            .is_some_and(|draft| draft.body.contains("TODO"))
+        {
+            blockers.push("TODO in summary".to_string());
+        }
+        for (i, comment) in self.review_draft_comments.iter().enumerate() {
+            if comment.body.contains("TODO") {
+                blockers.push(format!("TODO in ✎{}", i + 1));
+            }
+            if !self.review_draft_anchored(comment) {
+                blockers.push(format!("✎{} unanchored", i + 1));
+            }
+        }
+        blockers
+    }
+
     pub(crate) fn review_draft_comment_at(&self, path: &str, line: u32) -> Option<usize> {
         self.review_draft_comments.iter().position(|comment| {
             comment.path == path && (comment.start..=comment.end).contains(&line)
@@ -984,6 +1087,34 @@ impl App {
     /// agent edits as soon as it reads this, so `path:line` is stale on arrival
     /// while the quoted text still says what the reviewer meant.
     fn snippet_for(&self, path: &str, start: u32, end: u32) -> Option<Vec<link::SnippetRow>> {
+        let (rows, span) = self.snippet_rows(path, start, end)?;
+        let rows: Vec<link::SnippetRow> = rows
+            .filter_map(|row| {
+                let line = self.base_rendered.get(row)?;
+                let (sign, number) = gutter_signature(line)?;
+                Some(link::SnippetRow {
+                    line: number,
+                    sign,
+                    text: body_text(line),
+                    commented: span.contains(&row),
+                })
+            })
+            .collect();
+        (!rows.is_empty()).then_some(rows)
+    }
+
+    /// Pristine-render rows a comment's snippet covers, and the commented span
+    /// inside them: the span plus a little context, the same cut whether the
+    /// agent reads it off the wire or the reader sees it on the review slate.
+    pub(crate) fn snippet_rows(
+        &self,
+        path: &str,
+        start: u32,
+        end: u32,
+    ) -> Option<(
+        std::ops::RangeInclusive<usize>,
+        std::ops::RangeInclusive<usize>,
+    )> {
         let file_idx = self.changes.iter().position(|c| c.path == path)?;
         let span = rows_for_span(&self.base_line_info, file_idx, start, end)?;
         // Walk out from the span for context, stopping at anything that isn't a
@@ -1001,19 +1132,7 @@ impl App {
         while last < ceiling && belongs(last + 1) {
             last += 1;
         }
-        let rows: Vec<link::SnippetRow> = (first..=last)
-            .filter_map(|row| {
-                let line = self.base_rendered.get(row)?;
-                let (sign, number) = gutter_signature(line)?;
-                Some(link::SnippetRow {
-                    line: number,
-                    sign,
-                    text: body_text(line),
-                    commented: span.contains(&row),
-                })
-            })
-            .collect();
-        (!rows.is_empty()).then_some(rows)
+        Some((first..=last, span))
     }
 
     /// Rendered-row ranges for the annotations, in step order, resolved

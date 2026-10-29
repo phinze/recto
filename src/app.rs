@@ -164,6 +164,7 @@ pub(crate) enum Focus {
 pub(crate) enum Page {
     Diff,
     Tour,
+    Review,
     PullRequest,
     ReviewThread,
 }
@@ -370,9 +371,17 @@ pub(crate) struct App {
     /// A section a companion asked for before the tour page had geometry to
     /// resolve it against. Spent by the next draw.
     pub(crate) tour_pending_section: Option<usize>,
-    /// Tour scroll to come back to after a quote sent the reader to the diff.
-    /// Set on the way in, spent by the first Esc on the way out.
-    pub(crate) tour_return: Option<usize>,
+    /// The document page and scroll to come back to after a quote sent the
+    /// reader to the diff. Set on the way in, spent by the first Esc on the way
+    /// out.
+    pub(crate) quote_return: Option<(Page, usize)>,
+    /// The review slate's document state, the same shape as the tour's.
+    pub(crate) review_scroll: usize,
+    pub(crate) review_max_scroll: usize,
+    pub(crate) review_sections: Vec<(String, usize)>,
+    pub(crate) review_outline_area: Rect,
+    pub(crate) review_quotes: Vec<QuoteSpan>,
+    pub(crate) review_body_area: Rect,
     pub(crate) active_thread: Option<usize>,
     pub(crate) thread_scroll: usize,
     pub(crate) thread_max_scroll: usize,
@@ -568,7 +577,13 @@ impl App {
             tour_body_area: Rect::default(),
             tour_anchors,
             tour_pending_section: None,
-            tour_return: None,
+            quote_return: None,
+            review_scroll: 0,
+            review_max_scroll: 0,
+            review_sections: Vec::new(),
+            review_outline_area: Rect::default(),
+            review_quotes: Vec::new(),
+            review_body_area: Rect::default(),
             active_thread: None,
             thread_scroll: 0,
             thread_max_scroll: 0,
@@ -1508,7 +1523,7 @@ mod tests {
         // The gutter beside it does.
         handle_mouse(&mut app, left_click(content_x + quote.gutter - 1, code_y));
         assert_eq!(app.page, Page::Diff, "a quote gutter drills into the diff");
-        assert!(app.return_to_tour());
+        assert!(app.return_from_quote());
 
         // And so does the label row, end to end, so the affordance is
         // findable without hunting for the narrow band.
@@ -1527,9 +1542,12 @@ mod tests {
             Some(("foo.go", 111))
         );
 
-        assert!(app.return_to_tour(), "Esc unwinds back into the tour");
+        assert!(app.return_from_quote(), "Esc unwinds back into the tour");
         assert_eq!(app.page, Page::Tour);
-        assert!(!app.return_to_tour(), "and the return is spent once used");
+        assert!(
+            !app.return_from_quote(),
+            "and the return is spent once used"
+        );
     }
 
     /// After a section jump the next quote below is that section's own, which
@@ -1560,7 +1578,7 @@ mod tests {
             "the first section's quote"
         );
 
-        assert!(app.return_to_tour());
+        assert!(app.return_from_quote());
         app.jump_to_section(1);
         assert!(app.open_quote_in_view().ok);
         assert_eq!(
@@ -1570,7 +1588,7 @@ mod tests {
         );
 
         // Past the last quote there is nothing to open, and nothing moves.
-        assert!(app.return_to_tour());
+        assert!(app.return_from_quote());
         app.tour_scroll = app.tour_max_scroll;
         let refused = app.open_quote_in_view();
         assert!(!refused.ok || app.page == Page::Diff);
@@ -1848,12 +1866,18 @@ mod tests {
         app.pull_request = Some(empty_pull_request("base"));
         let pages =
             |app: &App| -> Vec<Page> { tab_entries(app).into_iter().map(|e| e.page).collect() };
-        assert_eq!(pages(&app), vec![Page::Diff, Page::PullRequest]);
+        assert_eq!(
+            pages(&app),
+            vec![Page::Diff, Page::Review, Page::PullRequest]
+        );
 
         app.handle_request(link::Request::Tour {
             body: "## One\n\na\n\n## Two\n\nb".into(),
         });
-        assert_eq!(pages(&app), vec![Page::Diff, Page::Tour, Page::PullRequest]);
+        assert_eq!(
+            pages(&app),
+            vec![Page::Diff, Page::Tour, Page::Review, Page::PullRequest]
+        );
 
         app.select_tab(2);
         assert_eq!(app.page, Page::Tour);
@@ -1918,12 +1942,12 @@ mod tests {
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         app.pull_request = Some(empty_pull_request("base"));
 
-        app.select_tab(2);
+        app.select_tab(3);
         assert_eq!(app.page, Page::PullRequest);
         app.select_tab(1);
         assert_eq!(app.page, Page::Diff);
-        app.select_tab(3);
-        assert_eq!(app.page, Page::Diff, "no third tab to land on");
+        app.select_tab(4);
+        assert_eq!(app.page, Page::Diff, "no fourth tab to land on");
     }
 
     #[test]
@@ -2285,6 +2309,93 @@ mod tests {
                 ("gone.rs".to_string(), 3),
             ]
         );
+    }
+
+    #[test]
+    fn the_review_slate_reads_in_posting_order_and_edits_in_place() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.pull_request = Some(empty_pull_request("base"));
+        app.set_review_draft_body("Looks good.\n\n--p+🤖".into(), link::DraftEditor::User);
+        for (line, body) in [(111, "later TODO"), (2, "🤖 earlier")] {
+            let response = app.add_review_draft_comment(
+                "foo.go",
+                line,
+                None,
+                body.into(),
+                link::DraftEditor::Agent,
+            );
+            assert!(response.ok);
+        }
+        app.review_draft_comments.push(link::DraftReviewComment {
+            id: 99,
+            path: "gone.rs".into(),
+            start: 4,
+            end: 4,
+            body: "stranded".into(),
+            last_editor: link::DraftEditor::User,
+        });
+        app.reweave();
+
+        let terminal_backend = ratatui::backend::TestBackend::new(120, 60);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        app.page = Page::Review;
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        let titles: Vec<&str> = app
+            .review_sections
+            .iter()
+            .map(|(t, _)| t.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["Summary", "✎1 foo.go:2", "✎2 foo.go:111", "✎3 gone.rs:4"]
+        );
+        let rendered = terminal
+            .backend()
+            .buffer()
+            .content
+            .iter()
+            .map(|cell| cell.symbol())
+            .collect::<String>();
+        assert!(
+            rendered.contains("added at new line 2"),
+            "the code rides along"
+        );
+        assert!(rendered.contains("not in this diff"));
+        assert!(rendered.contains("TODO in ✎2"));
+        assert!(rendered.contains("✎3 unanchored"));
+        assert_eq!(app.review_quotes.len(), 2, "only anchored drafts open");
+
+        // The section in view is the item the keys act on.
+        assert_eq!(app.review_item_in_view(), 0);
+        app.edit_review_item_in_view();
+        assert!(matches!(
+            &app.mode,
+            Mode::NoteInput(NoteDraft {
+                kind: ComposerKind::ReviewBody,
+                ..
+            })
+        ));
+        app.mode = Mode::Normal;
+        app.jump_to_section(2);
+        assert_eq!(app.review_item_in_view(), 2);
+        app.edit_review_item_in_view();
+        let Mode::NoteInput(draft) = &app.mode else {
+            panic!("composer opens on the draft in view");
+        };
+        assert_eq!(draft.body, "later TODO");
+        app.mode = Mode::Normal;
+
+        // Its code opens in the diff, and `u` comes back to the same place.
+        let scroll = app.review_scroll;
+        assert!(app.open_review_item_in_view().ok);
+        assert_eq!(app.page, Page::Diff);
+        app.go_up();
+        assert_eq!(app.page, Page::Review);
+        assert_eq!(app.review_scroll, scroll);
+        app.jump_to_section(3);
+        assert!(!app.open_review_item_in_view().ok, "nowhere to land");
     }
 
     #[test]

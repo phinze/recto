@@ -10,7 +10,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{App, Cursor, Mode, Page, SPINNER_FRAME_MS, SPINNER_FRAMES};
 use crate::ui::diff::draw_diff;
 use crate::ui::document::{
-    active_section, draw_pull_request, draw_review_thread, draw_tour, short_oid,
+    active_section, draw_pull_request, draw_review, draw_review_thread, draw_tour, short_oid,
 };
 use crate::ui::overlay::{draw_help, draw_note_input, draw_quit_confirm};
 use crate::ui::panes::{draw_commits, draw_files};
@@ -94,6 +94,13 @@ pub(crate) fn tab_entries(app: &App) -> Vec<TabEntry> {
         labels.push((Page::Tour, "Tour".to_string()));
     }
     if let Some(pr) = &app.pull_request {
+        // The slate exists as soon as there is a PR to review, empty or not,
+        // since it is where the summary gets started.
+        let label = match app.review_draft_comments.len() {
+            0 => "Review".to_string(),
+            n => format!("Review ✎{n}"),
+        };
+        labels.push((Page::Review, label));
         labels.push((Page::PullRequest, format!("PR #{}", pr.number)));
     }
 
@@ -181,6 +188,7 @@ fn status_line(app: &App) -> Paragraph<'static> {
 
     match app.page {
         Page::Tour => document_status(&mut spans, &app.tour_sections, app.tour_scroll),
+        Page::Review => document_status(&mut spans, &app.review_sections, app.review_scroll),
         Page::PullRequest => document_status(&mut spans, &app.pr_sections, app.pr_scroll),
         Page::ReviewThread => {}
         Page::Diff => {}
@@ -360,6 +368,7 @@ pub(crate) fn draw(frame: &mut ratatui::Frame, app: &mut App) {
 
     match app.page {
         Page::Tour => draw_tour(frame, rows[1], app),
+        Page::Review => draw_review(frame, rows[1], app),
         Page::PullRequest => draw_pull_request(frame, rows[1], app),
         Page::ReviewThread => draw_review_thread(frame, rows[1], app),
         Page::Diff => draw_diff_page(frame, rows[1], app),
@@ -495,6 +504,6 @@ mod tests {
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         app.pull_request = Some(empty_pull_request("base"));
         let pages: Vec<Page> = tab_entries(&app).into_iter().map(|e| e.page).collect();
-        assert_eq!(pages, vec![Page::Diff, Page::PullRequest]);
+        assert_eq!(pages, vec![Page::Diff, Page::Review, Page::PullRequest]);
     }
 }

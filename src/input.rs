@@ -245,28 +245,42 @@ pub(crate) fn handle_event(
                     KeyCode::Char('G') | KeyCode::End => app.tour_scroll = app.tour_max_scroll,
                     _ => {}
                 },
+                Mode::Normal if app.page == Page::Review => match key.code {
+                    KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
+                    KeyCode::Esc => app.page = Page::Diff,
+                    KeyCode::Char('c') => {
+                        app.edit_review_item_in_view();
+                        mode = app.mode.clone();
+                    }
+                    KeyCode::Enter => {
+                        app.open_review_item_in_view();
+                    }
+                    KeyCode::Char(c @ '1'..='9') => app.jump_to_section(c as usize - '1' as usize),
+                    KeyCode::Char(']') => app.jump_section(1),
+                    KeyCode::Char('[') => app.jump_section(-1),
+                    KeyCode::Char('j') | KeyCode::Down => {
+                        app.review_scroll = (app.review_scroll + 1).min(app.review_max_scroll);
+                    }
+                    KeyCode::Char('k') | KeyCode::Up => {
+                        app.review_scroll = app.review_scroll.saturating_sub(1);
+                    }
+                    KeyCode::PageDown | KeyCode::Char(' ') => {
+                        app.review_scroll = (app.review_scroll + 10).min(app.review_max_scroll);
+                    }
+                    KeyCode::PageUp => {
+                        app.review_scroll = app.review_scroll.saturating_sub(10);
+                    }
+                    KeyCode::Char('g') | KeyCode::Home => app.review_scroll = 0,
+                    KeyCode::Char('G') | KeyCode::End => app.review_scroll = app.review_max_scroll,
+                    _ => {}
+                },
                 Mode::Normal if app.page == Page::PullRequest => match key.code {
                     KeyCode::Char('q') => app.mode = Mode::QuitConfirm,
                     KeyCode::Char('p') | KeyCode::Esc => {
                         app.page = Page::Diff;
                     }
                     KeyCode::Char('c') => {
-                        let body = app
-                            .review_draft_body
-                            .as_ref()
-                            .map(|draft| draft.body.clone())
-                            .unwrap_or_default();
-                        app.mode = Mode::NoteInput(NoteDraft {
-                            kind: ComposerKind::ReviewBody,
-                            anchor: None,
-                            caret: body.chars().count(),
-                            body,
-                            error: None,
-                            editing: app
-                                .review_draft_body
-                                .as_ref()
-                                .map(|_| ComposerEdit::ReviewBody),
-                        });
+                        app.mode = Mode::NoteInput(app.review_body_composer());
                         mode = app.mode.clone();
                     }
                     KeyCode::Char('t') => {
@@ -353,7 +367,7 @@ pub(crate) fn handle_event(
                     KeyCode::Esc => {
                         // A quote drilled in from the tour; Esc is the way back
                         // out before it means anything else.
-                        if app.return_to_tour() {
+                        if app.return_from_quote() {
                         } else if app.search_query.is_some() {
                             app.clear_search();
                         } else if app.focus_span.is_some() {
@@ -606,21 +620,31 @@ pub(crate) fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         return;
     }
-    if app.page == Page::Tour {
+    // The tour and the review slate are both documents with quotes that open
+    // into the diff, so a click means the same thing on either.
+    if matches!(app.page, Page::Tour | Page::Review) {
+        let (outline_area, body_area, quotes) = if app.page == Page::Tour {
+            (app.tour_outline_area, app.tour_body_area, &app.tour_quotes)
+        } else {
+            (
+                app.review_outline_area,
+                app.review_body_area,
+                &app.review_quotes,
+            )
+        };
         if m.kind == MouseEventKind::Down(MouseButton::Left)
-            && app.tour_outline_area.contains(Position {
+            && outline_area.contains(Position {
                 x: m.column,
                 y: m.row,
             })
         {
-            if let Some(index) = outline_index_at(&app.tour_sections, app.tour_outline_area, m.row)
-            {
+            if let Some(index) = outline_index_at(app.document_sections(), outline_area, m.row) {
                 app.jump_to_section(index);
             }
             return;
         }
         if m.kind == MouseEventKind::Down(MouseButton::Left)
-            && app.tour_body_area.contains(Position {
+            && body_area.contains(Position {
                 x: m.column,
                 y: m.row,
             })
@@ -628,11 +652,10 @@ pub(crate) fn handle_mouse(app: &mut App, m: event::MouseEvent) {
             // Skip the block's top border to get the first content row, then
             // add the scroll offset to reach the document row under the cursor.
             let clicked =
-                usize::from(m.row.saturating_sub(app.tour_body_area.y + 1)) + app.tour_scroll;
+                usize::from(m.row.saturating_sub(body_area.y + 1)) + app.document_scroll();
             // Content starts past the border and the block's padding.
-            let content_x = app.tour_body_area.x + 2;
-            let spec = app
-                .tour_quotes
+            let content_x = body_area.x + 2;
+            let spec = quotes
                 .iter()
                 .find(|quote| quote.rows.contains(&clicked))
                 // A label row goes to the source end to end; a code row only
@@ -650,12 +673,12 @@ pub(crate) fn handle_mouse(app: &mut App, m: event::MouseEvent) {
         }
         match m.kind {
             MouseEventKind::ScrollDown => {
-                app.tour_scroll =
-                    (app.tour_scroll + usize::from(WHEEL_STEP)).min(app.tour_max_scroll)
+                app.set_document_scroll(app.document_scroll() + usize::from(WHEEL_STEP))
             }
-            MouseEventKind::ScrollUp => {
-                app.tour_scroll = app.tour_scroll.saturating_sub(usize::from(WHEEL_STEP))
-            }
+            MouseEventKind::ScrollUp => app.set_document_scroll(
+                app.document_scroll()
+                    .saturating_sub(usize::from(WHEEL_STEP)),
+            ),
             _ => {}
         }
         return;
