@@ -57,7 +57,10 @@ fn quote_spec(kind: &CodeBlockKind<'_>) -> Option<String> {
 }
 
 fn render(source: &str, mut quote: Option<Quote<'_>>) -> Rendered {
-    let parser = Parser::new_ext(source, Options::all());
+    // GitHub renders `--` as two hyphens, and review bodies are read here to
+    // check exactly what will post, so typographic rewriting would show text
+    // that is not the text. `--p+🤖` in particular has to survive intact.
+    let parser = Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION);
     let mut out = Vec::new();
     let mut current = Vec::new();
     let mut styles = vec![Style::default().fg(theme::TEXT)];
@@ -318,6 +321,13 @@ mod tests {
         assert_eq!(text[2], "Read this and that.");
         assert_eq!(text[4], "• one");
         assert_eq!(text[5], "• two");
+    }
+
+    #[test]
+    fn punctuation_renders_as_written() {
+        let rendered = lines("Ship it -- \"really\".\n\n--p+🤖");
+        let text: Vec<String> = rendered.iter().map(Line::to_string).collect();
+        assert_eq!(text, vec!["Ship it -- \"really\".", "", "--p+🤖"]);
     }
 
     #[test]
