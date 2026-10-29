@@ -509,6 +509,7 @@ impl App {
     /// editor jumps stay anchored to real diff lines; everything downstream
     /// (scroll, search, clicks) sees one consistent rendered stream.
     pub(crate) fn reweave(&mut self) {
+        self.sort_review_drafts();
         self.rebuild_file_rows();
         let mut inserts: Vec<(usize, Line<'static>, Option<FileReviewObject>)> = Vec::new();
         for (i, a) in self.annotations.iter().enumerate() {
@@ -620,6 +621,29 @@ impl App {
         self.line_info = line_info;
         self.rendered_review_objects = rendered_review_objects;
         self.rebuild_display_rows();
+    }
+
+    /// Keep the shared drafts in slate order: the order GitHub lays a review
+    /// out in, so the badge numbers in the diff, the file pane and the slate
+    /// all agree with what the author will read. That is the file pane's file
+    /// order, then the span, then the id. A draft whose span no longer
+    /// resolves sorts last, where the slate collects the unanchored ones.
+    fn sort_review_drafts(&mut self) {
+        let changes = &self.changes;
+        let line_info = &self.base_line_info;
+        self.review_draft_comments.sort_by_cached_key(|comment| {
+            let file_idx = changes.iter().position(|c| c.path == comment.path);
+            let anchored = file_idx
+                .is_some_and(|i| rows_for_span(line_info, i, comment.start, comment.end).is_some());
+            (
+                !anchored,
+                file_idx.unwrap_or(usize::MAX),
+                comment.path.clone(),
+                comment.start,
+                comment.end,
+                comment.id,
+            )
+        });
     }
 
     /// Reweave without moving what the reader is looking at. A companion write

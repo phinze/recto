@@ -98,10 +98,11 @@ fn file_review_object_line(app: &App, object: FileReviewObject) -> ListItem<'sta
             ]
         }
         FileReviewObject::SharedDraft(id) => {
-            let comment = app
+            let position = app
                 .review_draft_comments
                 .iter()
-                .find(|comment| comment.id == id);
+                .position(|comment| comment.id == id);
+            let comment = position.map(|i| &app.review_draft_comments[i]);
             let editor = comment.map_or("draft", |comment| match comment.last_editor {
                 link::DraftEditor::User => "you edited",
                 link::DraftEditor::Agent => "agent edited",
@@ -109,7 +110,7 @@ fn file_review_object_line(app: &App, object: FileReviewObject) -> ListItem<'sta
             vec![
                 Span::raw("  "),
                 Span::styled(
-                    format!("✎{id}"),
+                    format!("✎{}", position.map_or(id as usize, |i| i + 1)),
                     Style::default()
                         .fg(theme::YELLOW)
                         .add_modifier(Modifier::BOLD),

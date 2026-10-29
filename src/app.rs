@@ -2244,6 +2244,50 @@ mod tests {
     }
 
     #[test]
+    fn drafts_sort_into_slate_order_whatever_order_they_were_written_in() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.pull_request = Some(empty_pull_request("base"));
+        app.review_draft_comments.push(link::DraftReviewComment {
+            id: 1,
+            path: "gone.rs".into(),
+            start: 3,
+            end: 3,
+            body: "unanchored".into(),
+            last_editor: link::DraftEditor::Agent,
+        });
+        app.next_review_draft_id = 2;
+        for line in [111, 2] {
+            let response = app.add_review_draft_comment(
+                "foo.go",
+                line,
+                None,
+                format!("line {line}"),
+                link::DraftEditor::Agent,
+            );
+            assert!(response.ok);
+        }
+
+        let response = app.handle_request(link::Request::ReviewDraft);
+        let order: Vec<(String, u32)> = response
+            .review_draft
+            .unwrap()
+            .comments
+            .into_iter()
+            .map(|comment| (comment.path, comment.start))
+            .collect();
+        assert_eq!(
+            order,
+            vec![
+                ("foo.go".to_string(), 2),
+                ("foo.go".to_string(), 111),
+                ("gone.rs".to_string(), 3),
+            ]
+        );
+    }
+
+    #[test]
     fn note_acknowledgement_removes_only_the_ids_that_were_read() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
