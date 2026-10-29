@@ -62,9 +62,12 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto pr OWNER/REPO#NUMBER   # fetch and open public PR context in the TUI
     recto notes                  # collect the private notes the user left for you
     recto review                 # peek at the shared, local-only review draft
-    recto review-body BODY       # create, revise, or delete the top-level body
+    recto review --markdown      # the same slate, as the user reads it
+    recto review-focus [summary|ID] # show the Review tab at one item
+    recto review-body [--if-revision N] BODY # create, revise, or delete the summary
     recto review-comment PATH:LINE=BODY
-    recto review-comment --id ID BODY
+    recto review-comment --id ID [--if-revision N] BODY
+    recto review-verdict approve|request-changes|comment|unset
     recto state forget --workspace-root PATH
 
 `state forget` is a destructive lifecycle API, not part of ordinary companion
@@ -85,9 +88,9 @@ will apply when the user returns.
 
 recto shows one surface at a time, and a tab strip across the top says which
 ones exist right now. The diff is always there, a tour appears once one is laid
-down, and a PR appears once one is attached. The user switches with `shift-1`,
-`shift-2` and `shift-3`, or by clicking a tab, and `u` steps back up a level
-from wherever they are. `ping` reports the current surface as `page`. Both
+down, and attaching a PR adds two: the Review tab holding the draft review,
+then the PR itself. The user switches with `shift-1` through `shift-4`, or by
+clicking a tab, and `u` steps back up a level from wherever they are. `ping` reports the current surface as `page`. Both
 `focus` and `annotate` switch to the diff, since neither can mean "look here
 now" while a different page is up.
 
@@ -107,9 +110,12 @@ fetch it and reattach, or pick a base yourself with `recto base`. A full
 workspace, Recto asks `rig info --format=json` for the current repository's PR
 and performs the same attachment automatically on startup. Other Recto
 startups stay offline. The PR overview opens immediately with its description,
-timeline, and inline review threads. The user toggles between it and the diff
-with `p`, moves among public threads with `t` / `T`, and presses `enter` on an
-anchored thread in the diff to open its full conversation.
+timeline, and open review threads in full. Resolved and outdated threads fold
+into one-line headings at the end, and stay out of the diff and file pane
+entirely. The user toggles between the PR and the diff with `p`, moves among
+every public thread with `t` / `T` there (open ones only in the diff), and
+presses `enter` on an anchored thread in the diff to open its full
+conversation.
 
 Tour stops, tour pull quotes, published threads, shared review drafts, and
 private agent notes all appear as typed child rows beneath their changed file
@@ -203,26 +209,49 @@ attribute it there instead of asserting it yourself.
 
 ## Co-author a public review draft
 
-The top-level review body and inline review comments are local drafts, not
-published GitHub content and not private agent notes. Recto saves authored
-state beneath `$XDG_STATE_HOME/recto/workspaces/`, keyed by the canonical
-workspace root, whether or not Rig launched it. It restores only the draft
-matching the attached repository, PR number, and head OID. The user stages or
-edits the body with `c` on the PR overview, and an inline comment with `c` on a
-diff line. Read the whole shared draft with `recto review`; this is a peek, so
-calling it repeatedly never consumes anything. The body and each comment carry
-a `last_editor` field, and inline comments also have stable ids. Rig teardown
+The review being written is a local draft, not published GitHub content and
+not private agent notes: a verdict, a top-level summary, and inline comments.
+Recto saves it beneath `$XDG_STATE_HOME/recto/workspaces/`, keyed by the
+canonical workspace root, whether or not Rig launched it, and restores only the
+draft matching the attached repository, PR number, and head OID. Rig teardown
 uses `recto state forget` to end that state with the workspace without learning
 Recto's file layout.
 
-Revise the top-level body with `recto review-body 'new Markdown'`. Passing an
-empty body deletes it. The command returns the updated full draft as JSON.
+The user reads and edits the whole draft on the Review tab, in the order it
+will post: the verdict and a count of mechanical blockers (a stale head, a
+`TODO`, a comment whose span left the diff), then the summary, then each inline
+comment with the diff rows it points at, sorted by file and line. They edit the
+item in view with `c` or in `$EDITOR` with `e`, cycle the verdict with `V`, and
+press `enter` to see a comment's code in the diff, with `u` to come back. They
+can also start an inline comment with `c` on a diff line. Comment badges
+(`✎1`, `✎2`, ...) are positions in that order everywhere, so they can shift
+as comments arrive; the stable `id` is your handle.
 
-Revise the same comment with `recto review-comment --id ID 'new Markdown'`.
-Create one from the companion side with
-`recto review-comment 'PATH:LINE=Markdown'`. Passing an empty body with `--id`
-deletes the draft. Every mutation returns the updated draft as JSON so both
-sides can immediately see the same object.
+Read the draft with `recto review`; this is a peek, so calling it repeatedly
+never consumes anything. Comments come back in posting order, each with its
+`id`, `last_editor`, `revision`, and the `snippet` of diff rows the slate
+shows. A comment with no `snippet` no longer resolves in the current diff and
+cannot post until it is re-anchored or deleted. `recto review --markdown`
+prints the same slate as readable Markdown, for reading it back in the
+conversation.
+
+Revise the summary with `recto review-body --if-revision N 'new Markdown'`,
+and a comment with `recto review-comment --id ID --if-revision N 'new
+Markdown'`, passing the revision you last read. A refusal means the user (or
+another writer) changed it after your read: it exits 1 and prints the current
+draft, so start from their body rather than retrying your text. Passing an
+empty body deletes the summary or that comment. Create a comment with
+`recto review-comment 'PATH:LINE=Markdown'` or `'PATH:START-END=Markdown'`.
+Every mutation returns the updated draft as JSON so both sides see the same
+object.
+
+Draft writes never move the user's page, scroll, or cursor. When you want them
+looking at something you wrote, say so with `recto review-focus ID`, or
+`recto review-focus summary`. `ping` reports `page: "review"` while the slate
+is up.
+
+`recto review-verdict` sets the verdict. The verdict is the user's call: set it
+when they tell you to, never on your own judgment.
 
 These commands require an attached PR, and this workflow does not post
 anything publicly. Do not copy private `recto notes` into the review draft by
@@ -386,11 +415,11 @@ means no notes were pending. It exits 1 only when recto is parked in an
 editor, where the TUI loop cannot answer the read. Ask
 the user to come back to recto, then try again.
 
-The review draft commands (`review`, `review-body`, `review-comment`) also
-exit 1 while recto is parked in an editor. A write is refused rather than
-queued, since you could not have read what it would replace. Draft writes
-never move the user's page, scroll, or cursor; use `focus` when you want them
-looking at the comment.
+The review draft commands (`review`, `review-body`, `review-comment`,
+`review-verdict`) also exit 1 while recto is parked in an editor. A write is
+refused rather than queued, since you could not have read what it would
+replace. A `review-focus` sent meanwhile waits and applies when the user
+returns.
 
 ## Reading the ping
 
@@ -445,7 +474,8 @@ entirely, which reads as zero.
 `recto comment-visibility`. Older Recto versions omit it and always show
 comments.
 
-`page` is the surface on screen: `"diff"`, `"tour"`, `"pr"` or `"thread"`.
+`page` is the surface on screen: `"diff"`, `"tour"`, `"review"`, `"pr"` or
+`"thread"`.
 `tour` says whether a literate tour is laid down and `tour_sections` counts its
 sections, which is the largest number `tour-focus` will take. Both are counted
 from the document itself, so they answer before the tour page has ever been
