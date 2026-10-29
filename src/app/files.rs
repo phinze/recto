@@ -551,6 +551,7 @@ mod tests {
             body: "Shared words.".into(),
             last_editor: link::DraftEditor::Agent,
             revision: 0,
+            snippet: None,
         }];
         let notes = [AgentNote {
             id: 9,

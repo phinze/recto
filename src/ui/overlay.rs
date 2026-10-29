@@ -286,6 +286,10 @@ const HELP_ROWS: &[HelpRow] = &[
     head("Review slate"),
     bind("c", "edit the summary or comment in view"),
     bind("e", "edit the summary or comment in view in $EDITOR"),
+    bind(
+        "V",
+        "cycle the verdict: approve, request changes, comment, unset",
+    ),
     bind("enter", "open the comment in view in the diff"),
     bind("u", "back from the diff to the slate"),
     bind(

@@ -16,6 +16,14 @@ use clap::{Subcommand, ValueEnum};
 use crate::highlight::ext_for_path;
 use crate::{github, link, parse_pathspec, state};
 
+#[derive(Clone, Copy, Debug, ValueEnum)]
+pub(crate) enum VerdictArg {
+    Approve,
+    RequestChanges,
+    Comment,
+    Unset,
+}
+
 /// Subcommands that talk to an already-running recto over its workspace socket.
 #[derive(Subcommand, Debug)]
 pub(crate) enum ClientCommand {
@@ -70,9 +78,18 @@ pub(crate) enum ClientCommand {
         #[arg(long, num_args = 1..)]
         ack: Vec<u64>,
     },
-    /// Show the local review draft as JSON. This is a non-consuming read and
-    /// may be called throughout co-authoring.
-    Review,
+    /// Show the local review draft as JSON, in posting order. This is a
+    /// non-consuming read and may be called throughout co-authoring.
+    Review {
+        /// Print the slate as the reader sees it, snippets included, instead
+        /// of JSON.
+        #[arg(long)]
+        markdown: bool,
+    },
+    /// Show the review slate at one item: `summary`, or an inline draft's id.
+    ReviewFocus { item: Option<String> },
+    /// Set the review's verdict, or `unset` it.
+    ReviewVerdict { verdict: VerdictArg },
     /// Add, revise, or delete the shared top-level review body. An empty BODY
     /// deletes the draft. --if-revision refuses the write unless the body is
     /// still at the revision you last read.
@@ -180,7 +197,11 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
                     print!("{}", render_agent_notes_markdown(comments));
                 }
             }
-            if let Some(draft) = &resp.review_draft {
+            if let Some(draft) = &resp.review_draft
+                && matches!(command, ClientCommand::Review { markdown: true })
+            {
+                print!("{}", render_review_markdown(draft));
+            } else if let Some(draft) = &resp.review_draft {
                 match serde_json::to_string_pretty(draft) {
                     Ok(json) => println!("{json}"),
                     Err(e) => {
@@ -379,7 +400,24 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         ClientCommand::Notes { ack } => {
             Ok(link::Request::AcknowledgeAgentNotes { ids: ack.clone() })
         }
-        ClientCommand::Review => Ok(link::Request::ReviewDraft),
+        ClientCommand::Review { .. } => Ok(link::Request::ReviewDraft),
+        ClientCommand::ReviewFocus { item } => {
+            let id = match item.as_deref() {
+                None | Some("summary") => None,
+                Some(raw) => Some(raw.parse::<u64>().map_err(|_| {
+                    anyhow!("review-focus takes `summary` or a draft id, not {raw}")
+                })?),
+            };
+            Ok(link::Request::ReviewFocus { id })
+        }
+        ClientCommand::ReviewVerdict { verdict } => Ok(link::Request::ReviewVerdict {
+            verdict: match verdict {
+                VerdictArg::Approve => Some(link::Verdict::Approve),
+                VerdictArg::RequestChanges => Some(link::Verdict::RequestChanges),
+                VerdictArg::Comment => Some(link::Verdict::Comment),
+                VerdictArg::Unset => None,
+            },
+        }),
         ClientCommand::ReviewBody { body, if_revision } => Ok(link::Request::ReviewDraftBody {
             body: body.clone(),
             if_revision: *if_revision,
@@ -440,6 +478,58 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
 /// with its number and `path:line`, then quotes the diff rows it points at, so
 /// the agent can act without re-opening the file — and so the note still makes
 /// sense after its own edits have moved those line numbers.
+/// The slate as the reader sees it on the Review tab: verdict, summary, then
+/// each inline draft with its snippet, in posting order. This is for reading
+/// it back, not for posting: the JSON is the payload.
+fn render_review_markdown(draft: &link::ReviewDraft) -> String {
+    let pr = &draft.pull_request;
+    let verdict = draft.verdict.map_or("unset", link::Verdict::label);
+    let mut out = format!(
+        "# Review of {}#{}\n\nHead `{}` · verdict: {verdict} · {} inline comment{}\n",
+        pr.repository,
+        pr.number,
+        pr.head_oid,
+        draft.comments.len(),
+        if draft.comments.len() == 1 { "" } else { "s" }
+    );
+    out.push_str("\n## Summary\n\n");
+    match &draft.body {
+        Some(body) => out.push_str(&format!("{}\n", body.body)),
+        None => out.push_str("No summary yet.\n"),
+    }
+    for (i, c) in draft.comments.iter().enumerate() {
+        let span = if c.end > c.start {
+            format!("{}-{}", c.start, c.end)
+        } else {
+            c.start.to_string()
+        };
+        out.push_str(&format!(
+            "\n## ✎{} {}:{} (id {}, revision {})\n",
+            i + 1,
+            c.path,
+            span,
+            c.id,
+            c.revision
+        ));
+        match &c.snippet {
+            Some(rows) => {
+                out.push_str(&format!("\n```{}\n", ext_for_path(&c.path)));
+                for r in rows {
+                    let mark = if r.commented { '>' } else { ' ' };
+                    match r.line {
+                        Some(n) => out.push_str(&format!("{mark}{n:>5} {} {}\n", r.sign, r.text)),
+                        None => out.push_str(&format!("{mark}      {} {}\n", r.sign, r.text)),
+                    }
+                }
+                out.push_str("```\n");
+            }
+            None => out.push_str("\nNot in this diff: re-anchor or delete before posting.\n"),
+        }
+        out.push_str(&format!("\n{}\n", c.body));
+    }
+    out
+}
+
 fn render_agent_notes_markdown(comments: &[link::AgentNote]) -> String {
     let mut out = format!("# Agent notes ({})\n\n", comments.len());
     out.push_str(
@@ -565,6 +655,58 @@ mod tests {
             parse(&["review-comment", "--if-revision", "2", "a.rs:1=x"]).is_err(),
             "a new comment has no revision to check"
         );
+    }
+
+    #[test]
+    fn the_markdown_slate_reads_in_posting_order() {
+        let draft = link::ReviewDraft {
+            pull_request: link::PullRequestRef {
+                repository: "owner/repo".into(),
+                number: 42,
+                head_oid: "abc123".into(),
+            },
+            verdict: Some(link::Verdict::Approve),
+            body: Some(link::DraftReviewBody {
+                body: "Nice.\n\n--p+🤖".into(),
+                last_editor: link::DraftEditor::User,
+                revision: 2,
+            }),
+            comments: vec![
+                link::DraftReviewComment {
+                    id: 9,
+                    path: "src/a.rs".into(),
+                    start: 3,
+                    end: 4,
+                    body: "🤖 Tighten this.".into(),
+                    last_editor: link::DraftEditor::Agent,
+                    revision: 1,
+                    snippet: Some(vec![link::SnippetRow {
+                        line: Some(3),
+                        sign: '+',
+                        text: "let x = 1;".into(),
+                        commented: true,
+                    }]),
+                },
+                link::DraftReviewComment {
+                    id: 2,
+                    path: "gone.rs".into(),
+                    start: 1,
+                    end: 1,
+                    body: "Stranded.".into(),
+                    last_editor: link::DraftEditor::User,
+                    revision: 1,
+                    snippet: None,
+                },
+            ],
+        };
+        let out = render_review_markdown(&draft);
+        assert!(out.contains("verdict: approve"));
+        let summary = out.find("--p+🤖").unwrap();
+        let first = out.find("## ✎1 src/a.rs:3-4 (id 9, revision 1)").unwrap();
+        let second = out.find("## ✎2 gone.rs:1").unwrap();
+        assert!(summary < first && first < second);
+        assert!(out.contains(">    3 + let x = 1;"));
+        assert!(out.contains("Not in this diff"));
     }
 
     #[test]

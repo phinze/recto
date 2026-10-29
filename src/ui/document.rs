@@ -663,6 +663,19 @@ pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
                 format!("  head {}", short_oid(&pr.head_oid)),
                 Style::default().fg(theme::OVERLAY0),
             ),
+            Span::styled("  ·  verdict: ", Style::default().fg(theme::OVERLAY0)),
+            match app.review_verdict {
+                Some(link::Verdict::Approve) => {
+                    Span::styled("approve", Style::default().fg(theme::GREEN))
+                }
+                Some(link::Verdict::RequestChanges) => {
+                    Span::styled("request changes", Style::default().fg(theme::RED))
+                }
+                Some(link::Verdict::Comment) => {
+                    Span::styled("comment", Style::default().fg(theme::TEAL))
+                }
+                None => Span::styled("unset (V)", Style::default().fg(theme::OVERLAY0)),
+            },
         ]),
         Line::from(status),
     ];
@@ -682,6 +695,9 @@ pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     app.review_outline_area = layout.outline_area;
     app.review_quotes = layout.quotes;
     app.review_body_area = layout.body_area;
+    if let Some(item) = app.review_pending_item.take() {
+        app.jump_to_section(item);
+    }
 }
 
 pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {

@@ -271,6 +271,7 @@ pub(crate) fn handle_event(
                         edit_review_item_in_editor(app, terminal, editor_link);
                         mode = app.mode.clone();
                     }
+                    KeyCode::Char('V') => app.cycle_review_verdict(),
                     KeyCode::Enter => {
                         app.open_review_item_in_view();
                     }

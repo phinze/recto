@@ -169,6 +169,7 @@ impl App {
         if let Some(pull_request) = pull_request {
             store.set_review(
                 pull_request.clone(),
+                self.review_verdict,
                 self.review_draft_body.as_ref(),
                 &self.review_draft_comments,
                 self.next_review_draft_id,
@@ -241,6 +242,8 @@ impl App {
             link::Request::ReadAgentNotes => self.agent_notes_response(),
             link::Request::AcknowledgeAgentNotes { ids } => self.acknowledge_agent_notes(&ids),
             link::Request::ReviewDraft => self.review_draft_response(),
+            link::Request::ReviewVerdict { verdict } => self.set_review_verdict(verdict),
+            link::Request::ReviewFocus { id } => self.focus_review_item(id),
             link::Request::ReviewDraftBody { body, if_revision } => {
                 self.set_review_draft_body(body, link::DraftEditor::Agent, if_revision)
             }
@@ -342,6 +345,7 @@ impl App {
                 .as_ref()
                 .and_then(|store| store.review(&incoming_ref));
             if let Some(restored) = restored {
+                self.review_verdict = restored.verdict;
                 self.review_draft_body = restored.body;
                 self.review_draft_comments = restored.comments;
                 self.next_review_draft_id = restored.next_id;
@@ -351,6 +355,7 @@ impl App {
                     self.mode = Mode::NoteInput(composer);
                 }
             } else {
+                self.review_verdict = None;
                 self.review_draft_body = None;
                 self.review_draft_comments.clear();
                 self.next_review_draft_id = 1;
@@ -866,9 +871,63 @@ impl App {
                 number: pr.number,
                 head_oid: pr.head_oid.clone(),
             },
+            verdict: self.review_verdict,
             body: self.review_draft_body.clone(),
-            comments: self.review_draft_comments.clone(),
+            comments: self
+                .review_draft_comments
+                .iter()
+                .map(|comment| link::DraftReviewComment {
+                    snippet: self.snippet_for(&comment.path, comment.start, comment.end),
+                    ..comment.clone()
+                })
+                .collect(),
         })
+    }
+
+    /// Set or clear the verdict. It is the reader's call; a companion sets it
+    /// only when told to.
+    pub(crate) fn set_review_verdict(&mut self, verdict: Option<link::Verdict>) -> link::Response {
+        if self.pull_request.is_none() {
+            return link::Response::err("attach a pull request before drafting a review");
+        }
+        self.review_verdict = verdict;
+        self.persist_soon();
+        self.review_draft_response()
+    }
+
+    /// Step the verdict through its choices, the slate's `V`.
+    pub(crate) fn cycle_review_verdict(&mut self) {
+        use link::Verdict::*;
+        let next = match self.review_verdict {
+            None => Some(Approve),
+            Some(Approve) => Some(RequestChanges),
+            Some(RequestChanges) => Some(Comment),
+            Some(Comment) => None,
+        };
+        self.set_review_verdict(next);
+    }
+
+    /// Bring the slate into view at one item: the summary, or the draft with
+    /// this stable id. Like a tour section, the scroll waits for the next draw,
+    /// which knows where the item landed.
+    pub(crate) fn focus_review_item(&mut self, id: Option<u64>) -> link::Response {
+        if self.pull_request.is_none() {
+            return link::Response::err("no pull request attached");
+        }
+        let item = match id {
+            None => 0,
+            Some(id) => match self.review_draft_comments.iter().position(|c| c.id == id) {
+                Some(i) => i + 1,
+                None => {
+                    return link::Response::err(format!(
+                        "review draft comment {id} does not exist"
+                    ));
+                }
+            },
+        };
+        self.review_pending_item = Some(item);
+        self.page = Page::Review;
+        link::Response::ok()
     }
 
     fn review_draft_response(&self) -> link::Response {
@@ -952,6 +1011,7 @@ impl App {
             body,
             last_editor,
             revision: 1,
+            snippet: None,
         });
         self.persist_soon();
         self.settle_draft_write(last_editor, Some((file_idx, start, end)));

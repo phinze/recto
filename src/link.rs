@@ -89,6 +89,19 @@ pub enum Request {
     /// Read the shared, local-only review draft without consuming it.
     #[serde(rename = "review")]
     ReviewDraft,
+    /// Set or clear the review's verdict.
+    #[serde(rename = "review-verdict")]
+    ReviewVerdict {
+        #[serde(default)]
+        verdict: Option<Verdict>,
+    },
+    /// Show the review slate scrolled to one item: the summary when `id` is
+    /// absent, otherwise the inline draft with that stable id.
+    #[serde(rename = "review-focus")]
+    ReviewFocus {
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        id: Option<u64>,
+    },
     /// Create, revise, or delete the shared top-level review body. An empty
     /// body deletes the draft. With `if_revision`, the write is refused unless
     /// the body is still at that revision.
@@ -157,8 +170,31 @@ pub struct AgentNote {
 pub struct ReviewDraft {
     pub pull_request: PullRequestRef,
     #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub verdict: Option<Verdict>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
     pub body: Option<DraftReviewBody>,
+    /// In slate order, which is the order they post in.
     pub comments: Vec<DraftReviewComment>,
+}
+
+/// The event a review posts as. Setting it is the reader's call, made on the
+/// slate or by telling the agent to.
+#[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum Verdict {
+    Approve,
+    RequestChanges,
+    Comment,
+}
+
+impl Verdict {
+    pub fn label(self) -> &'static str {
+        match self {
+            Verdict::Approve => "approve",
+            Verdict::RequestChanges => "request changes",
+            Verdict::Comment => "comment",
+        }
+    }
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -181,6 +217,10 @@ pub struct DraftReviewComment {
     pub last_editor: DraftEditor,
     #[serde(default)]
     pub revision: u64,
+    /// The diff rows the comment points at, filled in only on the way out to
+    /// a companion. Absent means the span no longer resolves in this diff.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub snippet: Option<Vec<SnippetRow>>,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -808,8 +848,14 @@ fn handle_while_in_editor(
         }
         // The draft cannot be read from here, so a write would land on top of
         // whatever the reader saves on the way back, unseen by both sides.
-        Request::ReviewDraftBody { .. } | Request::ReviewDraftComment { .. } => {
+        Request::ReviewDraftBody { .. }
+        | Request::ReviewDraftComment { .. }
+        | Request::ReviewVerdict { .. } => {
             Response::err("recto is in an editor; leave it before revising the review draft")
+        }
+        Request::ReviewFocus { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; the review will show when you return")
         }
     }
 }
@@ -1079,7 +1125,9 @@ mod tests {
                 body: "Shared words.".into(),
                 last_editor: DraftEditor::Agent,
                 revision: 0,
+                snippet: None,
             }],
+            verdict: None,
         });
         let json = serde_json::to_string(&response).expect("serialize");
         let back: Response = serde_json::from_str(&json).expect("round trip");

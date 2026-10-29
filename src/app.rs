@@ -454,6 +454,10 @@ pub(crate) struct App {
     /// comments it has no file anchor and is authored from the PR overview.
     pub(crate) review_draft_body: Option<link::DraftReviewBody>,
     pub(crate) next_review_draft_id: u64,
+    pub(crate) review_verdict: Option<link::Verdict>,
+    /// A slate item a companion asked to see before the page had geometry to
+    /// resolve it against. Spent by the next draw.
+    pub(crate) review_pending_item: Option<usize>,
     /// XDG-backed durable state keyed by this workspace's canonical root.
     pub(crate) persistence: Option<state::Store>,
     pub(crate) persistence_due: Option<Instant>,
@@ -636,6 +640,8 @@ impl App {
             review_draft_comments: Vec::new(),
             review_draft_body: None,
             next_review_draft_id: 1,
+            review_verdict: None,
+            review_pending_item: None,
             persistence,
             persistence_due: None,
             diff_cursor: None,
@@ -2177,6 +2183,7 @@ mod tests {
         };
         store.set_review(
             key,
+            Some(link::Verdict::Approve),
             Some(&link::DraftReviewBody {
                 body: "Saved overall review".into(),
                 last_editor: link::DraftEditor::User,
@@ -2190,6 +2197,7 @@ mod tests {
                 body: "Saved inline comment".into(),
                 last_editor: link::DraftEditor::Agent,
                 revision: 0,
+                snippet: None,
             }],
             8,
         );
@@ -2213,6 +2221,7 @@ mod tests {
         );
         assert_eq!(app.review_draft_comments[0].id, 7);
         assert_eq!(app.next_review_draft_id, 8);
+        assert_eq!(app.review_verdict, Some(link::Verdict::Approve));
     }
 
     #[test]
@@ -2288,6 +2297,7 @@ mod tests {
             body: "unanchored".into(),
             last_editor: link::DraftEditor::Agent,
             revision: 0,
+            snippet: None,
         });
         app.next_review_draft_id = 2;
         for line in [111, 2] {
@@ -2348,6 +2358,7 @@ mod tests {
             body: "stranded".into(),
             last_editor: link::DraftEditor::User,
             revision: 0,
+            snippet: None,
         });
         app.reweave();
 
@@ -2458,6 +2469,52 @@ mod tests {
         assert!(app.submit_composer(&composer).unwrap().ok);
         assert_eq!(app.review_draft_comments[0].body, "reader's");
         assert_eq!(app.review_draft_comments[0].revision, 3);
+    }
+
+    #[test]
+    fn a_companion_can_point_at_the_slate_and_set_the_verdict() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.pull_request = Some(empty_pull_request("base"));
+        let agent = link::DraftEditor::Agent;
+        app.add_review_draft_comment("foo.go", 111, None, "second".into(), agent);
+        app.add_review_draft_comment("foo.go", 2, None, "first".into(), agent);
+        let later = app.review_draft_comments[1].id;
+
+        let focused = app.handle_request(link::Request::ReviewFocus { id: Some(later) });
+        assert!(focused.ok);
+        assert_eq!(app.page, Page::Review);
+        let terminal_backend = ratatui::backend::TestBackend::new(100, 30);
+        let mut terminal = Terminal::new(terminal_backend).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(
+            app.review_item_in_view(),
+            2,
+            "draft ✎2 is the one asked for"
+        );
+        assert!(
+            !app.handle_request(link::Request::ReviewFocus { id: Some(404) })
+                .ok
+        );
+
+        let set = app.handle_request(link::Request::ReviewVerdict {
+            verdict: Some(link::Verdict::RequestChanges),
+        });
+        let draft = set.review_draft.unwrap();
+        assert_eq!(draft.verdict, Some(link::Verdict::RequestChanges));
+        // Snippets ride along on the way out, so the agent reads the same
+        // excerpt the slate shows.
+        let snippet = draft.comments[0].snippet.as_ref().unwrap();
+        assert!(
+            snippet
+                .iter()
+                .any(|row| row.commented && row.line == Some(2))
+        );
+        app.cycle_review_verdict();
+        assert_eq!(app.review_verdict, Some(link::Verdict::Comment));
+        app.cycle_review_verdict();
+        assert_eq!(app.review_verdict, None);
     }
 
     #[test]
@@ -2630,6 +2687,7 @@ mod tests {
             body: "Shared draft".into(),
             last_editor: link::DraftEditor::User,
             revision: 0,
+            snippet: None,
         });
         app.agent_notes.push(AgentNote {
             id: 8,

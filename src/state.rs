@@ -16,7 +16,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 use crate::app::{AgentNote, Annotation, FocusAnchor, NoteDraft};
-use crate::link::{DraftReviewBody, DraftReviewComment, PullRequest, PullRequestRef};
+use crate::link::{DraftReviewBody, DraftReviewComment, PullRequest, PullRequestRef, Verdict};
 
 const SCHEMA_VERSION: u32 = 2;
 const LEGACY_SCHEMA_VERSION: u32 = 1;
@@ -42,6 +42,8 @@ struct ReviewState {
     next_id: u64,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     composer: Option<NoteDraft>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    verdict: Option<Verdict>,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -109,6 +111,7 @@ pub struct Store {
 }
 
 pub struct RestoredReview {
+    pub verdict: Option<Verdict>,
     pub body: Option<DraftReviewBody>,
     pub comments: Vec<DraftReviewComment>,
     pub next_id: u64,
@@ -240,6 +243,7 @@ impl Store {
             .iter()
             .find(|review| review.pull_request == *pull_request)
             .map(|review| RestoredReview {
+                verdict: review.verdict,
                 body: review.body.clone(),
                 comments: review.comments.clone(),
                 next_id: review
@@ -261,6 +265,7 @@ impl Store {
     pub fn set_review(
         &mut self,
         pull_request: PullRequestRef,
+        verdict: Option<Verdict>,
         body: Option<&DraftReviewBody>,
         comments: &[DraftReviewComment],
         next_id: u64,
@@ -277,6 +282,7 @@ impl Store {
             comments: comments.to_vec(),
             next_id: next_id.max(1),
             composer,
+            verdict,
         };
         match self
             .document
@@ -541,6 +547,7 @@ mod tests {
         };
         store.set_review(
             pull_request.clone(),
+            Some(Verdict::RequestChanges),
             Some(&DraftReviewBody {
                 body: "Overall".into(),
                 last_editor: crate::link::DraftEditor::User,
@@ -554,6 +561,7 @@ mod tests {
                 body: "Inline".into(),
                 last_editor: crate::link::DraftEditor::Agent,
                 revision: 0,
+                snippet: None,
             }],
             8,
         );
@@ -566,6 +574,7 @@ mod tests {
         assert_eq!(review.body.unwrap().body, "Overall");
         assert_eq!(review.comments[0].body, "Inline");
         assert_eq!(review.next_id, 8);
+        assert_eq!(review.verdict, Some(Verdict::RequestChanges));
         assert_eq!(review.composer, Some(review_composer));
         assert!(!workspace.join(".recto").exists());
     }
@@ -711,6 +720,7 @@ mod tests {
         };
         store.set_review(
             old.clone(),
+            None,
             Some(&DraftReviewBody {
                 body: "Only for the old diff".into(),
                 last_editor: crate::link::DraftEditor::User,
