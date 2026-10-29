@@ -386,6 +386,12 @@ means no notes were pending. It exits 1 only when recto is parked in an
 editor, where the TUI loop cannot answer the read. Ask
 the user to come back to recto, then try again.
 
+The review draft commands (`review`, `review-body`, `review-comment`) also
+exit 1 while recto is parked in an editor. A write is refused rather than
+queued, since you could not have read what it would replace. Draft writes
+never move the user's page, scroll, or cursor; use `focus` when you want them
+looking at the comment.
+
 ## Reading the ping
 
 Always `recto ping` first if you're unsure recto is open. A clean ping

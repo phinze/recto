@@ -2187,6 +2187,63 @@ mod tests {
     }
 
     #[test]
+    fn companion_draft_writes_leave_the_reader_where_they_were() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.pull_request = Some(empty_pull_request("base"));
+        let row_of = |app: &App, line: u32| {
+            app.line_info
+                .iter()
+                .position(|info| *info == Some((0, line)))
+                .unwrap()
+        };
+        let reading = row_of(&app, 112);
+        app.scroll = reading;
+        app.diff_cursor = Some(reading);
+        app.page = Page::PullRequest;
+        let still_reading = |app: &App| {
+            assert_eq!(app.page, Page::PullRequest);
+            assert_eq!(app.diff_cursor, Some(row_of(app, 112)));
+            assert_eq!(app.source_line_at_row(app.scroll), Some(row_of(app, 112)));
+        };
+
+        let added = app.handle_request(link::Request::ReviewDraftComment {
+            id: None,
+            path: Some("foo.go".into()),
+            start: Some(2),
+            end: None,
+            body: "one\n\ntwo\n\nthree".into(),
+        });
+        assert!(added.ok);
+        assert!(row_of(&app, 112) > reading, "the draft rows landed above");
+        still_reading(&app);
+
+        let id = app.review_draft_comments[0].id;
+        let revised = app.handle_request(link::Request::ReviewDraftComment {
+            id: Some(id),
+            path: None,
+            start: None,
+            end: None,
+            body: "a\n\nmuch\n\nlonger\n\ncomment".into(),
+        });
+        assert!(revised.ok);
+        still_reading(&app);
+
+        // The reader's own write still follows the span they wrote on.
+        let own = app.add_review_draft_comment(
+            "foo.go",
+            111,
+            None,
+            "mine".into(),
+            link::DraftEditor::User,
+        );
+        assert!(own.ok);
+        assert_eq!(app.page, Page::Diff);
+        assert_eq!(app.diff_cursor, Some(row_of(&app, 111)));
+    }
+
+    #[test]
     fn note_acknowledgement_removes_only_the_ids_that_were_read() {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();

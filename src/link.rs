@@ -782,11 +782,10 @@ fn handle_while_in_editor(
         Request::ReviewDraft => {
             Response::err("recto is in an editor; leave it before reading the review draft")
         }
+        // The draft cannot be read from here, so a write would land on top of
+        // whatever the reader saves on the way back, unseen by both sides.
         Request::ReviewDraftBody { .. } | Request::ReviewDraftComment { .. } => {
-            queue(tx, request.clone());
-            Response::ok_note(
-                "recto is in an editor; the shared draft update will land when you return",
-            )
+            Response::err("recto is in an editor; leave it before revising the review draft")
         }
     }
 }
@@ -1439,6 +1438,25 @@ mod tests {
         assert!(resp.ok);
         let queued = rx.try_recv().expect("comment reaches the main loop");
         assert!(matches!(queued.request, Request::AgentNote { .. }));
+
+        // A shared draft is different: it cannot be read from here, so a
+        // queued write would land unseen on top of the reader's own save.
+        for request in [
+            Request::ReviewDraftBody {
+                body: "summary".into(),
+            },
+            Request::ReviewDraftComment {
+                id: Some(1),
+                path: None,
+                start: None,
+                end: None,
+                body: "revised".into(),
+            },
+        ] {
+            let resp = handle_while_in_editor(&request, &tx, &editor);
+            assert!(!resp.ok, "draft writes must fail while parked");
+            assert!(rx.try_recv().is_err(), "and must not be queued");
+        }
     }
 
     #[test]

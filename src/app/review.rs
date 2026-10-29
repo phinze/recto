@@ -622,6 +622,50 @@ impl App {
         self.rebuild_display_rows();
     }
 
+    /// Reweave without moving what the reader is looking at. A companion write
+    /// can add or grow note rows above the viewport, which would otherwise
+    /// slide the code under the reader's eyes, so the top row and the cursor
+    /// are pinned to the diff row they sit on (or just above) and resolved
+    /// again after the weave.
+    fn reweave_holding_view(&mut self) {
+        if self.rendered_review_objects.len() != self.rendered.len() {
+            self.reweave();
+            return;
+        }
+        // Woven rows carry a review object and diff rows do not, so counting
+        // the bare rows gives a position that survives the weave.
+        let pin = |app: &App, row: usize| {
+            let objects = &app.rendered_review_objects;
+            let base = (row..objects.len())
+                .find(|&r| objects[r].is_none())
+                .unwrap_or(objects.len());
+            let above = base - row.min(base);
+            let index = objects[..base].iter().filter(|o| o.is_none()).count();
+            (index, above)
+        };
+        let unpin = |app: &App, (index, above): (usize, usize)| {
+            let base = app
+                .rendered_review_objects
+                .iter()
+                .enumerate()
+                .filter(|(_, o)| o.is_none())
+                .nth(index)
+                .map_or(app.rendered.len(), |(r, _)| r);
+            base.saturating_sub(above)
+        };
+        let top = self.display_position(self.scroll);
+        let top_pin = top.map(|(line, _)| pin(self, line));
+        let cursor_pin = self.diff_cursor.map(|row| pin(self, row));
+        self.reweave();
+        if let (Some((_, offset)), Some(p)) = (top, top_pin) {
+            let line = unpin(self, p);
+            self.scroll = (self.display_row_of_line(line) + offset).min(self.max_scroll());
+        }
+        if let Some(p) = cursor_pin {
+            self.diff_cursor = Some(unpin(self, p).min(self.rendered.len().saturating_sub(1)));
+        }
+    }
+
     /// Replace the annotation set and weave it into the render. Scrolls to the
     /// first resolvable step — "step 1 here" should land eyes there — and
     /// reports any sites that didn't resolve so the driving agent can correct
@@ -847,13 +891,7 @@ impl App {
             last_editor,
         });
         self.persist_soon();
-        self.reweave();
-        if let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end) {
-            self.reveal_span(&rows);
-            self.diff_cursor = Some(*rows.start());
-            self.page = Page::Diff;
-            self.take_diff_focus();
-        }
+        self.settle_draft_write(last_editor, Some((file_idx, start, end)));
         self.review_draft_response()
     }
 
@@ -884,17 +922,31 @@ impl App {
             self.review_draft_comments[idx].last_editor = last_editor;
         }
         self.persist_soon();
+        let follow = (!deleting)
+            .then(|| self.changes.iter().position(|c| c.path == anchor.0))
+            .flatten()
+            .map(|file_idx| (file_idx, anchor.1, anchor.2));
+        self.settle_draft_write(last_editor, follow);
+        self.review_draft_response()
+    }
+
+    /// Fold a draft write back into the diff. The reader just wrote theirs, so
+    /// the view follows it to its span; a companion write leaves the reader
+    /// wherever they were reading, on whatever page that was.
+    fn settle_draft_write(&mut self, editor: link::DraftEditor, follow: Option<(usize, u32, u32)>) {
+        if editor == link::DraftEditor::Agent {
+            self.reweave_holding_view();
+            return;
+        }
         self.reweave();
-        if !deleting
-            && let Some(file_idx) = self.changes.iter().position(|c| c.path == anchor.0)
-            && let Some(rows) = rows_for_span(&self.line_info, file_idx, anchor.1, anchor.2)
+        if let Some((file_idx, start, end)) = follow
+            && let Some(rows) = rows_for_span(&self.line_info, file_idx, start, end)
         {
             self.reveal_span(&rows);
             self.diff_cursor = Some(*rows.start());
             self.page = Page::Diff;
             self.take_diff_focus();
         }
-        self.review_draft_response()
     }
 
     pub(crate) fn review_draft_comment_at(&self, path: &str, line: u32) -> Option<usize> {
