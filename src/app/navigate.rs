@@ -231,7 +231,8 @@ impl App {
         let (path, line) = self.cursor_target()?;
         let threads = &self.pull_request.as_ref()?.threads;
         let contains_cursor = |thread: &link::ReviewThread| {
-            thread.path == path
+            thread.is_open()
+                && thread.path == path
                 && review_thread_span(thread)
                     .is_some_and(|(start, end)| (start..=end).contains(&line))
         };

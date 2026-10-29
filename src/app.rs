@@ -2017,6 +2017,7 @@ mod tests {
             .map(|i| format!("paragraph {i}"))
             .collect::<Vec<_>>()
             .join("\n\n");
+        pr.conversation.push(conversation_comment());
         app.pull_request = Some(pr);
         app.page = Page::PullRequest;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
@@ -2040,7 +2041,9 @@ mod tests {
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         let terminal_backend = ratatui::backend::TestBackend::new(50, 24);
         let mut terminal = Terminal::new(terminal_backend).unwrap();
-        app.pull_request = Some(empty_pull_request("base"));
+        let mut pr = empty_pull_request("base");
+        pr.conversation.push(conversation_comment());
+        app.pull_request = Some(pr);
         app.page = Page::PullRequest;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
@@ -2515,6 +2518,62 @@ mod tests {
         assert_eq!(app.review_verdict, Some(link::Verdict::Comment));
         app.cycle_review_verdict();
         assert_eq!(app.review_verdict, None);
+    }
+
+    #[test]
+    fn settled_threads_stay_out_of_the_diff_and_the_file_pane() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        let thread = |id: &str, line: u32, resolved: bool| link::ReviewThread {
+            id: id.into(),
+            path: "foo.go".into(),
+            side: link::DiffSide::Right,
+            line: Some(line),
+            start_line: None,
+            original_line: Some(line),
+            original_start_line: None,
+            resolved,
+            outdated: false,
+            comments: Vec::new(),
+        };
+        let mut pr = empty_pull_request("base");
+        pr.threads = vec![thread("settled", 2, true), thread("live", 111, false)];
+        app.pull_request = Some(pr);
+        app.reweave();
+
+        let woven: Vec<_> = app
+            .rendered_review_objects
+            .iter()
+            .flatten()
+            .filter(|object| matches!(object, FileReviewObject::PublishedThread(_)))
+            .collect();
+        assert_eq!(woven, vec![&FileReviewObject::PublishedThread(1)]);
+        let listed = app
+            .file_rows
+            .iter()
+            .filter(|row| {
+                matches!(
+                    row,
+                    FileRow::ReviewObject {
+                        object: FileReviewObject::PublishedThread(_),
+                        ..
+                    }
+                )
+            })
+            .count();
+        assert_eq!(listed, 1);
+        assert_eq!(
+            app.review_thread_rows()
+                .into_iter()
+                .map(|(i, _)| i)
+                .collect::<Vec<_>>(),
+            vec![1],
+            "t / T in the diff walk open threads only"
+        );
+        // The PR page still walks every thread, settled ones included.
+        assert!(app.cycle_public_thread(1));
+        assert_eq!(app.active_thread, Some(0));
     }
 
     #[test]

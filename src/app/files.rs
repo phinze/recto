@@ -129,7 +129,7 @@ pub(crate) fn build_review_file_rows(
             threads
                 .iter()
                 .enumerate()
-                .filter(|(_, thread)| thread.path == *path)
+                .filter(|(_, thread)| thread.path == *path && thread.is_open())
                 .map(|(i, _)| FileRow::ReviewObject {
                     file_idx,
                     object: FileReviewObject::PublishedThread(i),
@@ -413,7 +413,8 @@ impl App {
                 .as_ref()
                 .map_or(&[][..], |pr| pr.threads.as_slice());
             let contains = |thread: &link::ReviewThread| {
-                thread.path == *path
+                thread.is_open()
+                    && thread.path == *path
                     && review_thread_span(thread)
                         .is_some_and(|(start, end)| (start..=end).contains(&line))
             };

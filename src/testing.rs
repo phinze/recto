@@ -208,3 +208,16 @@ pub(crate) fn change(path: &str) -> FileChange {
         status: FileStatus::Modified,
     }
 }
+
+/// A conversation comment, for PR documents that need more than a description.
+pub(crate) fn conversation_comment() -> link::ConversationComment {
+    link::ConversationComment {
+        author: link::Actor {
+            login: "teammate".into(),
+            name: None,
+        },
+        body: "A conversation comment.".into(),
+        created_at: "2026-08-14T12:00:00Z".into(),
+        url: "https://github.com/owner/repo/pull/42#issuecomment-1".into(),
+    }
+}

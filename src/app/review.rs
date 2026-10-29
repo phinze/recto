@@ -540,7 +540,7 @@ impl App {
         }
         if self.show_comments {
             if let Some(pr) = &self.pull_request {
-                for (i, thread) in pr.threads.iter().enumerate() {
+                for (i, thread) in pr.threads.iter().enumerate().filter(|(_, t)| t.is_open()) {
                     let Some((start, end)) = review_thread_span(thread) else {
                         continue;
                     };
@@ -1323,6 +1323,7 @@ impl App {
             .as_ref()
             .into_iter()
             .flat_map(|pr| pr.threads.iter().enumerate())
+            .filter(|(_, thread)| thread.is_open())
             .filter_map(|(i, thread)| {
                 let (start, end) = review_thread_span(thread)?;
                 let file_idx = self.changes.iter().position(|c| c.path == thread.path)?;

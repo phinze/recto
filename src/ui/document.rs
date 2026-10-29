@@ -742,7 +742,7 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
     ];
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    let document = pull_request_document(pr, app.review_draft_body.as_ref());
+    let document = pull_request_document(pr);
     let layout = draw_document(
         frame,
         rows[1],
@@ -757,33 +757,13 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
     app.pr_outline_area = layout.outline_area;
 }
 
-fn pull_request_document(
-    pr: &link::PullRequest,
-    draft_body: Option<&link::DraftReviewBody>,
-) -> Document {
+fn pull_request_document(pr: &link::PullRequest) -> Document {
     let mut doc = Document::default();
     doc.section("Description");
     if pr.body.trim().is_empty() {
         doc.push(dim_line("No description."));
     } else {
         doc.extend(markdown::lines(&pr.body));
-    }
-
-    doc.section("Shared review draft");
-    if let Some(draft) = draft_body {
-        let editor = match draft.last_editor {
-            link::DraftEditor::User => "you last edited",
-            link::DraftEditor::Agent => "agent last edited",
-        };
-        doc.push(Line::from(Span::styled(
-            editor,
-            Style::default().fg(theme::YELLOW),
-        )));
-        doc.extend(markdown::lines(&draft.body));
-    } else {
-        doc.push(dim_line(
-            "No top-level review drafted. Press c to start one.",
-        ));
     }
 
     if !pr.conversation.is_empty() {
@@ -819,20 +799,32 @@ fn pull_request_document(
                 review.submitted_at.as_deref(),
                 color,
             );
-            if review.body.trim().is_empty() {
-                doc.push(dim_line("No review summary."));
-            } else {
+            // A bodiless review is just the event; its header already says it.
+            if !review.body.trim().is_empty() {
                 doc.extend(markdown::lines(&review.body));
+                doc.push(Line::default());
             }
-            doc.push(Line::default());
         }
     }
-    if !pr.threads.is_empty() {
-        doc.section("Review threads");
-        for (i, thread) in pr.threads.iter().enumerate() {
+    let (open, settled): (Vec<_>, Vec<_>) = pr
+        .threads
+        .iter()
+        .enumerate()
+        .partition(|(_, thread)| thread.is_open());
+    if !open.is_empty() {
+        doc.section("Open threads");
+        for (i, thread) in open {
             thread_heading(&mut doc.lines, i + 1, thread);
             doc.extend(review_thread_lines(thread));
             doc.push(Line::default());
+        }
+    }
+    // Settled history stays reachable (t / T walk every thread) without
+    // spending a screen per conversation nobody needs to reread.
+    if !settled.is_empty() {
+        doc.section(&format!("Resolved and outdated ({})", settled.len()));
+        for (i, thread) in settled {
+            thread_heading(&mut doc.lines, i + 1, thread);
         }
     }
     doc
@@ -1140,28 +1132,37 @@ mod tests {
                 }],
             }],
         };
-        let review_body = link::DraftReviewBody {
-            body: "The shared top-level review.".into(),
-            last_editor: link::DraftEditor::Agent,
-            revision: 0,
-        };
-        let text: Vec<String> = pull_request_document(&pr, Some(&review_body))
+        let mut pr = pr;
+        let mut settled = pr.threads[0].clone();
+        settled.id = "thread-2".into();
+        settled.resolved = true;
+        settled.comments[0].body = "Long since handled.".into();
+        pr.threads.push(settled);
+        let text: Vec<String> = pull_request_document(&pr)
             .lines
             .iter()
             .map(Line::to_string)
             .collect();
         assert!(text.iter().any(|line| line == "Description"));
-        assert!(text.iter().any(|line| line == "Shared review draft"));
         assert!(
-            text.iter()
-                .any(|line| line == "The shared top-level review.")
+            !text.iter().any(|line| line.contains("review draft")),
+            "the draft lives on the slate now"
         );
         assert!(text.iter().any(|line| line == "Conversation"));
         assert!(text.iter().any(|line| line == "Reviews"));
-        assert!(text.iter().any(|line| line == "Review threads"));
+        assert!(text.iter().any(|line| line == "Open threads"));
         assert!(
             text.iter()
                 .any(|line| line.contains("Thread 1  src/main.rs:42  open"))
+        );
+        assert!(text.iter().any(|line| line == "Resolved and outdated (1)"));
+        assert!(
+            text.iter()
+                .any(|line| line.contains("Thread 2  src/main.rs:42  resolved"))
+        );
+        assert!(
+            !text.iter().any(|line| line.contains("Long since handled")),
+            "a settled thread folds to its heading"
         );
         assert!(
             text.iter()

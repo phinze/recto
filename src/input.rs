@@ -299,7 +299,11 @@ pub(crate) fn handle_event(
                     KeyCode::Char('p') | KeyCode::Esc => {
                         app.page = Page::Diff;
                     }
+                    // The summary is written on the slate now; land there
+                    // with its composer open, so old muscle memory still works.
                     KeyCode::Char('c') => {
+                        app.page = Page::Review;
+                        app.review_pending_item = Some(0);
                         app.mode = Mode::NoteInput(app.review_body_composer());
                         mode = app.mode.clone();
                     }

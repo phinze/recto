@@ -288,6 +288,14 @@ pub struct ReviewThread {
     pub comments: Vec<ReviewComment>,
 }
 
+impl ReviewThread {
+    /// Still a live conversation. Resolved and outdated threads are settled
+    /// history: the PR page keeps them, the diff and file pane do not.
+    pub fn is_open(&self) -> bool {
+        !self.resolved && !self.outdated
+    }
+}
+
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct ReviewComment {
     pub id: String,
