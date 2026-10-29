@@ -48,6 +48,11 @@ pub(crate) struct NoteDraft {
     /// rather than vector positions, so a companion-side update while the
     /// composer is open cannot make the save land on a different item.
     pub(crate) editing: Option<ComposerEdit>,
+    /// Revision of the shared draft this composer opened on. Saving checks it,
+    /// so a companion write made while the composer was open is not silently
+    /// overwritten. `None` saves unconditionally.
+    #[serde(default)]
+    pub(crate) base_revision: Option<u64>,
 }
 
 /// Geometry from the latest composer draw. Mouse input arrives between draws,

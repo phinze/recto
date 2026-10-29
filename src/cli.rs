@@ -74,14 +74,22 @@ pub(crate) enum ClientCommand {
     /// may be called throughout co-authoring.
     Review,
     /// Add, revise, or delete the shared top-level review body. An empty BODY
-    /// deletes the draft.
-    ReviewBody { body: String },
+    /// deletes the draft. --if-revision refuses the write unless the body is
+    /// still at the revision you last read.
+    ReviewBody {
+        body: String,
+        #[arg(long)]
+        if_revision: Option<u64>,
+    },
     /// Add or revise a shared public review comment. Without --id, INPUT is
     /// `path:LINE=body` or `path:START-END=body`. With --id, INPUT is the new
-    /// body; an empty body deletes that draft.
+    /// body; an empty body deletes that draft, and --if-revision refuses the
+    /// write unless the comment is still at the revision you last read.
     ReviewComment {
         #[arg(long)]
         id: Option<u64>,
+        #[arg(long, requires = "id")]
+        if_revision: Option<u64>,
         input: String,
     },
 }
@@ -187,6 +195,13 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             0
         }
         Ok(resp) => {
+            // A refused draft write carries the draft as it stands, so the
+            // writer can start from it rather than read it back separately.
+            if let Some(draft) = &resp.review_draft
+                && let Ok(json) = serde_json::to_string_pretty(draft)
+            {
+                println!("{json}");
+            }
             eprintln!(
                 "recto: {}",
                 resp.error.unwrap_or_else(|| "request refused".into())
@@ -365,11 +380,13 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
             Ok(link::Request::AcknowledgeAgentNotes { ids: ack.clone() })
         }
         ClientCommand::Review => Ok(link::Request::ReviewDraft),
-        ClientCommand::ReviewBody { body } => {
-            Ok(link::Request::ReviewDraftBody { body: body.clone() })
-        }
+        ClientCommand::ReviewBody { body, if_revision } => Ok(link::Request::ReviewDraftBody {
+            body: body.clone(),
+            if_revision: *if_revision,
+        }),
         ClientCommand::ReviewComment {
             id: Some(id),
+            if_revision,
             input,
         } => Ok(link::Request::ReviewDraftComment {
             id: Some(*id),
@@ -377,8 +394,11 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
             start: None,
             end: None,
             body: input.clone(),
+            if_revision: *if_revision,
         }),
-        ClientCommand::ReviewComment { id: None, input } => {
+        ClientCommand::ReviewComment {
+            id: None, input, ..
+        } => {
             let (pathspec, body) = input
                 .split_once('=')
                 .ok_or_else(|| anyhow!("missing `=body` in review-comment input: {input}"))?;
@@ -394,6 +414,7 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
                 start: Some(start),
                 end,
                 body: body.to_string(),
+                if_revision: None,
             })
         }
         ClientCommand::Note { spec } => {
@@ -511,15 +532,52 @@ mod tests {
     }
 
     #[test]
+    fn if_revision_rides_along_on_revisions_only() {
+        #[derive(clap::Parser)]
+        struct Client {
+            #[command(subcommand)]
+            command: ClientCommand,
+        }
+        let parse = |args: &[&str]| {
+            <Client as clap::Parser>::try_parse_from(
+                std::iter::once("recto").chain(args.iter().copied()),
+            )
+            .map(|client| client.command)
+        };
+        let command = parse(&[
+            "review-comment",
+            "--id",
+            "7",
+            "--if-revision",
+            "2",
+            "new body",
+        ])
+        .unwrap();
+        assert!(matches!(
+            build_request(&command).unwrap(),
+            link::Request::ReviewDraftComment {
+                id: Some(7),
+                if_revision: Some(2),
+                ..
+            }
+        ));
+        assert!(
+            parse(&["review-comment", "--if-revision", "2", "a.rs:1=x"]).is_err(),
+            "a new comment has no revision to check"
+        );
+    }
+
+    #[test]
     fn review_body_command_preserves_markdown() {
         let request = build_request(&ClientCommand::ReviewBody {
             body: "## Summary\n\nLooks good.".into(),
+            if_revision: None,
         })
         .unwrap();
 
         assert!(matches!(
             request,
-            link::Request::ReviewDraftBody { body }
+            link::Request::ReviewDraftBody { body, .. }
                 if body == "## Summary\n\nLooks good."
         ));
     }

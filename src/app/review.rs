@@ -241,8 +241,8 @@ impl App {
             link::Request::ReadAgentNotes => self.agent_notes_response(),
             link::Request::AcknowledgeAgentNotes { ids } => self.acknowledge_agent_notes(&ids),
             link::Request::ReviewDraft => self.review_draft_response(),
-            link::Request::ReviewDraftBody { body } => {
-                self.set_review_draft_body(body, link::DraftEditor::Agent)
+            link::Request::ReviewDraftBody { body, if_revision } => {
+                self.set_review_draft_body(body, link::DraftEditor::Agent, if_revision)
             }
             link::Request::ReviewDraftComment {
                 id,
@@ -250,8 +250,14 @@ impl App {
                 start,
                 end,
                 body,
+                if_revision,
             } => match id {
-                Some(id) => self.revise_review_draft_comment(id, body, link::DraftEditor::Agent),
+                Some(id) => self.revise_review_draft_comment(
+                    id,
+                    body,
+                    link::DraftEditor::Agent,
+                    if_revision,
+                ),
                 None => {
                     let (Some(path), Some(start)) = (path, start) else {
                         return link::Response::err(
@@ -852,11 +858,9 @@ impl App {
         link::Response::ok_note(format!("acknowledged {removed} agent note(s)"))
     }
 
-    fn review_draft_response(&self) -> link::Response {
-        let Some(pr) = &self.pull_request else {
-            return link::Response::err("no pull request attached");
-        };
-        link::Response::ok_review_draft(link::ReviewDraft {
+    fn review_draft(&self) -> Option<link::ReviewDraft> {
+        let pr = self.pull_request.as_ref()?;
+        Some(link::ReviewDraft {
             pull_request: link::PullRequestRef {
                 repository: pr.repository.clone(),
                 number: pr.number,
@@ -867,17 +871,49 @@ impl App {
         })
     }
 
+    fn review_draft_response(&self) -> link::Response {
+        match self.review_draft() {
+            Some(draft) => link::Response::ok_review_draft(draft),
+            None => link::Response::err("no pull request attached"),
+        }
+    }
+
+    /// Refuse a write made against a revision the item has since moved past.
+    fn draft_conflict(&self, what: &str, expected: u64, current: u64) -> Option<link::Response> {
+        if expected == current {
+            return None;
+        }
+        let draft = self.review_draft()?;
+        Some(link::Response::draft_conflict(
+            format!(
+                "{what} is at revision {current}, not {expected}: it changed since that read, \
+                 so start from the current body"
+            ),
+            draft,
+        ))
+    }
+
     pub(crate) fn set_review_draft_body(
         &mut self,
         body: String,
         last_editor: link::DraftEditor,
+        if_revision: Option<u64>,
     ) -> link::Response {
         if self.pull_request.is_none() {
             return link::Response::err("attach a pull request before drafting a review");
         }
+        let current = self.review_draft_body.as_ref().map_or(0, |b| b.revision);
+        if let Some(conflict) =
+            if_revision.and_then(|expected| self.draft_conflict("the summary", expected, current))
+        {
+            return conflict;
+        }
         let body = body.trim().to_string();
-        self.review_draft_body =
-            (!body.is_empty()).then_some(link::DraftReviewBody { body, last_editor });
+        self.review_draft_body = (!body.is_empty()).then_some(link::DraftReviewBody {
+            body,
+            last_editor,
+            revision: current + 1,
+        });
         self.persist_soon();
         self.review_draft_response()
     }
@@ -915,6 +951,7 @@ impl App {
             end,
             body,
             last_editor,
+            revision: 1,
         });
         self.persist_soon();
         self.settle_draft_write(last_editor, Some((file_idx, start, end)));
@@ -926,6 +963,7 @@ impl App {
         id: u64,
         body: String,
         last_editor: link::DraftEditor,
+        if_revision: Option<u64>,
     ) -> link::Response {
         let Some(idx) = self
             .review_draft_comments
@@ -934,6 +972,12 @@ impl App {
         else {
             return link::Response::err(format!("review draft comment {id} does not exist"));
         };
+        let current = self.review_draft_comments[idx].revision;
+        if let Some(conflict) = if_revision
+            .and_then(|expected| self.draft_conflict(&format!("comment {id}"), expected, current))
+        {
+            return conflict;
+        }
         let anchor = (
             self.review_draft_comments[idx].path.clone(),
             self.review_draft_comments[idx].start,
@@ -946,6 +990,7 @@ impl App {
         } else {
             self.review_draft_comments[idx].body = body;
             self.review_draft_comments[idx].last_editor = last_editor;
+            self.review_draft_comments[idx].revision = current + 1;
         }
         self.persist_soon();
         let follow = (!deleting)
@@ -999,28 +1044,71 @@ impl App {
                 .review_draft_body
                 .as_ref()
                 .map(|_| ComposerEdit::ReviewBody),
+            base_revision: self.review_draft_body.as_ref().map(|b| b.revision),
+        }
+    }
+
+    /// A composer on an existing inline draft, holding the revision it opened
+    /// at so a save cannot land on top of a write it never saw.
+    pub(crate) fn review_comment_composer(comment: &link::DraftReviewComment) -> NoteDraft {
+        NoteDraft {
+            kind: ComposerKind::ReviewComment,
+            anchor: Some((comment.path.clone(), comment.start)),
+            caret: comment.body.chars().count(),
+            body: comment.body.clone(),
+            error: None,
+            editing: Some(ComposerEdit::ReviewComment(comment.id)),
+            base_revision: Some(comment.revision),
+        }
+    }
+
+    /// A composer on the slate item in view, or `None` if it is gone.
+    pub(crate) fn review_item_composer(&self) -> Option<NoteDraft> {
+        match self.review_item_in_view() {
+            0 => Some(self.review_body_composer()),
+            n => self
+                .review_draft_comments
+                .get(n - 1)
+                .map(Self::review_comment_composer),
         }
     }
 
     /// Open the composer on the slate item in view.
     pub(crate) fn edit_review_item_in_view(&mut self) {
-        let draft = match self.review_item_in_view() {
-            0 => self.review_body_composer(),
-            n => {
-                let Some(comment) = self.review_draft_comments.get(n - 1) else {
-                    return;
-                };
-                NoteDraft {
-                    kind: ComposerKind::ReviewComment,
-                    anchor: Some((comment.path.clone(), comment.start)),
-                    caret: comment.body.chars().count(),
-                    body: comment.body.clone(),
-                    error: None,
-                    editing: Some(ComposerEdit::ReviewComment(comment.id)),
-                }
+        if let Some(draft) = self.review_item_composer() {
+            self.mode = Mode::NoteInput(draft);
+        }
+    }
+
+    /// Save what a composer holds, as the reader. `None` means there was
+    /// nothing to save: an empty new note or comment simply closes.
+    pub(crate) fn submit_composer(&mut self, draft: &NoteDraft) -> Option<link::Response> {
+        let body = draft.body.trim().to_string();
+        let user = link::DraftEditor::User;
+        match (draft.kind, draft.editing) {
+            (ComposerKind::AgentNote, Some(ComposerEdit::AgentNote(id))) => {
+                Some(self.revise_agent_note(id, body))
             }
-        };
-        self.mode = Mode::NoteInput(draft);
+            (ComposerKind::AgentNote, None) if body.is_empty() => None,
+            (ComposerKind::AgentNote, None) => {
+                let (path, line) = draft.anchor.clone()?;
+                Some(self.add_agent_note(&path, line, None, body))
+            }
+            (ComposerKind::ReviewComment, Some(ComposerEdit::ReviewComment(id))) => {
+                Some(self.revise_review_draft_comment(id, body, user, draft.base_revision))
+            }
+            (ComposerKind::ReviewComment, None) if body.is_empty() => None,
+            (ComposerKind::ReviewComment, None) => {
+                let (path, line) = draft.anchor.clone()?;
+                Some(self.add_review_draft_comment(&path, line, None, body, user))
+            }
+            (ComposerKind::ReviewBody, _) => {
+                Some(self.set_review_draft_body(body, user, draft.base_revision))
+            }
+            _ => Some(link::Response::err(
+                "the comment being edited changed unexpectedly",
+            )),
+        }
     }
 
     /// Follow the item in view into the diff at its span; `u` comes back.

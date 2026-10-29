@@ -35,6 +35,67 @@ pub(crate) fn shifted_digit(key: &event::KeyEvent) -> Option<usize> {
     }
 }
 
+/// Hand the slate item in view to `$EDITOR` as a Markdown file, and save what
+/// comes back as the reader's write. The save carries the revision the item
+/// had on the way out, so if it moved meanwhile the reader's text lands in the
+/// composer with the conflict named rather than over the other write.
+fn edit_review_item_in_editor(
+    app: &mut App,
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    editor_link: &link::EditorLink,
+) {
+    let Some(mut draft) = app.review_item_composer() else {
+        return;
+    };
+    let path = std::env::temp_dir().join(format!(
+        "recto-review-{}-{}.md",
+        std::process::id(),
+        app.review_item_in_view()
+    ));
+    if std::fs::write(&path, &draft.body).is_err() {
+        return;
+    }
+    let status = app.status();
+    let _ = run_editor(
+        terminal,
+        &path.to_string_lossy(),
+        1,
+        editor_link,
+        status,
+        false,
+    );
+    app.terminal_focused = true;
+    let edited = std::fs::read_to_string(&path);
+    let _ = std::fs::remove_file(&path);
+    let Ok(edited) = edited else {
+        return;
+    };
+    if edited.trim() == draft.body.trim() {
+        return;
+    }
+    draft.caret = edited.chars().count();
+    draft.body = edited;
+    if let Some(r) = app.submit_composer(&draft)
+        && !r.ok
+    {
+        refused(&mut draft, r);
+        app.mode = Mode::NoteInput(draft);
+    }
+}
+
+/// Explain a refused save in the composer that made it. A refusal carrying the
+/// draft back means the other side wrote since the composer opened: keep the
+/// reader's words, and let a second enter overwrite on purpose.
+fn refused(draft: &mut NoteDraft, response: link::Response) {
+    if response.review_draft.is_some() {
+        draft.base_revision = None;
+        draft.error =
+            Some("the agent changed this meanwhile · enter overwrites, esc keeps theirs".into());
+    } else {
+        draft.error = response.error;
+    }
+}
+
 pub(crate) fn handle_event(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -90,58 +151,12 @@ pub(crate) fn handle_event(
                         // Both are accepted for terminals that do distinguish.
                         KeyCode::Enter if alt || shift => draft.insert('\n'),
                         KeyCode::Char('j') if ctrl => draft.insert('\n'),
-                        KeyCode::Enter => {
-                            let body = draft.body.trim().to_string();
-                            let resp = match (draft.kind, draft.editing) {
-                                (ComposerKind::AgentNote, Some(ComposerEdit::AgentNote(idx))) => {
-                                    Some(app.revise_agent_note(idx, body))
-                                }
-                                (ComposerKind::AgentNote, None) if body.is_empty() => None,
-                                (ComposerKind::AgentNote, None) => {
-                                    let (path, line) = draft
-                                        .anchor
-                                        .as_ref()
-                                        .expect("agent note composer has an anchor");
-                                    Some(app.add_agent_note(path, *line, None, body))
-                                }
-                                (
-                                    ComposerKind::ReviewComment,
-                                    Some(ComposerEdit::ReviewComment(id)),
-                                ) => Some(app.revise_review_draft_comment(
-                                    id,
-                                    body,
-                                    link::DraftEditor::User,
-                                )),
-                                (ComposerKind::ReviewComment, None) if body.is_empty() => None,
-                                (ComposerKind::ReviewComment, None) => {
-                                    let (path, line) = draft
-                                        .anchor
-                                        .as_ref()
-                                        .expect("review comment composer has an anchor");
-                                    Some(app.add_review_draft_comment(
-                                        path,
-                                        *line,
-                                        None,
-                                        body,
-                                        link::DraftEditor::User,
-                                    ))
-                                }
-                                (ComposerKind::ReviewBody, _) => {
-                                    Some(app.set_review_draft_body(body, link::DraftEditor::User))
-                                }
-                                _ => Some(link::Response::err(
-                                    "the comment being edited changed unexpectedly",
-                                )),
-                            };
-                            match resp {
-                                Some(r) if !r.ok => {
-                                    // Keep the draft on screen; the reviewer
-                                    // shouldn't lose a paragraph to a reload.
-                                    draft.error = r.error;
-                                }
-                                _ => app.mode = Mode::Normal,
-                            }
-                        }
+                        KeyCode::Enter => match app.submit_composer(draft) {
+                            // Keep the draft on screen; the reviewer shouldn't
+                            // lose a paragraph to a reload.
+                            Some(r) if !r.ok => refused(draft, r),
+                            _ => app.mode = Mode::Normal,
+                        },
 
                         // Motion. The line verbs span the whole note; the
                         // arrows move by wrapped row, so up and down go where
@@ -250,6 +265,10 @@ pub(crate) fn handle_event(
                     KeyCode::Esc => app.page = Page::Diff,
                     KeyCode::Char('c') => {
                         app.edit_review_item_in_view();
+                        mode = app.mode.clone();
+                    }
+                    KeyCode::Char('e') => {
+                        edit_review_item_in_editor(app, terminal, editor_link);
                         mode = app.mode.clone();
                     }
                     KeyCode::Enter => {
@@ -483,7 +502,7 @@ pub(crate) fn handle_event(
                     KeyCode::Char('e') => {
                         if let Some((path, line)) = app.edit_target() {
                             let status = app.status();
-                            let _ = run_editor(terminal, &path, line, editor_link, status);
+                            let _ = run_editor(terminal, &path, line, editor_link, status, true);
                             // We're foreground again on return; some terminals
                             // don't emit a fresh FocusGained after the handoff.
                             app.terminal_focused = true;
@@ -517,27 +536,31 @@ pub(crate) fn handle_event(
                                 editing: note_idx
                                     .and_then(|i| app.agent_notes.get(i))
                                     .map(|note| ComposerEdit::AgentNote(note.id)),
+                                base_revision: None,
                             });
                             mode = app.mode.clone();
                         }
                     }
                     KeyCode::Char('c') if app.pull_request.is_some() => {
                         if let Some((path, line)) = app.cursor_target() {
-                            let comment_idx = app.review_draft_comment_at(&path, line);
-                            let body = comment_idx
+                            // Re-open the draft already on this line rather
+                            // than stacking a second one on top of it.
+                            let draft = match app
+                                .review_draft_comment_at(&path, line)
                                 .and_then(|i| app.review_draft_comments.get(i))
-                                .map(|comment| comment.body.clone())
-                                .unwrap_or_default();
-                            app.mode = Mode::NoteInput(NoteDraft {
-                                kind: ComposerKind::ReviewComment,
-                                anchor: Some((path, line)),
-                                caret: body.chars().count(),
-                                body,
-                                error: None,
-                                editing: comment_idx
-                                    .and_then(|i| app.review_draft_comments.get(i))
-                                    .map(|comment| ComposerEdit::ReviewComment(comment.id)),
-                            });
+                            {
+                                Some(comment) => App::review_comment_composer(comment),
+                                None => NoteDraft {
+                                    kind: ComposerKind::ReviewComment,
+                                    anchor: Some((path, line)),
+                                    caret: 0,
+                                    body: String::new(),
+                                    error: None,
+                                    editing: None,
+                                    base_revision: None,
+                                },
+                            };
+                            app.mode = Mode::NoteInput(draft);
                             mode = app.mode.clone();
                         }
                     }

@@ -1127,6 +1127,7 @@ mod tests {
         let review_body = link::DraftReviewBody {
             body: "The shared top-level review.".into(),
             last_editor: link::DraftEditor::Agent,
+            revision: 0,
         };
         let text: Vec<String> = pull_request_document(&pr, Some(&review_body))
             .lines

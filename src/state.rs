@@ -520,6 +520,7 @@ mod tests {
             caret: 5,
             error: None,
             editing: None,
+            base_revision: None,
         };
         store.set_notes(std::slice::from_ref(&note), 5);
         store.set_note_composer(Some(&note_composer));
@@ -536,12 +537,14 @@ mod tests {
             caret: 17,
             error: None,
             editing: Some(ComposerEdit::ReviewComment(7)),
+            base_revision: None,
         };
         store.set_review(
             pull_request.clone(),
             Some(&DraftReviewBody {
                 body: "Overall".into(),
                 last_editor: crate::link::DraftEditor::User,
+                revision: 0,
             }),
             &[DraftReviewComment {
                 id: 7,
@@ -550,6 +553,7 @@ mod tests {
                 end: 21,
                 body: "Inline".into(),
                 last_editor: crate::link::DraftEditor::Agent,
+                revision: 0,
             }],
             8,
         );
@@ -710,6 +714,7 @@ mod tests {
             Some(&DraftReviewBody {
                 body: "Only for the old diff".into(),
                 last_editor: crate::link::DraftEditor::User,
+                revision: 0,
             }),
             &[],
             1,

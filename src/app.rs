@@ -1363,6 +1363,7 @@ mod tests {
         app.set_review_draft_body(
             "Typed and then the process died".into(),
             link::DraftEditor::User,
+            None,
         );
         app.persist_now().unwrap();
 
@@ -2110,6 +2111,7 @@ mod tests {
             caret: 8,
             error: None,
             editing: None,
+            base_revision: None,
         };
         store.set_note_composer(Some(&composer));
         store.save().unwrap();
@@ -2147,6 +2149,7 @@ mod tests {
             caret: 9,
             error: None,
             editing: None,
+            base_revision: None,
         });
         app.persist_soon();
         app.persistence_due = Some(Instant::now());
@@ -2177,6 +2180,7 @@ mod tests {
             Some(&link::DraftReviewBody {
                 body: "Saved overall review".into(),
                 last_editor: link::DraftEditor::User,
+                revision: 0,
             }),
             &[link::DraftReviewComment {
                 id: 7,
@@ -2185,6 +2189,7 @@ mod tests {
                 end: 12,
                 body: "Saved inline comment".into(),
                 last_editor: link::DraftEditor::Agent,
+                revision: 0,
             }],
             8,
         );
@@ -2238,6 +2243,7 @@ mod tests {
             start: Some(2),
             end: None,
             body: "one\n\ntwo\n\nthree".into(),
+            if_revision: None,
         });
         assert!(added.ok);
         assert!(row_of(&app, 112) > reading, "the draft rows landed above");
@@ -2250,6 +2256,7 @@ mod tests {
             start: None,
             end: None,
             body: "a\n\nmuch\n\nlonger\n\ncomment".into(),
+            if_revision: None,
         });
         assert!(revised.ok);
         still_reading(&app);
@@ -2280,6 +2287,7 @@ mod tests {
             end: 3,
             body: "unanchored".into(),
             last_editor: link::DraftEditor::Agent,
+            revision: 0,
         });
         app.next_review_draft_id = 2;
         for line in [111, 2] {
@@ -2317,7 +2325,11 @@ mod tests {
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         load_sample_diff(&mut app);
         app.pull_request = Some(empty_pull_request("base"));
-        app.set_review_draft_body("Looks good.\n\n--p+🤖".into(), link::DraftEditor::User);
+        app.set_review_draft_body(
+            "Looks good.\n\n--p+🤖".into(),
+            link::DraftEditor::User,
+            None,
+        );
         for (line, body) in [(111, "later TODO"), (2, "🤖 earlier")] {
             let response = app.add_review_draft_comment(
                 "foo.go",
@@ -2335,6 +2347,7 @@ mod tests {
             end: 4,
             body: "stranded".into(),
             last_editor: link::DraftEditor::User,
+            revision: 0,
         });
         app.reweave();
 
@@ -2396,6 +2409,55 @@ mod tests {
         assert_eq!(app.review_scroll, scroll);
         app.jump_to_section(3);
         assert!(!app.open_review_item_in_view().ok, "nowhere to land");
+    }
+
+    #[test]
+    fn a_draft_write_against_a_stale_revision_is_refused_with_the_current_draft() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        app.pull_request = Some(empty_pull_request("base"));
+        let user = link::DraftEditor::User;
+        let agent = link::DraftEditor::Agent;
+
+        assert!(app.set_review_draft_body("first".into(), agent, Some(0)).ok);
+        assert_eq!(app.review_draft_body.as_ref().unwrap().revision, 1);
+        let stale = app.set_review_draft_body("clobber".into(), agent, Some(0));
+        assert!(!stale.ok);
+        assert_eq!(
+            stale.review_draft.unwrap().body.unwrap().body,
+            "first",
+            "the refusal hands back what is there"
+        );
+        assert!(
+            app.set_review_draft_body("second".into(), agent, Some(1))
+                .ok
+        );
+
+        assert!(
+            app.add_review_draft_comment("foo.go", 2, None, "mine".into(), user)
+                .ok
+        );
+        let id = app.review_draft_comments[0].id;
+        assert_eq!(app.review_draft_comments[0].revision, 1);
+
+        // The reader opens a composer; the agent revises underneath it.
+        let mut composer = App::review_comment_composer(&app.review_draft_comments[0]);
+        assert_eq!(composer.base_revision, Some(1));
+        assert!(
+            app.revise_review_draft_comment(id, "agent's".into(), agent, Some(1))
+                .ok
+        );
+        composer.body = "reader's".into();
+        let refused = app.submit_composer(&composer).unwrap();
+        assert!(!refused.ok && refused.review_draft.is_some());
+        assert_eq!(app.review_draft_comments[0].body, "agent's");
+
+        // Choosing to overwrite is a deliberate second save.
+        composer.base_revision = None;
+        assert!(app.submit_composer(&composer).unwrap().ok);
+        assert_eq!(app.review_draft_comments[0].body, "reader's");
+        assert_eq!(app.review_draft_comments[0].revision, 3);
     }
 
     #[test]
@@ -2567,6 +2629,7 @@ mod tests {
             end: 2,
             body: "Shared draft".into(),
             last_editor: link::DraftEditor::User,
+            revision: 0,
         });
         app.agent_notes.push(AgentNote {
             id: 8,
@@ -2819,6 +2882,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
             caret: 0,
             error: None,
             editing: None,
+            base_revision: None,
         }
     }
 

@@ -285,6 +285,7 @@ const HELP_ROWS: &[HelpRow] = &[
     bind("v", "toggle non-tour comments"),
     head("Review slate"),
     bind("c", "edit the summary or comment in view"),
+    bind("e", "edit the summary or comment in view in $EDITOR"),
     bind("enter", "open the comment in view in the diff"),
     bind("u", "back from the diff to the slate"),
     bind(

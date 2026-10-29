@@ -260,6 +260,7 @@ fn run_editor(
     line: u32,
     editor_link: &link::EditorLink,
     status: link::Status,
+    drivable: bool,
 ) -> Result<()> {
     let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
     let mut parts = editor.split_whitespace();
@@ -269,7 +270,9 @@ fn run_editor(
     // If the editor is neovim, hand it an RPC socket via `--listen` so the
     // agent link can drive its cursor and highlight while we're parked here.
     // Anything else gets the plain handoff; focus is deferred to our return.
-    let nvim_addr = if editor_is_nvim(prog) {
+    // A review draft is not drivable: a companion focus would swap the
+    // reader's half-written comment for a source file.
+    let nvim_addr = if drivable && editor_is_nvim(prog) {
         let addr = link::nvim_addr(std::process::id());
         let _ = std::fs::remove_file(&addr);
         Some(addr)

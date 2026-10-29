@@ -378,15 +378,7 @@ impl App {
                 else {
                     return;
                 };
-                let body = comment.body.clone();
-                self.mode = Mode::NoteInput(NoteDraft {
-                    kind: ComposerKind::ReviewComment,
-                    anchor: Some((comment.path.clone(), comment.start)),
-                    caret: body.chars().count(),
-                    body,
-                    error: None,
-                    editing: Some(ComposerEdit::ReviewComment(id)),
-                });
+                self.mode = Mode::NoteInput(App::review_comment_composer(comment));
             }
             FileReviewObject::AgentNote(i) => {
                 let Some(note) = self.agent_notes.get(i) else {
@@ -400,6 +392,7 @@ impl App {
                     body,
                     error: None,
                     editing: Some(ComposerEdit::AgentNote(note.id)),
+                    base_revision: None,
                 });
             }
         }
@@ -557,6 +550,7 @@ mod tests {
             end: 42,
             body: "Shared words.".into(),
             last_editor: link::DraftEditor::Agent,
+            revision: 0,
         }];
         let notes = [AgentNote {
             id: 9,

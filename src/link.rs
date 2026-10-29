@@ -90,9 +90,14 @@ pub enum Request {
     #[serde(rename = "review")]
     ReviewDraft,
     /// Create, revise, or delete the shared top-level review body. An empty
-    /// body deletes the draft.
+    /// body deletes the draft. With `if_revision`, the write is refused unless
+    /// the body is still at that revision.
     #[serde(rename = "review-body")]
-    ReviewDraftBody { body: String },
+    ReviewDraftBody {
+        body: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_revision: Option<u64>,
+    },
     /// Create, revise, or delete one shared inline review comment. New comments
     /// carry an anchor and no id; revisions carry the stable id. An empty body
     /// deletes an existing draft.
@@ -107,6 +112,9 @@ pub enum Request {
         #[serde(skip_serializing_if = "Option::is_none")]
         end: Option<u32>,
         body: String,
+        /// Refuse a revision unless the comment is still at this revision.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        if_revision: Option<u64>,
     },
 }
 
@@ -157,6 +165,10 @@ pub struct ReviewDraft {
 pub struct DraftReviewBody {
     pub body: String,
     pub last_editor: DraftEditor,
+    /// Bumped by every write from either side, so a writer can say which
+    /// version it read. Drafts saved before revisions existed load at 0.
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -167,6 +179,8 @@ pub struct DraftReviewComment {
     pub end: u32,
     pub body: String,
     pub last_editor: DraftEditor,
+    #[serde(default)]
+    pub revision: u64,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -503,6 +517,16 @@ impl Response {
         Self {
             review_draft: Some(review_draft),
             ..Self::ok()
+        }
+    }
+
+    /// A draft write refused because the item moved on since the writer read
+    /// it. The current draft rides along, so the writer starts from what is
+    /// there instead of retrying its stale text.
+    pub fn draft_conflict(msg: impl Into<String>, review_draft: ReviewDraft) -> Self {
+        Self {
+            review_draft: Some(review_draft),
+            ..Self::err(msg)
         }
     }
 
@@ -1021,8 +1045,17 @@ mod tests {
             serde_json::from_str::<Request>(
                 r#"{"cmd":"review-body","body":"The overall review."}"#
             ),
-            Ok(Request::ReviewDraftBody { body }) if body == "The overall review."
+            Ok(Request::ReviewDraftBody { body, .. }) if body == "The overall review."
         ));
+    }
+
+    #[test]
+    fn a_draft_saved_before_revisions_loads_at_revision_zero() {
+        let comment: DraftReviewComment = serde_json::from_str(
+            r#"{"id":3,"path":"a.rs","start":1,"end":1,"body":"b","last_editor":"user"}"#,
+        )
+        .unwrap();
+        assert_eq!(comment.revision, 0);
     }
 
     #[test]
@@ -1036,6 +1069,7 @@ mod tests {
             body: Some(DraftReviewBody {
                 body: "The overall review.".into(),
                 last_editor: DraftEditor::User,
+                revision: 0,
             }),
             comments: vec![DraftReviewComment {
                 id: 1,
@@ -1044,6 +1078,7 @@ mod tests {
                 end: 42,
                 body: "Shared words.".into(),
                 last_editor: DraftEditor::Agent,
+                revision: 0,
             }],
         });
         let json = serde_json::to_string(&response).expect("serialize");
@@ -1444,6 +1479,7 @@ mod tests {
         for request in [
             Request::ReviewDraftBody {
                 body: "summary".into(),
+                if_revision: None,
             },
             Request::ReviewDraftComment {
                 id: Some(1),
@@ -1451,6 +1487,7 @@ mod tests {
                 start: None,
                 end: None,
                 body: "revised".into(),
+                if_revision: None,
             },
         ] {
             let resp = handle_while_in_editor(&request, &tx, &editor);
