@@ -1499,6 +1499,7 @@ dependencies = [
  "color-eyre",
  "crossterm",
  "ignore",
+ "libc",
  "notify",
  "pulldown-cmark",
  "ratatui",

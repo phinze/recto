@@ -7,6 +7,7 @@ mod github;
 mod graph;
 mod highlight;
 mod input;
+mod job;
 mod link;
 mod markdown;
 mod state;
@@ -294,7 +295,8 @@ fn run_editor(
     if let Some(addr) = &nvim_addr {
         cmd.arg("--listen").arg(addr);
     }
-    let _ = cmd.arg(format!("+{line}")).arg(path).status();
+    cmd.arg(format!("+{line}")).arg(path);
+    let _ = job::run_foreground(&mut cmd);
 
     editor_link.leave();
     if let Some(addr) = &nvim_addr {
