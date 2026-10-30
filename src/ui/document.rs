@@ -781,9 +781,26 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
         }
     }
 
-    if !pr.reviews.is_empty() {
+    // A bodiless "commented" review is the container GitHub makes for inline
+    // replies; the threads below already carry what it said.
+    let reviews: Vec<_> = pr
+        .reviews
+        .iter()
+        .filter(|review| {
+            !(review.body.trim().is_empty()
+                && matches!(
+                    review.state,
+                    link::ReviewState::Commented | link::ReviewState::Unknown
+                ))
+        })
+        .collect();
+    if !reviews.is_empty() {
         doc.section("Reviews");
-        for review in &pr.reviews {
+        // Newest first, so each reviewer's standing verdict leads and the
+        // ones it replaced fold to a heading beneath it.
+        let mut seen = std::collections::HashSet::new();
+        for review in reviews.into_iter().rev() {
+            let superseded = !seen.insert(review.author.login.as_str());
             let (verb, color) = match review.state {
                 link::ReviewState::Approved => ("approved", theme::GREEN),
                 link::ReviewState::ChangesRequested => ("requested changes", theme::RED),
@@ -799,8 +816,27 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
                 review.submitted_at.as_deref(),
                 color,
             );
+            if let Some(header) = doc.lines.last_mut() {
+                let (tag, tag_color) = match review.commit_oid.as_deref() {
+                    Some(oid) if oid == pr.head_oid => ("current head".to_string(), theme::GREEN),
+                    Some(oid) => (format!("at {}", short_oid(oid)), theme::OVERLAY0),
+                    None => (String::new(), theme::OVERLAY0),
+                };
+                if !tag.is_empty() {
+                    header.push_span(Span::styled(
+                        format!("  · {tag}"),
+                        Style::default().fg(tag_color),
+                    ));
+                }
+                if superseded {
+                    header.push_span(Span::styled(
+                        "  · superseded",
+                        Style::default().fg(theme::OVERLAY0),
+                    ));
+                }
+            }
             // A bodiless review is just the event; its header already says it.
-            if !review.body.trim().is_empty() {
+            if !superseded && !review.body.trim().is_empty() {
                 doc.extend(markdown::lines(&review.body));
                 doc.push(Line::default());
             }
@@ -1168,6 +1204,42 @@ mod tests {
             text.iter()
                 .any(|line| line.contains("@reviewer  requested changes"))
         );
+
+        // A later verdict leads, the one it replaced folds, and an inline
+        // reply's empty container drops out.
+        let earlier = link::ReviewSummary {
+            body: "🚧 Not ready yet.".into(),
+            submitted_at: Some("2026-08-14T12:30:00Z".into()),
+            commit_oid: Some("abcdef0123456789".into()),
+            ..pr.reviews[0].clone()
+        };
+        let container = link::ReviewSummary {
+            body: String::new(),
+            state: link::ReviewState::Commented,
+            ..pr.reviews[0].clone()
+        };
+        pr.reviews.insert(0, earlier);
+        pr.reviews.push(container);
+        let text: Vec<String> = pull_request_document(&pr)
+            .lines
+            .iter()
+            .map(Line::to_string)
+            .collect();
+        let headers: Vec<&String> = text
+            .iter()
+            .filter(|line| line.starts_with("@reviewer  requested changes"))
+            .collect();
+        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert!(
+            !text
+                .iter()
+                .any(|line| line.starts_with("@reviewer  reviewed"))
+        );
+        assert!(headers[0].ends_with("· current head"), "{}", headers[0]);
+        assert!(headers[1].contains("· at abcdef0"), "{}", headers[1]);
+        assert!(headers[1].ends_with("· superseded"), "{}", headers[1]);
+        assert!(!text.iter().any(|line| line.contains("Not ready yet")));
+        assert!(text.iter().any(|line| line.contains("A review summary.")));
     }
 
     /// The rail wraps a long title instead of clipping it, and every row an
