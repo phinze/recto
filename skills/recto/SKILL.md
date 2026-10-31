@@ -23,9 +23,10 @@ through.
 
 ## Inside a multi-repo Rig
 
-A Rig keeps one persistent recto per repo and shows the currently relevant one
-beside its task-level agent. When `RIG_BASEDIR` is set, route every command
-through Rig and name the repo subdirectory from the generated rig instructions:
+Most rigs start with the agent alone, and a repo's recto appears beside the
+agent when someone asks for it. (Review rigs open with one already, since the
+diff is the job.) When `RIG_BASEDIR` is set, route every command through Rig
+and name the repo subdirectory from the generated rig instructions:
 
     rig recto cloud ping
     rig recto cloud base 'trunk()'
@@ -34,10 +35,13 @@ through Rig and name the repo subdirectory from the generated rig instructions:
     rig recto cloud notes
     rig recto cloud clear
 
-`rig recto <repo>` promotes that repo's existing viewer into the main window;
-any remaining arguments are forwarded to recto from the correct workspace.
-The command is idempotent when that repo is already visible and preserves
-recto's exit codes. Use this form even when you think the right viewer is
+`rig recto <repo>` puts that repo's viewer beside the agent, starting it if
+it isn't running and parking whichever repo was there into its own tab. Any
+remaining arguments are forwarded to recto from the correct workspace. The
+command is idempotent when that repo is already visible and preserves
+recto's exit codes. Because every `rig recto` command opens the viewer,
+`ping` included, run one when you want the user looking at the diff, not to
+probe whether a recto exists. Use this form even when you think the right viewer is
 already active, so the user's visible surface and the command target cannot
 drift apart. Do not run tmux pane commands yourself, and do not use `recto -R`
 as a substitute: Rig owns the carousel and must know which viewer to surface.
@@ -408,7 +412,9 @@ exception: its scope is the workspace, not the current diff.
   retry once. Do not guess a succession of broader bases just to make a target
   appear.
 - **exit 2** — no recto is listening for this workspace (or you're not
-  in a repo). Don't keep trying; just describe the change in text.
+  in a repo). Inside a Rig, `rig recto <repo>` starts one, so this
+  shouldn't happen there. Outside one, don't keep trying; just describe the
+  change in text.
 
 `recto notes` is the one command that exits 0 with nothing on stdout: that
 means no notes were pending. It exits 1 only when recto is parked in an
