@@ -1651,63 +1651,118 @@ mod tests {
         assert_eq!(app.annotations.len(), 1);
     }
 
-    /// Clicking an unfocused pane aims at the window, not at whatever the
-    /// pointer happens to be over.
-    #[test]
-    fn the_click_that_focuses_the_pane_does_nothing_else() {
+    /// An app on the diff page with the files pane focused, so a click that
+    /// reaches the diff shows up as focus moving to it. Returns that click.
+    fn focus_click_fixture() -> (App, event::MouseEvent) {
         let backend = Arc::new(TestBackend::new());
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
         let mut terminal = Terminal::new(terminal_backend).unwrap();
         app.pull_request = Some(empty_pull_request("base"));
+        app.page = Page::Diff;
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let entries = tab_entries(&app);
-        let pr_col = entries
-            .iter()
-            .find(|entry| entry.page == Page::PullRequest)
-            .expect("tab present")
-            .columns
-            .start;
-        let tab_row = app.tabs_area.y;
+        app.focus = Focus::Files;
+        let diff = app.diff_content_area;
+        let click = left_click(diff.x + 1, diff.y + 1);
+        (app, click)
+    }
+
+    /// Clicking an unfocused pane aims at the window, not at whatever the
+    /// pointer happens to be over.
+    #[test]
+    fn the_click_that_focuses_the_pane_does_nothing_else() {
+        let (mut app, click) = focus_click_fixture();
 
         // Unfocused: the click brings the pane forward and stops there.
         app.terminal_focused = false;
-        handle_mouse(&mut app, left_click(pr_col, tab_row));
-        assert_eq!(app.page, Page::Diff, "the activating click is swallowed");
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Files, "the activating click is swallowed");
         assert!(app.terminal_focused, "but it does focus the pane");
 
         // Spent: the very next click is a real one.
-        handle_mouse(&mut app, left_click(pr_col, tab_row));
-        assert_eq!(app.page, Page::PullRequest);
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Diff);
     }
 
     /// A focus report can arrive before the click that caused it, so the grace
     /// window has to catch that ordering too.
     #[test]
     fn a_click_just_after_a_focus_report_is_still_the_focusing_click() {
-        let backend = Arc::new(TestBackend::new());
-        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
-        let terminal_backend = ratatui::backend::TestBackend::new(100, 24);
-        let mut terminal = Terminal::new(terminal_backend).unwrap();
-        app.pull_request = Some(empty_pull_request("base"));
-        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
-        let entries = tab_entries(&app);
-        let pr_col = entries
-            .iter()
-            .find(|entry| entry.page == Page::PullRequest)
-            .expect("tab present")
-            .columns
-            .start;
-        let tab_row = app.tabs_area.y;
+        let (mut app, click) = focus_click_fixture();
 
         // Focus already reported, click lands right behind it.
-        app.terminal_focused = true;
-        app.focus_regained_at = Some(Instant::now());
-        handle_mouse(&mut app, left_click(pr_col, tab_row));
-        assert_eq!(app.page, Page::Diff);
+        app.terminal_focused = false;
+        app.focus_gained();
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Files);
 
-        handle_mouse(&mut app, left_click(pr_col, tab_row));
-        assert_eq!(app.page, Page::PullRequest);
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Diff);
+    }
+
+    /// A focus report can also trail its click, and some terminals repeat
+    /// them. Neither may cost the reader a second click.
+    #[test]
+    fn a_late_or_repeated_focus_report_does_not_reopen_the_grace_window() {
+        // Click first, then the report it caused, twice.
+        let (mut app, click) = focus_click_fixture();
+        app.terminal_focused = false;
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Files);
+        app.focus_gained();
+        app.focus_gained();
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Diff, "click, report, report");
+
+        // The click lands between a pair of reports.
+        let (mut app, click) = focus_click_fixture();
+        app.terminal_focused = false;
+        app.focus_gained();
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Files);
+        app.focus_gained();
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Diff, "report, click, report");
+    }
+
+    /// Rex reports focus on every mouse release, focused or not. A click must
+    /// not arm a trap for the next one, or clicking again keeps nothing working.
+    #[test]
+    fn a_focus_report_on_mouse_release_does_not_eat_the_next_click() {
+        let (mut app, click) = focus_click_fixture();
+        for _ in 0..3 {
+            app.focus = Focus::Files;
+            handle_mouse(&mut app, click);
+            assert_eq!(app.focus, Focus::Diff);
+            app.focus_gained();
+        }
+    }
+
+    /// A tab is too small to hit by accident, so a click on one always means
+    /// it, including the click that brings the pane forward.
+    #[test]
+    fn a_tab_click_switches_tabs_while_it_focuses_the_pane() {
+        let (mut app, click) = focus_click_fixture();
+        let entries = tab_entries(&app);
+        let tab = |page| {
+            let entry = entries.iter().find(|e| e.page == page).expect("tab");
+            left_click(entry.columns.start, app.tabs_area.y)
+        };
+        let (pr, diff_tab) = (tab(Page::PullRequest), tab(Page::Diff));
+
+        app.terminal_focused = false;
+        handle_mouse(&mut app, pr);
+        assert_eq!(app.page, Page::PullRequest, "from an unfocused pane");
+        assert!(app.terminal_focused);
+
+        app.terminal_focused = false;
+        app.focus_gained();
+        handle_mouse(&mut app, diff_tab);
+        assert_eq!(app.page, Page::Diff, "inside the grace window");
+
+        // It spent the window, so the next click isn't eaten either.
+        handle_mouse(&mut app, click);
+        assert_eq!(app.focus, Focus::Diff);
     }
 
     /// Scrolling was never aimed at the window, so it keeps working.

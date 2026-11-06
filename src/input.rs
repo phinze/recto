@@ -5,7 +5,6 @@
 //! Nothing here draws, and nothing here talks to a backend.
 
 use std::io;
-use std::time::Instant;
 
 use anyhow::Result;
 use crossterm::event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind};
@@ -600,10 +599,7 @@ pub(crate) fn handle_event(
             }
         }
         Event::Mouse(m) if matches!(app.mode, Mode::Normal) => handle_mouse(app, m),
-        Event::FocusGained => {
-            app.terminal_focused = true;
-            app.focus_regained_at = Some(Instant::now());
-        }
+        Event::FocusGained => app.focus_gained(),
         Event::FocusLost => app.terminal_focused = false,
         _ => {}
     }
@@ -612,8 +608,15 @@ pub(crate) fn handle_event(
 
 pub(crate) fn handle_mouse(app: &mut App, m: event::MouseEvent) {
     // Scrolling is deliberately exempt: reading an unfocused pane is a real
-    // thing to want, and a wheel event was never aimed at the window.
-    if matches!(m.kind, MouseEventKind::Down(_)) && app.consume_focus_click() {
+    // thing to want, and a wheel event was never aimed at the window. So is a
+    // tab: nobody lands on one by accident while aiming at the window.
+    let on_tab_strip = !app.show_help
+        && m.kind == MouseEventKind::Down(MouseButton::Left)
+        && app.tabs_area.contains(Position {
+            x: m.column,
+            y: m.row,
+        });
+    if matches!(m.kind, MouseEventKind::Down(_)) && app.consume_focus_click() && !on_tab_strip {
         return;
     }
     if app.show_help {

@@ -2,6 +2,8 @@
 //! review threads anchored in the diff, and with the cursor down the rendered
 //! rows themselves.
 
+use std::time::Instant;
+
 use crate::app::{App, FOCUS_CLICK_GRACE, Page, SCROLLOFF};
 use crate::link;
 use crate::ui::chrome::tab_entries;
@@ -30,6 +32,16 @@ impl App {
         self.reveal_span(&rows);
         self.diff_cursor = Some(*rows.start());
         self.take_diff_focus();
+    }
+
+    /// The terminal reports focus. Only a real change opens the grace window:
+    /// Rex repeats these reports and sends another on every mouse release, and
+    /// any of them reopening it would eat the reader's next click as well.
+    pub(crate) fn focus_gained(&mut self) {
+        if !self.terminal_focused {
+            self.terminal_focused = true;
+            self.focus_regained_at = Some(Instant::now());
+        }
     }
 
     /// Whether this click is the one that brought the pane forward. Clicking an
