@@ -1,7 +1,7 @@
-use std::cell::RefCell;
 use std::collections::HashMap;
 use std::io::Cursor;
 use std::path::Path;
+use std::sync::Mutex;
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -25,7 +25,7 @@ pub struct Highlighter {
     theme_hl: ThemeHighlighter<'static>,
     /// Resolved syntax index per file extension, so we skip the linear
     /// `find_syntax_by_extension` scan on every body line.
-    syntax_cache: RefCell<HashMap<String, usize>>,
+    syntax_cache: Mutex<HashMap<String, usize>>,
 }
 
 impl Highlighter {
@@ -42,14 +42,15 @@ impl Highlighter {
         Self {
             syntax_set,
             theme_hl,
-            syntax_cache: RefCell::new(HashMap::new()),
+            syntax_cache: Mutex::new(HashMap::new()),
         }
     }
 
     /// Index into `syntax_set.syntaxes()` for `ext`, memoized. Falls back to
     /// plain text for unknown extensions.
     fn syntax_idx(&self, ext: &str) -> usize {
-        if let Some(&idx) = self.syntax_cache.borrow().get(ext) {
+        let mut cache = self.syntax_cache.lock().expect("syntax cache lock");
+        if let Some(&idx) = cache.get(ext) {
             return idx;
         }
         let syntax = self
@@ -62,7 +63,7 @@ impl Highlighter {
             .iter()
             .position(|s| std::ptr::eq(s, syntax))
             .expect("resolved syntax belongs to this set");
-        self.syntax_cache.borrow_mut().insert(ext.to_string(), idx);
+        cache.insert(ext.to_string(), idx);
         idx
     }
 

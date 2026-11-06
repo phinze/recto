@@ -1,6 +1,7 @@
 //! Parse and render backend unified diffs into Recto's styled row model.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 
 use ratatui::{
     style::{Color, Modifier, Style},
@@ -18,6 +19,11 @@ pub(crate) type FetchContent<'a> = dyn Fn(&str) -> Option<String> + 'a;
 
 const TAB_WIDTH: usize = 4;
 
+/// Most threads one render uses. Recto reloads whenever the workspace changes
+/// and shares its machine with sibling sessions, so a reload shouldn't take
+/// every core.
+const MAX_RENDER_THREADS: usize = 8;
+
 fn basename(path: &str) -> &str {
     path.rsplit_once('/').map_or(path, |(_, name)| name)
 }
@@ -29,6 +35,16 @@ pub(crate) struct RenderedDiff {
     pub file_starts: Vec<usize>,
     pub line_info: Vec<LineInfo>,
     pub file_stats: Vec<(u32, u32)>,
+}
+
+/// One file's slice of the diff, with what its rows need looked up in advance.
+struct FileSection<'a> {
+    path: Option<&'a str>,
+    /// Index into `changes`, when the file is one of them.
+    file: Option<usize>,
+    text: &'a str,
+    /// Post-image content, reused for every hunk header in the file.
+    content: Option<String>,
 }
 
 /// A `-` or `+` body row queued for batch flushing. We hold them so we can
@@ -69,51 +85,143 @@ pub(crate) fn render_diff(
     let gutter = gutter_widths(diff);
     let file_stats = compute_file_stats(diff, &path_to_idx, changes.len());
 
+    // Fetched up front, one at a time: a jj fetch snapshots the working copy,
+    // which shouldn't race itself. The fetcher routes by scope: disk for Range
+    // (cheap, accurate for jj `@`), backend for Rev.
+    let sections: Vec<FileSection> = split_files(diff)
+        .into_iter()
+        .map(|(path, text)| FileSection {
+            path,
+            file: path.and_then(|p| path_to_idx.get(p).copied()),
+            text,
+            content: path.and_then(fetch_content),
+        })
+        .collect();
+
+    let workers = std::thread::available_parallelism()
+        .map_or(1, |n| n.get())
+        .min(MAX_RENDER_THREADS);
+    let parts = parallel_map(&sections, workers, |section| {
+        render_section(section, changes, &file_stats, hl, gutter)
+    });
+
+    let mut rendered: Vec<Line<'static>> =
+        Vec::with_capacity(parts.iter().map(|p| p.0.len()).sum());
+    let mut line_info: Vec<LineInfo> = Vec::with_capacity(rendered.capacity());
+    let mut file_starts: Vec<usize> = vec![0; changes.len()];
+    for (section, (lines, info)) in sections.iter().zip(parts) {
+        if let Some(i) = section.file {
+            file_starts[i] = rendered.len();
+        }
+        rendered.extend(lines);
+        line_info.extend(info);
+    }
+
+    RenderedDiff {
+        lines: rendered,
+        file_starts,
+        line_info,
+        file_stats,
+    }
+}
+
+/// The path a `diff --git` header introduces, if `line` is one. Body rows can't
+/// be mistaken for it, since they all start with a `+`, `-` or space.
+fn file_header_path(line: &str) -> Option<&str> {
+    let (_, path) = line.strip_prefix("diff --git ")?.split_once(" b/")?;
+    Some(path)
+}
+
+/// Cut a diff into one slice per file, each starting at its header, with
+/// anything ahead of the first header as a pathless slice of its own.
+fn split_files(diff: &str) -> Vec<(Option<&str>, &str)> {
+    let mut sections = Vec::new();
+    let mut path = None;
+    let (mut start, mut offset) = (0, 0);
+    for line in diff.split_inclusive('\n') {
+        let bare = line.strip_suffix('\n').unwrap_or(line);
+        let bare = bare.strip_suffix('\r').unwrap_or(bare);
+        if let Some(next) = file_header_path(bare) {
+            if offset > start {
+                sections.push((path, &diff[start..offset]));
+            }
+            path = Some(next);
+            start = offset;
+        }
+        offset += line.len();
+    }
+    if offset > start {
+        sections.push((path, &diff[start..offset]));
+    }
+    sections
+}
+
+/// Apply `f` to every item across up to `workers` threads, keeping item order.
+/// Threads pull the next item as they finish, since one big file can outweigh
+/// hundreds of small ones.
+fn parallel_map<T: Sync, R: Send>(
+    items: &[T],
+    workers: usize,
+    f: impl Fn(&T) -> R + Sync,
+) -> Vec<R> {
+    let next = AtomicUsize::new(0);
+    let mut slots: Vec<Option<R>> = items.iter().map(|_| None).collect();
+    std::thread::scope(|scope| {
+        let handles: Vec<_> = (0..workers.min(items.len()))
+            .map(|_| {
+                scope.spawn(|| {
+                    let mut done = Vec::new();
+                    loop {
+                        let i = next.fetch_add(1, Ordering::Relaxed);
+                        let Some(item) = items.get(i) else {
+                            return done;
+                        };
+                        done.push((i, f(item)));
+                    }
+                })
+            })
+            .collect();
+        for handle in handles {
+            for (i, value) in handle.join().expect("render thread panicked") {
+                slots[i] = Some(value);
+            }
+        }
+    });
+    slots.into_iter().flatten().collect()
+}
+
+/// Render one file. Everything the row loop tracks starts over at a header, so
+/// sections share nothing but read-only inputs.
+fn render_section(
+    section: &FileSection,
+    changes: &[FileChange],
+    file_stats: &[(u32, u32)],
+    hl: &Highlighter,
+    gutter: Gutter,
+) -> (Vec<Line<'static>>, Vec<LineInfo>) {
     let mut rendered: Vec<Line<'static>> = Vec::new();
     let mut line_info: Vec<LineInfo> = Vec::new();
-    let mut file_starts: Vec<usize> = vec![0; changes.len()];
+    let current_ext = section.path.map_or("", ext_for_path);
+    let current_file = section.file;
+    let current_content = section.content.as_deref();
     let mut in_metadata = false;
-    let mut current_ext = String::new();
-    let mut current_file: Option<usize> = None;
-    // Post-image content of the current file, fetched once on `diff --git` and
-    // reused for every hunk header in the file. The fetcher routes by scope:
-    // disk for Range (cheap, accurate for jj `@`), backend for Rev.
-    let mut current_content: Option<String> = None;
     let mut new_line: u32 = 0;
     let mut old_line: u32 = 0;
     let mut pending: Vec<PendingBody> = Vec::new();
 
-    for line in diff.lines() {
-        if let Some(rest) = line.strip_prefix("diff --git ")
-            && let Some((_, b)) = rest.split_once(" b/")
-        {
-            flush_pending(
-                &mut pending,
-                &mut rendered,
-                &mut line_info,
-                &current_ext,
-                hl,
-                gutter,
-            );
-            let idx = path_to_idx.get(b).copied();
-            let status = idx.map(|i| changes[i].status);
-            let stats = idx
-                .and_then(|i| file_stats.get(i).copied())
-                .unwrap_or((0, 0));
-            let line_no = rendered.len();
-            if let Some(i) = idx {
-                file_starts[i] = line_no;
-            }
-            rendered.push(file_separator(b, status, stats));
-            line_info.push(None);
-            in_metadata = true;
-            current_ext = ext_for_path(b).to_string();
-            current_file = idx;
-            current_content = fetch_content(b);
-            new_line = 0;
-            old_line = 0;
-            continue;
-        }
+    let mut lines = section.text.lines();
+    if let Some(path) = section.path {
+        lines.next();
+        let status = current_file.map(|i| changes[i].status);
+        let stats = current_file
+            .and_then(|i| file_stats.get(i).copied())
+            .unwrap_or((0, 0));
+        rendered.push(file_separator(path, status, stats));
+        line_info.push(None);
+        in_metadata = true;
+    }
+
+    for line in lines {
         // Every hunk header re-seeds the line counters — not just the first.
         // Gating this on `in_metadata` (true only until a file's first `@@`)
         // meant later hunks fell through to the body path and the counter kept
@@ -126,14 +234,14 @@ pub(crate) fn render_diff(
                 &mut pending,
                 &mut rendered,
                 &mut line_info,
-                &current_ext,
+                current_ext,
                 hl,
                 gutter,
             );
             let (o, n) = parse_hunk_starts(line).unwrap_or((1, 1));
             old_line = o;
             new_line = n;
-            let augmented = augment_hunk_header(line, &current_ext, current_content.as_deref(), n);
+            let augmented = augment_hunk_header(line, current_ext, current_content, n);
             rendered.push(hunk_header(&augmented));
             line_info.push(None);
             continue;
@@ -169,7 +277,7 @@ pub(crate) fn render_diff(
                     &mut pending,
                     &mut rendered,
                     &mut line_info,
-                    &current_ext,
+                    current_ext,
                     hl,
                     gutter,
                 );
@@ -179,7 +287,7 @@ pub(crate) fn render_diff(
                 };
                 rendered.push(diff_body_line(
                     line,
-                    &current_ext,
+                    current_ext,
                     hl,
                     old_no,
                     new_no,
@@ -203,17 +311,12 @@ pub(crate) fn render_diff(
         &mut pending,
         &mut rendered,
         &mut line_info,
-        &current_ext,
+        current_ext,
         hl,
         gutter,
     );
 
-    RenderedDiff {
-        lines: rendered,
-        file_starts,
-        line_info,
-        file_stats,
-    }
+    (rendered, line_info)
 }
 
 /// Single-pass count of `+`/`-` body lines per file. We need this up front so
@@ -684,5 +787,47 @@ fn status_color(status: FileStatus) -> Color {
         FileStatus::Deleted => theme::RED,
         FileStatus::Modified => theme::YELLOW,
         FileStatus::Renamed | FileStatus::Copied => theme::TEAL,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_diff_splits_at_each_file_header_and_keeps_every_byte() {
+        let diff = "preamble\ndiff --git a/x.rs b/x.rs\n@@ -1 +1 @@\n-a\n+b\ndiff --git a/y.rs b/y.rs\n+c\n";
+        let sections = split_files(diff);
+        let paths: Vec<_> = sections.iter().map(|(path, _)| *path).collect();
+        assert_eq!(paths, [None, Some("x.rs"), Some("y.rs")]);
+        assert_eq!(
+            sections.iter().map(|(_, text)| *text).collect::<String>(),
+            diff
+        );
+    }
+
+    #[test]
+    fn a_header_without_a_path_stays_inside_its_file() {
+        let diff = "diff --git a/x.rs b/x.rs\ndiff --git nonsense\n";
+        assert_eq!(split_files(diff), [(Some("x.rs"), diff)]);
+    }
+
+    #[test]
+    fn crlf_headers_still_split_without_keeping_the_carriage_return() {
+        let diff = "diff --git a/x.rs b/x.rs\r\n+a\r\ndiff --git a/y.rs b/y.rs\r\n";
+        let paths: Vec<_> = split_files(diff).iter().map(|(path, _)| *path).collect();
+        assert_eq!(paths, [Some("x.rs"), Some("y.rs")]);
+    }
+
+    #[test]
+    fn parallel_results_keep_item_order_however_work_finishes() {
+        let items: Vec<u64> = (0..40).collect();
+        // Early items are slowest, so they finish last.
+        let doubled = parallel_map(&items, 4, |n| {
+            std::thread::sleep(std::time::Duration::from_millis(40 - n));
+            n * 2
+        });
+        assert_eq!(doubled, items.iter().map(|n| n * 2).collect::<Vec<_>>());
+        assert!(parallel_map(&[] as &[u64], 4, |n| *n).is_empty());
     }
 }
