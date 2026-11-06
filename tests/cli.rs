@@ -1,17 +1,23 @@
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
+
+static NEXT_REPO: AtomicUsize = AtomicUsize::new(0);
 
 struct TempRepos(PathBuf);
 
 impl TempRepos {
     fn new() -> Self {
+        // Tests share a process, and macOS clocks are too coarse to tell two
+        // of them apart. The timestamp only guards against a recycled pid.
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
+        let id = NEXT_REPO.fetch_add(1, Ordering::Relaxed);
         let root = std::env::temp_dir().join(format!(
-            "recto-cli-repository-{}-{nonce}",
+            "recto-cli-repository-{}-{nonce}-{id}",
             std::process::id()
         ));
         for name in ["caller", "target"] {
