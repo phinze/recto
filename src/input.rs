@@ -95,6 +95,19 @@ fn refused(draft: &mut NoteDraft, response: link::Response) {
     }
 }
 
+/// Whether an event can change what's on screen. Mouse capture turns on
+/// any-motion tracking, so a gliding pointer is a stream of events nothing
+/// handles, and on a large diff a frame for each one pins a core.
+pub(crate) fn changes_frame(event: &Event) -> bool {
+    !matches!(
+        event,
+        Event::Mouse(event::MouseEvent {
+            kind: MouseEventKind::Moved | MouseEventKind::Drag(_) | MouseEventKind::Up(_),
+            ..
+        })
+    )
+}
+
 pub(crate) fn handle_event(
     app: &mut App,
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -873,6 +886,32 @@ pub(crate) fn move_note_caret_to_click(draft: &mut NoteDraft, layout: NoteLayout
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn only_pointer_travel_skips_the_redraw() {
+        let mouse = |kind| {
+            Event::Mouse(event::MouseEvent {
+                kind,
+                column: 0,
+                row: 0,
+                modifiers: event::KeyModifiers::NONE,
+            })
+        };
+        assert!(!changes_frame(&mouse(MouseEventKind::Moved)));
+        assert!(!changes_frame(&mouse(MouseEventKind::Drag(
+            MouseButton::Left
+        ))));
+        assert!(!changes_frame(&mouse(MouseEventKind::Up(
+            MouseButton::Left
+        ))));
+
+        assert!(changes_frame(&mouse(MouseEventKind::Down(
+            MouseButton::Left
+        ))));
+        assert!(changes_frame(&mouse(MouseEventKind::ScrollDown)));
+        assert!(changes_frame(&Event::FocusLost));
+        assert!(changes_frame(&Event::Resize(80, 24)));
+    }
 
     #[test]
     fn shift_digits_are_read_in_both_terminal_spellings() {

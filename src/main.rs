@@ -40,7 +40,7 @@ use crate::app::{App, POLL_INTERVAL, RELOAD_DEBOUNCE};
 use crate::backend::{Base, detect_backend, short_oid};
 use crate::cli::{ClientCommand, run_client};
 use crate::highlight::Highlighter;
-use crate::input::handle_event;
+use crate::input::{changes_frame, handle_event};
 use crate::ui::chrome::draw;
 
 /// recto — a jj-first terminal diff viewer.
@@ -393,25 +393,27 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
         }
 
         if event::poll(POLL_INTERVAL)? {
+            let event = event::read()?;
+            needs_redraw |= changes_frame(&event);
             if matches!(
-                handle_event(app, terminal, event::read()?, &editor_link)?,
+                handle_event(app, terminal, event, &editor_link)?,
                 Action::Quit
             ) {
                 app.persist_now()?;
                 break;
             }
-            needs_redraw = true;
             // Coalesce bursts (key autorepeat, mouse-scroll) into one redraw
             // by draining everything already queued before drawing again.
             while event::poll(Duration::ZERO)? {
+                let event = event::read()?;
+                needs_redraw |= changes_frame(&event);
                 if matches!(
-                    handle_event(app, terminal, event::read()?, &editor_link)?,
+                    handle_event(app, terminal, event, &editor_link)?,
                     Action::Quit
                 ) {
                     app.persist_now()?;
                     return Ok(());
                 }
-                needs_redraw = true;
             }
         }
     }
