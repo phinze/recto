@@ -40,6 +40,9 @@ struct Document {
     /// Widest a prose row may run. Long lines across a wide pane are hard to
     /// track back to their start, so a document can ask to wrap sooner.
     measure: Option<u16>,
+    /// Sections that stand for a review thread, by section and thread index,
+    /// so the section in view can open its thread.
+    threads: Vec<(usize, usize)>,
 }
 
 /// Where a tour quote points, parsed from the tour source rather than from a
@@ -105,6 +108,23 @@ impl Document {
             "────────────────────────────────────────",
             Style::default().fg(theme::SURFACE1),
         )));
+    }
+
+    /// A heading that organizes the page but is not a place to go: the
+    /// entries beneath it carry the outline instead.
+    fn heading(&mut self, title: &str) {
+        let at = self.sections.len();
+        self.section(title);
+        self.sections.truncate(at);
+    }
+
+    /// An outline entry at the current row for something that draws its own
+    /// heading, such as a thread card.
+    fn anchor(&mut self, title: String) {
+        self.sections.push(DocumentSection {
+            title,
+            row: self.lines.len(),
+        });
     }
 
     fn push(&mut self, line: Line<'static>) {
@@ -762,6 +782,7 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
     frame.render_widget(Paragraph::new(header), rows[0]);
 
     let document = pull_request_document(pr);
+    let threads = document.threads.clone();
     let layout = draw_document(
         frame,
         rows[1],
@@ -774,6 +795,7 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
     app.pr_max_scroll = layout.max_scroll;
     app.pr_sections = layout.sections;
     app.pr_outline_area = layout.outline_area;
+    app.pr_section_threads = threads;
 }
 
 fn pull_request_document(pr: &link::PullRequest) -> Document {
@@ -853,8 +875,15 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
         .enumerate()
         .partition(|(_, thread)| thread.is_open());
     if !open.is_empty() {
-        doc.section("Open threads");
+        doc.heading("Open threads");
         for (i, thread) in open {
+            let name = thread.path.rsplit('/').next().unwrap_or(&thread.path);
+            let line = thread.line.or(thread.original_line);
+            doc.threads.push((doc.sections.len(), i));
+            doc.anchor(match line {
+                Some(line) => format!("Thread {} · {name}:{line}", i + 1),
+                None => format!("Thread {} · {name}", i + 1),
+            });
             thread_card(&mut doc, i + 1, thread, &pr.author.login);
             doc.push(Line::default());
             doc.push(Line::default());
@@ -939,6 +968,10 @@ fn thread_card(doc: &mut Document, n: usize, thread: &link::ReviewThread, pr_aut
             Style::default().fg(theme::SUBTEXT0),
         ));
     }
+    status.push(Span::styled(
+        "  ·  enter opens",
+        Style::default().fg(theme::OVERLAY0),
+    ));
     for row in [heading, status] {
         doc.bands.insert(doc.lines.len());
         doc.push(Line::from(row).style(band));

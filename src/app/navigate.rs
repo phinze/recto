@@ -8,7 +8,7 @@ use crate::app::{App, FOCUS_CLICK_GRACE, Page, SCROLLOFF};
 use crate::link;
 use crate::ui::chrome::tab_entries;
 use crate::ui::diff::{review_thread_span, rows_for_span, step_pointable};
-use crate::ui::document::{section_step, tour_quote_anchors};
+use crate::ui::document::{active_section, section_step, tour_quote_anchors};
 use crate::{markdown, parse_pathspec};
 
 impl App {
@@ -220,6 +220,21 @@ impl App {
 
     /// Move among every public thread in the attached snapshot, including
     /// outdated and left-side conversations that cannot be pinned in this diff.
+    /// Open the thread whose card is the PR page's section in view. False
+    /// when that section is not a thread.
+    pub(crate) fn open_thread_in_view(&mut self) -> bool {
+        let Some(section) = active_section(&self.pr_sections, self.pr_scroll) else {
+            return false;
+        };
+        let Some(&(_, thread)) = self.pr_section_threads.iter().find(|(s, _)| *s == section) else {
+            return false;
+        };
+        self.active_thread = Some(thread);
+        self.thread_scroll = 0;
+        self.page = Page::ReviewThread;
+        true
+    }
+
     pub(crate) fn cycle_public_thread(&mut self, delta: isize) -> bool {
         let Some(len) = self
             .pull_request

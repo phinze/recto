@@ -346,6 +346,9 @@ pub(crate) fn handle_event(
                     KeyCode::Char(c @ '1'..='9') => app.jump_to_section(c as usize - '1' as usize),
                     KeyCode::Char(']') => app.jump_section(1),
                     KeyCode::Char('[') => app.jump_section(-1),
+                    KeyCode::Enter => {
+                        app.open_thread_in_view();
+                    }
                     KeyCode::Char('g') | KeyCode::Home => app.pr_scroll = 0,
                     KeyCode::Char('G') | KeyCode::End => app.pr_scroll = app.pr_max_scroll,
                     _ => {}

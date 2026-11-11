@@ -357,6 +357,8 @@ pub(crate) struct App {
     /// width the body wrapped at.
     pub(crate) pr_sections: Vec<(String, usize)>,
     pub(crate) pr_outline_area: Rect,
+    /// Which PR page sections are thread cards, as (section, thread) pairs.
+    pub(crate) pr_section_threads: Vec<(usize, usize)>,
     pub(crate) tour_scroll: usize,
     pub(crate) tour_max_scroll: usize,
     pub(crate) tour_sections: Vec<(String, usize)>,
@@ -573,6 +575,7 @@ impl App {
             pr_max_scroll: 0,
             pr_sections: Vec::new(),
             pr_outline_area: Rect::default(),
+            pr_section_threads: Vec::new(),
             tour_scroll: 0,
             tour_max_scroll: 0,
             tour_sections: Vec::new(),
@@ -2629,6 +2632,56 @@ mod tests {
         // The PR page still walks every thread, settled ones included.
         assert!(app.cycle_public_thread(1));
         assert_eq!(app.active_thread, Some(0));
+    }
+
+    /// Each open thread is its own stop on the PR page, so the outline and
+    /// `]` reach it, and Enter opens whichever thread card is in view.
+    #[test]
+    fn enter_on_the_pr_page_opens_the_thread_in_view() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        let thread = |id: &str, line: u32, resolved: bool| link::ReviewThread {
+            id: id.into(),
+            path: "src/foo.go".into(),
+            side: link::DiffSide::Right,
+            line: Some(line),
+            start_line: None,
+            original_line: Some(line),
+            original_start_line: None,
+            resolved,
+            outdated: false,
+            comments: Vec::new(),
+        };
+        let mut pr = empty_pull_request("base");
+        pr.threads = vec![
+            thread("live", 2, false),
+            thread("settled", 5, true),
+            thread("also-live", 9, false),
+        ];
+        app.pull_request = Some(pr);
+        app.page = Page::PullRequest;
+        let mut terminal = Terminal::new(ratatui::backend::TestBackend::new(120, 40)).unwrap();
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+
+        let titles: Vec<&str> = app.pr_sections.iter().map(|(t, _)| t.as_str()).collect();
+        assert_eq!(
+            titles,
+            vec![
+                "Description",
+                "Thread 1 · foo.go:2",
+                "Thread 3 · foo.go:9",
+                "Resolved and outdated (1)"
+            ]
+        );
+
+        // On the description, Enter has nothing to open.
+        assert!(!app.open_thread_in_view());
+        assert_eq!(app.page, Page::PullRequest);
+
+        app.jump_to_section(2);
+        assert!(app.open_thread_in_view());
+        assert_eq!(app.page, Page::ReviewThread);
+        assert_eq!(app.active_thread, Some(2));
     }
 
     #[test]
