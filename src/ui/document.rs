@@ -1018,8 +1018,14 @@ fn thread_card(doc: &mut Document, n: usize, thread: &link::ReviewThread, pr_aut
         "  ·  enter opens",
         Style::default().fg(theme::OVERLAY0),
     ));
+    // Rows that spill on a narrow pane hang under the path, not the pill.
+    let hang = vec![Span::styled(
+        " ".repeat(format!(" Thread {n} ").len() + 2),
+        band,
+    )];
     for row in [heading, status] {
         doc.bands.insert(doc.lines.len());
+        doc.hangs.insert(doc.lines.len(), hang.clone());
         doc.push(Line::from(row).style(band));
     }
     doc.push(Line::default());
