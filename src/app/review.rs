@@ -1084,18 +1084,17 @@ impl App {
     /// same rule that names the section in the status line, so the edit keys
     /// act on exactly what the reader is told they are looking at.
     pub(crate) fn review_item_in_view(&self) -> usize {
-        self.review_focus()
-            .or_else(|| active_section(&self.review_sections, self.review_scroll))
-            .unwrap_or(0)
-    }
-
-    /// The item a companion pointed at, while the reader has not scrolled
-    /// away from where it was revealed. Revealing no longer parks the item at
-    /// the top, so the top of the viewport cannot name it on its own.
-    pub(crate) fn review_focus(&self) -> Option<usize> {
-        self.review_focused
-            .filter(|(item, at)| *at == self.review_scroll && *item < self.review_sections.len())
-            .map(|(item, _)| item)
+        let position = match self.doc_focus {
+            Some(focus)
+                if focus.page == Page::Review
+                    && focus.scroll == self.review_scroll
+                    && focus.section < self.review_sections.len() =>
+            {
+                self.review_sections[focus.section].1
+            }
+            _ => self.review_scroll,
+        };
+        active_section(&self.review_sections, position).unwrap_or(0)
     }
 
     /// A composer on the top-level body, prefilled with what is there.

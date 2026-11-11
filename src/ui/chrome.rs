@@ -10,7 +10,7 @@ use ratatui::widgets::{Paragraph, Wrap};
 use crate::app::{App, Cursor, Mode, Page, SPINNER_FRAME_MS, SPINNER_FRAMES};
 use crate::ui::diff::draw_diff;
 use crate::ui::document::{
-    active_section, draw_pull_request, draw_review, draw_review_thread, draw_tour, short_oid,
+    draw_pull_request, draw_review, draw_review_thread, draw_tour, short_oid,
 };
 use crate::ui::overlay::{draw_help, draw_note_input, draw_quit_confirm};
 use crate::ui::panes::{draw_commits, draw_files};
@@ -191,21 +191,13 @@ fn status_line(app: &App) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     match app.page {
-        Page::Tour => document_status(
-            &mut spans,
-            &app.tour_sections,
-            active_section(&app.tour_sections, app.tour_scroll),
-        ),
+        Page::Tour => document_status(&mut spans, &app.tour_sections, app.section_in_view()),
         Page::Review => document_status(
             &mut spans,
             &app.review_sections,
             (!app.review_sections.is_empty()).then(|| app.review_item_in_view()),
         ),
-        Page::PullRequest => document_status(
-            &mut spans,
-            &app.pr_sections,
-            active_section(&app.pr_sections, app.pr_scroll),
-        ),
+        Page::PullRequest => document_status(&mut spans, &app.pr_sections, app.section_in_view()),
         Page::ReviewThread => {}
         Page::Diff => {}
     }

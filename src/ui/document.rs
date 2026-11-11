@@ -13,8 +13,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
-use crate::app::{App, Page};
-use crate::ui::diff::{badge, gutter_signature, rows_for_span};
+use crate::app::{App, FOCUS_FLASH, FOCUS_FLASH_ALPHA, Page};
+use crate::ui::diff::{apply_flash, badge, gutter_signature, rows_for_span};
 use crate::{link, markdown, parse_pathspec, theme, wrap};
 
 /// A rendered prose document plus where its structural anchors landed. One
@@ -361,7 +361,7 @@ fn draw_document(
     title: &str,
     border: Color,
     scroll: usize,
-    focus: Option<usize>,
+    focus: Option<(usize, f32)>,
 ) -> DocumentLayout {
     // A single section is a label rather than a choice, the same rule the tab
     // strip and the side panes use, so it does not earn a rail.
@@ -382,10 +382,18 @@ fn draw_document(
     let inner_width = body_area.width.saturating_sub(4);
     let inner_height = body_area.height.saturating_sub(2) as usize;
     let WrappedDocument {
-        rows,
+        mut rows,
         sections,
         quotes,
     } = document.wrap(inner_width);
+    if let Some((section, flash)) = focus
+        && let Some(&(_, start)) = sections.get(section)
+    {
+        let end = sections
+            .get(section + 1)
+            .map_or(rows.len(), |(_, next)| *next);
+        highlight_section(&mut rows, start..end, flash);
+    }
     let visual_rows = rows.len();
     // A section listed in the rail but impossible to scroll to is a dead
     // control, which is what a document shorter than its viewport used to
@@ -401,7 +409,9 @@ fn draw_document(
             frame,
             outline_area,
             &sections,
-            focus.or(active_section(&sections, scroll)),
+            focus
+                .map(|(section, _)| section)
+                .or(active_section(&sections, scroll)),
         );
     }
 
@@ -431,17 +441,71 @@ fn draw_document(
     }
 }
 
-/// Scroll that brings rows `start..end` into a `height`-row viewport while
-/// moving as little as possible: none at all when they already show, just
-/// enough to uncover them when they fit, and to `start` when they are taller
-/// than the viewport, since the top of an item is where reading begins.
-fn reveal(scroll: usize, height: usize, start: usize, end: usize) -> usize {
-    if end.saturating_sub(start) > height || start < scroll {
-        start
-    } else if end > scroll + height {
-        end - height
-    } else {
+/// The section a jump revealed on `page`, with how strong its arrival flash
+/// still is, while the reader has not scrolled away from it.
+fn focus_for(app: &App, page: Page) -> Option<(usize, f32)> {
+    let focus = app.doc_focus.filter(|focus| focus.page == page)?;
+    let scroll = match page {
+        Page::Tour => app.tour_scroll,
+        Page::Review => app.review_scroll,
+        _ => app.pr_scroll,
+    };
+    if focus.scroll != scroll {
+        return None;
+    }
+    let t = focus.set_at.elapsed().as_secs_f32() / FOCUS_FLASH.as_secs_f32();
+    let fade = (1.0 - t).max(0.0);
+    Some((focus.section, FOCUS_FLASH_ALPHA * fade * fade))
+}
+
+/// Scroll that brings rows `start..end` into a `height`-row viewport the way
+/// a code focus lands: not at all when they already show, centered when they
+/// fit, and with their start a quarter of the way down when they are taller
+/// than the viewport, so the heading keeps some context above it without
+/// spending the screen on it.
+pub(crate) fn reveal(scroll: usize, height: usize, start: usize, end: usize) -> usize {
+    let len = end.saturating_sub(start);
+    if len > height {
+        start.saturating_sub(height / 4)
+    } else if start >= scroll && end <= scroll + height {
         scroll
+    } else {
+        start.saturating_sub((height - len) / 2)
+    }
+}
+
+/// Light the section a jump landed on: a lasting tint on its heading, which
+/// for a card is the whole shaded band, and the arrival flash code focus
+/// uses washed over the section while it fades.
+fn highlight_section(rows: &mut [Line<'static>], range: Range<usize>, flash: f32) {
+    let tint = |line: &mut Line<'static>| {
+        let bg = line.style.bg.unwrap_or(theme::BASE);
+        line.style.bg = Some(theme::blend(bg, theme::MAUVE, 0.22));
+        for span in &mut line.spans {
+            if let Some(sbg) = span.style.bg {
+                span.style.bg = Some(theme::blend(sbg, theme::MAUVE, 0.22));
+            }
+        }
+    };
+    let banded = rows
+        .get(range.start)
+        .is_some_and(|line| line.style.bg.is_some());
+    for row in range.clone() {
+        let Some(line) = rows.get_mut(row) else { break };
+        let heading = if banded {
+            line.style.bg.is_some()
+        } else {
+            row == range.start
+        };
+        if row > range.start && !heading {
+            break;
+        }
+        tint(line);
+    }
+    if flash > 0.0 {
+        for line in rows.iter_mut().take(range.end).skip(range.start) {
+            apply_flash(line, flash);
+        }
     }
 }
 
@@ -536,7 +600,7 @@ pub(crate) fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         " Tour ",
         theme::MAUVE,
         app.tour_scroll,
-        None,
+        focus_for(app, Page::Tour),
     );
     app.tour_scroll = layout.scroll;
     app.tour_max_scroll = layout.max_scroll;
@@ -544,6 +608,7 @@ pub(crate) fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
     app.tour_outline_area = layout.outline_area;
     app.tour_quotes = layout.quotes;
     app.tour_body_area = layout.body_area;
+    app.tour_viewport = (layout.rows, layout.height);
     if let Some(index) = app.tour_pending_section.take() {
         app.jump_to_section(index);
     }
@@ -603,20 +668,7 @@ fn snippet_line(row: &Line<'static>, width: usize, commented: bool) -> Option<Li
 fn review_document(app: &App) -> Document {
     let mut doc = Document::default();
     let dim = Style::default().fg(theme::OVERLAY0);
-    let focus = app.review_focus();
-    // The item a companion just pointed at may sit mid-screen rather than at
-    // the top, so its heading carries a band to say which one it is.
-    let section = |doc: &mut Document, title: &str| {
-        let index = doc.sections.len();
-        doc.section(title);
-        if Some(index) == focus {
-            let row = doc.lines.len() - 2;
-            doc.bands.insert(row);
-            let line = std::mem::take(&mut doc.lines[row]);
-            doc.lines[row] = line.style(Style::default().bg(theme::SURFACE0));
-        }
-    };
-    section(&mut doc, "Summary");
+    doc.section("Summary");
     match &app.review_draft_body {
         Some(draft) => {
             doc.push(Line::from(Span::styled(
@@ -645,7 +697,7 @@ fn review_document(app: &App) -> Document {
             format!("{}-{}", comment.start, comment.end)
         };
         let name = comment.path.rsplit('/').next().unwrap_or(&comment.path);
-        section(&mut doc, &format!("✎{} {name}:{span}", i + 1));
+        doc.section(&format!("✎{} {name}:{span}", i + 1));
         let label = Line::from(vec![
             Span::styled("  ", dim),
             Span::styled(
@@ -761,7 +813,7 @@ pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         " Review ",
         theme::YELLOW,
         app.review_scroll,
-        app.review_focus(),
+        focus_for(app, Page::Review),
     );
     app.review_scroll = layout.scroll;
     app.review_max_scroll = layout.max_scroll;
@@ -769,18 +821,11 @@ pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     app.review_outline_area = layout.outline_area;
     app.review_quotes = layout.quotes;
     app.review_body_area = layout.body_area;
-    // A draft the agent just wrote or touched should be visible, but jumping
-    // it to the top pushed the rest of a slate that already fit off screen.
-    if let Some(item) = app.review_pending_item.take()
-        && let Some(&(_, start)) = app.review_sections.get(item)
-    {
-        let end = app
-            .review_sections
-            .get(item + 1)
-            .map_or(layout.rows, |(_, next)| *next);
-        app.review_scroll =
-            reveal(app.review_scroll, layout.height, start, end).min(app.review_max_scroll);
-        app.review_focused = Some((item, app.review_scroll));
+    app.review_viewport = (layout.rows, layout.height);
+    // A draft the agent just wrote or touched is revealed like any jump: it
+    // stays put if it already shows, rather than scrolling the slate away.
+    if let Some(item) = app.review_pending_item.take() {
+        app.jump_to_section(item);
     }
 }
 
@@ -835,13 +880,14 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
         " PR context ",
         theme::SURFACE1,
         app.pr_scroll,
-        None,
+        focus_for(app, Page::PullRequest),
     );
     app.pr_scroll = layout.scroll;
     app.pr_max_scroll = layout.max_scroll;
     app.pr_sections = layout.sections;
     app.pr_outline_area = layout.outline_area;
     app.pr_section_threads = threads;
+    app.pr_viewport = (layout.rows, layout.height);
 }
 
 fn pull_request_document(pr: &link::PullRequest) -> Document {
@@ -1506,12 +1552,13 @@ mod tests {
     fn reveal_moves_only_as_far_as_it_has_to() {
         // Already on screen: stay put.
         assert_eq!(reveal(0, 30, 10, 20), 0);
-        // Below the fold but fits: scroll just enough to show its last row.
-        assert_eq!(reveal(0, 30, 25, 40), 10);
-        // Above the viewport: bring its top to the top.
-        assert_eq!(reveal(50, 30, 10, 20), 10);
-        // Taller than the viewport: start where reading starts.
-        assert_eq!(reveal(0, 30, 40, 100), 40);
+        // Out of view but fits: centered, from below or above.
+        assert_eq!(reveal(0, 30, 50, 60), 40);
+        assert_eq!(reveal(80, 30, 50, 60), 40);
+        // Near the top, centering clamps at the first row.
+        assert_eq!(reveal(50, 30, 4, 10), 0);
+        // Taller than the viewport: its start a quarter of the way down.
+        assert_eq!(reveal(0, 32, 40, 100), 32);
     }
 
     #[test]
@@ -1696,11 +1743,11 @@ mod tests {
 
         // The second entry starts after every row the first one occupies.
         handle_mouse(&mut app, left_click(x, first_row + entries[0].len() as u16));
-        assert_eq!(app.tour_scroll, second);
+        assert_eq!(app.section_in_view(), Some(1));
 
         // And a row the first title spilled onto still belongs to it.
         handle_mouse(&mut app, left_click(x, first_row + 1));
-        assert_eq!(app.tour_scroll, 0);
+        assert_eq!(app.section_in_view(), Some(0));
     }
 
     /// The quote is source, not diff: no added/removed tint, no marker, no

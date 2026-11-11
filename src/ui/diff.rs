@@ -428,7 +428,7 @@ pub(crate) fn agent_note_line(n: usize, text: &str, first: bool) -> Line<'static
 /// refinements) blend too so they don't punch unwashed holes in the wash.
 /// Rows with no bg blend from BASE, assuming a Catppuccin-base terminal — the
 /// same assumption the rest of the hard-coded theme already makes.
-fn apply_flash(line: &mut Line<'static>, alpha: f32) {
+pub(crate) fn apply_flash(line: &mut Line<'static>, alpha: f32) {
     let bg = line.style.bg.unwrap_or(theme::BASE);
     line.style.bg = Some(theme::blend(bg, theme::MAUVE, alpha));
     for span in &mut line.spans {

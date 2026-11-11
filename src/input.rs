@@ -737,10 +737,8 @@ pub(crate) fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 y: m.row,
             })
         {
-            if let Some(index) = outline_index_at(&app.pr_sections, app.pr_outline_area, m.row)
-                && let Some((_, offset)) = app.pr_sections.get(index)
-            {
-                app.pr_scroll = (*offset).min(app.pr_max_scroll);
+            if let Some(index) = outline_index_at(&app.pr_sections, app.pr_outline_area, m.row) {
+                app.jump_to_section(index);
             }
             return;
         }

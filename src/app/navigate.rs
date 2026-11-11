@@ -4,11 +4,11 @@
 
 use std::time::Instant;
 
-use crate::app::{App, FOCUS_CLICK_GRACE, Page, SCROLLOFF};
+use crate::app::{App, DocFocus, FOCUS_CLICK_GRACE, Page, SCROLLOFF};
 use crate::link;
 use crate::ui::chrome::tab_entries;
 use crate::ui::diff::{review_thread_span, rows_for_span, step_pointable};
-use crate::ui::document::{active_section, section_step, tour_quote_anchors};
+use crate::ui::document::{active_section, reveal, section_step, tour_quote_anchors};
 use crate::{markdown, parse_pathspec};
 
 impl App {
@@ -87,6 +87,42 @@ impl App {
         }
     }
 
+    fn document_viewport(&self) -> (usize, usize) {
+        match self.page {
+            Page::Tour => self.tour_viewport,
+            Page::Review => self.review_viewport,
+            _ => self.pr_viewport,
+        }
+    }
+
+    /// The section a jump revealed on this page, while the reader has not
+    /// scrolled away from where it landed.
+    pub(crate) fn document_focus(&self) -> Option<usize> {
+        self.doc_focus
+            .filter(|focus| {
+                focus.page == self.page
+                    && focus.scroll == self.document_scroll()
+                    && focus.section < self.document_sections().len()
+            })
+            .map(|focus| focus.section)
+    }
+
+    /// Where the reader is in the document: the start of a section a jump
+    /// revealed, or else the top of the viewport. Jumps no longer park a
+    /// section at the top, so the scroll offset alone cannot say.
+    pub(crate) fn reading_position(&self) -> usize {
+        match self.document_focus() {
+            Some(section) => self.document_sections()[section].1,
+            None => self.document_scroll(),
+        }
+    }
+
+    /// The section being read, which names the status line, lights the rail
+    /// and is what the section's own keys act on.
+    pub(crate) fn section_in_view(&self) -> Option<usize> {
+        active_section(self.document_sections(), self.reading_position())
+    }
+
     pub(crate) fn set_document_scroll(&mut self, scroll: usize) {
         match self.page {
             Page::Tour => self.tour_scroll = scroll.min(self.tour_max_scroll),
@@ -103,7 +139,7 @@ impl App {
         let spec = self
             .tour_quotes
             .iter()
-            .find(|quote| quote.rows.end > self.tour_scroll)
+            .find(|quote| quote.rows.end > self.reading_position())
             .map(|quote| quote.spec.clone());
         match spec {
             Some(spec) => self.open_quote(&spec),
@@ -162,21 +198,40 @@ impl App {
 
     /// Move one section forward or back on the current document page.
     pub(crate) fn jump_section(&mut self, delta: isize) {
-        let scroll = section_step(self.document_sections(), self.document_scroll(), delta);
-        if let Some(scroll) = scroll {
-            self.set_document_scroll(scroll);
+        let sections = self.document_sections();
+        let target = section_step(sections, self.reading_position(), delta)
+            .and_then(|offset| active_section(sections, offset));
+        if let Some(index) = target {
+            self.jump_to_section(index);
         }
     }
 
     /// Jump straight to a section by its badge number, 0-based internally.
+    /// The section is revealed the way a code focus is: left where it is when
+    /// it already shows, centered when it does not, and flashed either way.
     pub(crate) fn jump_to_section(&mut self, index: usize) {
-        let scroll = self
-            .document_sections()
-            .get(index)
-            .map(|(_, offset)| *offset);
-        if let Some(scroll) = scroll {
-            self.set_document_scroll(scroll);
-        }
+        let sections = self.document_sections();
+        let Some(&(_, start)) = sections.get(index) else {
+            return;
+        };
+        let (rows, height) = self.document_viewport();
+        let end = sections
+            .get(index + 1)
+            .map_or(rows, |(_, next)| *next)
+            .max(start + 1);
+        // Before the first draw there is no viewport to center in.
+        let scroll = if height == 0 {
+            start
+        } else {
+            reveal(self.document_scroll(), height, start, end)
+        };
+        self.set_document_scroll(scroll);
+        self.doc_focus = Some(DocFocus {
+            page: self.page,
+            section: index,
+            scroll: self.document_scroll(),
+            set_at: Instant::now(),
+        });
     }
 
     /// Bring the tour into view, optionally at a numbered section.
@@ -223,7 +278,7 @@ impl App {
     /// Open the thread whose card is the PR page's section in view. False
     /// when that section is not a thread.
     pub(crate) fn open_thread_in_view(&mut self) -> bool {
-        let Some(section) = active_section(&self.pr_sections, self.pr_scroll) else {
+        let Some(section) = self.section_in_view() else {
             return false;
         };
         let Some(&(_, thread)) = self.pr_section_threads.iter().find(|(s, _)| *s == section) else {

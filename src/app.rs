@@ -223,6 +223,16 @@ pub(crate) struct SearchMatch {
 /// A span a companion session asked us to highlight. Stored logically (path +
 /// new-side line range) rather than as rendered-row indices, so it survives
 /// diff reloads — `focus_rows` re-resolves it against the current render.
+/// A document section brought into view by a jump: which page and section,
+/// the scroll it was revealed at, and when, for the arrival flash.
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct DocFocus {
+    pub(crate) page: Page,
+    pub(crate) section: usize,
+    pub(crate) scroll: usize,
+    pub(crate) set_at: Instant,
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct FocusSpan {
     pub(crate) path: String,
@@ -460,9 +470,15 @@ pub(crate) struct App {
     /// A slate item a companion asked to see before the page had geometry to
     /// resolve it against. Spent by the next draw.
     pub(crate) review_pending_item: Option<usize>,
-    /// The slate item a companion last pointed at, and the scroll it was
-    /// revealed at. It stays the item in view until the reader scrolls.
-    pub(crate) review_focused: Option<(usize, usize)>,
+    /// The document section last jumped to, revealed mid-screen rather than
+    /// parked at the top. It stays the reading position until the reader
+    /// scrolls away from where it was revealed.
+    pub(crate) doc_focus: Option<DocFocus>,
+    /// Visual rows and viewport height of each document page as last drawn,
+    /// so a jump can tell whether a section already shows.
+    pub(crate) tour_viewport: (usize, usize),
+    pub(crate) review_viewport: (usize, usize),
+    pub(crate) pr_viewport: (usize, usize),
     /// XDG-backed durable state keyed by this workspace's canonical root.
     pub(crate) persistence: Option<state::Store>,
     pub(crate) persistence_due: Option<Instant>,
@@ -648,7 +664,10 @@ impl App {
             next_review_draft_id: 1,
             review_verdict: None,
             review_pending_item: None,
-            review_focused: None,
+            doc_focus: None,
+            tour_viewport: (0, 0),
+            review_viewport: (0, 0),
+            pr_viewport: (0, 0),
             persistence,
             persistence_due: None,
             diff_cursor: None,
@@ -1004,7 +1023,12 @@ impl App {
     /// only in response to state changes; loaders and focus pulses keep their
     /// existing animation cadence.
     pub(crate) fn is_animating(&self) -> bool {
-        self.loading.is_some() || self.focus_span.is_some()
+        self.loading.is_some()
+            || self.focus_span.is_some()
+            || self
+                .doc_focus
+                .as_ref()
+                .is_some_and(|focus| focus.set_at.elapsed() < FOCUS_FLASH)
     }
 
     fn apply_loaded(&mut self, scope: Scope, loaded: LoadedDiff) {
@@ -1877,8 +1901,8 @@ mod tests {
         terminal.draw(|frame| draw(frame, &mut app)).unwrap();
 
         assert_eq!(app.tour_pending_section, None, "spent by the draw");
-        assert_eq!(app.tour_scroll, app.tour_sections[2].1);
-        assert_eq!(active_section(&app.tour_sections, app.tour_scroll), Some(2));
+        assert_eq!(app.section_in_view(), Some(2));
+        assert_eq!(app.tour_scroll, 0, "the tour fits, so nothing scrolls");
     }
 
     /// "Look here now" cannot mean anything while another page is up.
@@ -1905,6 +1929,8 @@ mod tests {
         assert_eq!(app.page, Page::Diff);
     }
 
+    /// A jump in a document that fits moves nothing, but the section it named
+    /// is the one being read, so the rail, status line and `]` / `[` follow.
     #[test]
     fn sections_stay_reachable_when_the_document_fits() {
         let backend = Arc::new(TestBackend::new());
@@ -1921,11 +1947,20 @@ mod tests {
         assert!(third > 0, "sections sit at distinct offsets");
 
         app.jump_to_section(2);
-        assert_eq!(app.tour_scroll, third, "the last section is reachable");
-        assert_eq!(active_section(&app.tour_sections, app.tour_scroll), Some(2));
+        assert_eq!(app.tour_scroll, 0, "already on screen, so it stays put");
+        assert_eq!(
+            app.section_in_view(),
+            Some(2),
+            "the last section is reachable"
+        );
 
         app.jump_section(-1);
-        assert_eq!(app.tour_scroll, app.tour_sections[1].1);
+        assert_eq!(app.section_in_view(), Some(1));
+        assert_eq!(app.tour_scroll, 0);
+
+        // Scrolling away hands the reading position back to the viewport.
+        app.tour_scroll = third;
+        assert_eq!(app.document_focus(), None);
     }
 
     #[test]
@@ -1976,9 +2011,16 @@ mod tests {
         assert!(app.tour_outline_area.width > 0, "wide page gets a rail");
         assert!(app.tour_max_scroll > 0, "document overflows");
 
+        // A section taller than the page lands a quarter of the way down,
+        // keeping some of what came before it on screen.
         let second = app.tour_sections[1].1;
+        let (_, height) = app.tour_viewport;
         app.jump_to_section(1);
-        assert_eq!(app.tour_scroll, second.min(app.tour_max_scroll));
+        assert_eq!(
+            app.tour_scroll,
+            (second - height / 4).min(app.tour_max_scroll)
+        );
+        assert_eq!(app.section_in_view(), Some(1));
         // Section keys act on the page you are on, not on the PR's sections.
         assert_eq!(app.pr_scroll, 0);
     }
@@ -2092,7 +2134,14 @@ mod tests {
         // One padding row, then entry index 1.
         let (x, y) = (app.pr_outline_area.x + 1, app.pr_outline_area.y + 2);
         handle_mouse(&mut app, left_click(x, y));
-        assert_eq!(app.pr_scroll, second.min(app.pr_max_scroll));
+        assert_eq!(app.section_in_view(), Some(1));
+        // The short conversation is centered, not parked on the first row.
+        let (_, height) = app.pr_viewport;
+        assert!(
+            app.pr_scroll < second && second < app.pr_scroll + height,
+            "heading at {second} lands mid-screen, scroll {}",
+            app.pr_scroll
+        );
     }
 
     /// The rail is the discoverable half of section navigation, not the only
@@ -2565,7 +2614,7 @@ mod tests {
         assert_eq!(app.review_item_in_view(), 2, "and it stays the edit target");
         // Once the reader scrolls, the top of the view names the item again.
         app.review_scroll = 1;
-        assert_eq!(app.review_focus(), None);
+        assert_eq!(app.document_focus(), None);
         assert!(
             !app.handle_request(link::Request::ReviewFocus { id: Some(404) })
                 .ok
