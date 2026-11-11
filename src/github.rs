@@ -77,6 +77,12 @@ struct GhActor {
     login: String,
     #[serde(default)]
     name: Option<String>,
+    /// `gh pr view` says so for the PR's own author only.
+    #[serde(default)]
+    is_bot: bool,
+    /// GraphQL's actor type, `Bot` for a GitHub App.
+    #[serde(default, rename = "__typename")]
+    typename: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -187,7 +193,7 @@ query($owner: String!, $name: String!, $number: Int!, $endCursor: String) {
         nodes {
           id isResolved isOutdated path line originalLine startLine originalStartLine diffSide
           comments(first: 100) {
-            nodes { id databaseId author { login } body createdAt url replyTo { id } }
+            nodes { id databaseId author { login __typename } body createdAt url replyTo { id } }
           }
         }
       }
@@ -227,7 +233,7 @@ pub(crate) fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
     let gh: GhPullRequest = serde_json::from_slice(&output.stdout)
         .map_err(|e| anyhow!("could not decode gh PR response: {e}"))?;
     let threads = fetch_review_threads(&locator)?;
-    Ok(link::PullRequest {
+    let mut pr = link::PullRequest {
         repository: locator.repository,
         number: gh.number,
         title: gh.title,
@@ -260,7 +266,34 @@ pub(crate) fn fetch_pull_request(raw: &str) -> Result<link::PullRequest> {
             })
             .collect(),
         threads,
-    })
+    };
+    spread_bot_flags(&mut pr);
+    Ok(pr)
+}
+
+/// `gh pr view` leaves out whether a review's or comment's author is a bot,
+/// but the thread query knows. An account is the same account everywhere on
+/// the PR, so carry what the threads learned over to the rest.
+fn spread_bot_flags(pr: &mut link::PullRequest) {
+    let bots: std::collections::HashSet<String> = pr
+        .threads
+        .iter()
+        .flat_map(|thread| &thread.comments)
+        .filter(|comment| comment.author.bot)
+        .map(|comment| comment.author.login.clone())
+        .collect();
+    let authors = pr
+        .reviews
+        .iter_mut()
+        .map(|review| &mut review.author)
+        .chain(
+            pr.conversation
+                .iter_mut()
+                .map(|comment| &mut comment.author),
+        );
+    for author in authors {
+        author.bot |= bots.contains(&author.login);
+    }
 }
 
 fn fetch_review_threads(locator: &PrLocator) -> Result<Vec<link::ReviewThread>> {
@@ -353,6 +386,7 @@ fn normalize_review_thread(thread: GhReviewThread) -> link::ReviewThread {
 impl From<GhActor> for link::Actor {
     fn from(actor: GhActor) -> Self {
         Self {
+            bot: actor.is_bot || actor.typename.as_deref() == Some("Bot"),
             login: actor.login,
             name: actor.name,
         }
@@ -363,6 +397,7 @@ fn actor_or_ghost(actor: Option<GhActor>) -> link::Actor {
     actor.map(Into::into).unwrap_or_else(|| link::Actor {
         login: "ghost".into(),
         name: None,
+        bot: false,
     })
 }
 

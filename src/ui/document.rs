@@ -31,6 +31,15 @@ struct Document {
     /// Rows each expanded diff quote occupies, with the pathspec it names.
     /// Empty for documents that have no quotes, such as the PR page.
     quotes: Vec<(Range<usize>, String)>,
+    /// Continuation prefixes for rows that hang behind a gutter of their own,
+    /// such as a comment's author rule, keyed by source row.
+    hangs: std::collections::HashMap<usize, Vec<Span<'static>>>,
+    /// Rows whose background runs to the measure rather than stopping at the
+    /// text, so a heading band reads as one block.
+    bands: std::collections::HashSet<usize>,
+    /// Widest a prose row may run. Long lines across a wide pane are hard to
+    /// track back to their start, so a document can ask to wrap sooner.
+    measure: Option<u16>,
 }
 
 /// Where a tour quote points, parsed from the tour source rather than from a
@@ -124,17 +133,26 @@ impl Document {
             }
         }
 
+        let width = self.measure.map_or(width, |measure| measure.min(width));
         let mut rows: Vec<Line<'static>> = Vec::with_capacity(self.lines.len());
         // Where each source row begins, plus a sentinel so a range ending at
         // the last line still resolves.
         let mut starts = Vec::with_capacity(self.lines.len() + 1);
         for (i, line) in self.lines.iter().enumerate() {
             starts.push(rows.len());
-            match hang[i] {
-                Some(indent) => {
+            let first = rows.len();
+            match (hang[i], self.hangs.get(&i)) {
+                (Some(indent), _) => {
                     rows.extend(wrap::wrap_line(line, width, &wrap::indent_prefix(indent)))
                 }
-                None => rows.extend(wrap::wrap_line(line, width, &[])),
+                (None, Some(prefix)) => rows.extend(wrap::wrap_line(line, width, prefix)),
+                (None, None) => rows.extend(wrap::wrap_line(line, width, &[])),
+            }
+            if self.bands.contains(&i) {
+                for row in &mut rows[first..] {
+                    let fill = usize::from(width).saturating_sub(row.width());
+                    row.spans.push(Span::styled(" ".repeat(fill), line.style));
+                }
             }
         }
         starts.push(rows.len());
@@ -462,6 +480,7 @@ fn tour_document(source: &str, app: &App) -> Document {
             .map(|(title, row)| DocumentSection { title, row })
             .collect(),
         quotes: rendered.quotes,
+        ..Document::default()
     }
 }
 
@@ -758,7 +777,10 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
 }
 
 fn pull_request_document(pr: &link::PullRequest) -> Document {
-    let mut doc = Document::default();
+    let mut doc = Document {
+        measure: Some(PROSE_MEASURE),
+        ..Document::default()
+    };
     doc.section("Description");
     if pr.body.trim().is_empty() {
         doc.push(dim_line("No description."));
@@ -796,50 +818,35 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
         .collect();
     if !reviews.is_empty() {
         doc.section("Reviews");
-        // Newest first, so each reviewer's standing verdict leads and the
-        // ones it replaced fold to a heading beneath it.
+        // Newest first, so each reviewer's standing verdict leads. The ones
+        // it replaced gather beneath as a ledger, since nobody needs to reread
+        // a verdict that no longer stands.
         let mut seen = std::collections::HashSet::new();
-        for review in reviews.into_iter().rev() {
-            let superseded = !seen.insert(review.author.login.as_str());
-            let (verb, color) = match review.state {
-                link::ReviewState::Approved => ("approved", theme::GREEN),
-                link::ReviewState::ChangesRequested => ("requested changes", theme::RED),
-                link::ReviewState::Commented => ("reviewed", theme::TEAL),
-                link::ReviewState::Dismissed => ("review dismissed", theme::OVERLAY0),
-                link::ReviewState::Pending => ("review pending", theme::YELLOW),
-                link::ReviewState::Unknown => ("reviewed", theme::SUBTEXT0),
-            };
-            message_header(
-                &mut doc.lines,
-                &review.author,
-                verb,
-                review.submitted_at.as_deref(),
-                color,
-            );
-            if let Some(header) = doc.lines.last_mut() {
-                let (tag, tag_color) = match review.commit_oid.as_deref() {
-                    Some(oid) if oid == pr.head_oid => ("current head".to_string(), theme::GREEN),
-                    Some(oid) => (format!("at {}", short_oid(oid)), theme::OVERLAY0),
-                    None => (String::new(), theme::OVERLAY0),
-                };
-                if !tag.is_empty() {
-                    header.push_span(Span::styled(
-                        format!("  · {tag}"),
-                        Style::default().fg(tag_color),
-                    ));
-                }
-                if superseded {
-                    header.push_span(Span::styled(
-                        "  · superseded",
-                        Style::default().fg(theme::OVERLAY0),
-                    ));
-                }
+        let (standing, superseded): (Vec<_>, Vec<_>) = reviews
+            .into_iter()
+            .rev()
+            .partition(|review| seen.insert(review.author.login.as_str()));
+        for review in standing {
+            review_card(&mut doc, review, &pr.head_oid);
+        }
+        let mut by_author: Vec<(&str, usize)> = Vec::new();
+        for review in superseded {
+            match by_author
+                .iter_mut()
+                .find(|(who, _)| *who == review.author.login)
+            {
+                Some((_, n)) => *n += 1,
+                None => by_author.push((&review.author.login, 1)),
             }
-            // A bodiless review is just the event; its header already says it.
-            if !superseded && !review.body.trim().is_empty() {
-                doc.extend(markdown::lines(&review.body));
-                doc.push(Line::default());
-            }
+        }
+        for (who, n) in by_author {
+            doc.push(Line::from(Span::styled(
+                format!(
+                    "  ◌ {n} earlier review{} from @{who}, superseded",
+                    if n == 1 { "" } else { "s" }
+                ),
+                Style::default().fg(theme::OVERLAY0),
+            )));
         }
     }
     let (open, settled): (Vec<_>, Vec<_>) = pr
@@ -850,8 +857,8 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
     if !open.is_empty() {
         doc.section("Open threads");
         for (i, thread) in open {
-            thread_heading(&mut doc.lines, i + 1, thread);
-            doc.extend(review_thread_lines(thread));
+            thread_card(&mut doc, i + 1, thread, &pr.author.login);
+            doc.push(Line::default());
             doc.push(Line::default());
         }
     }
@@ -860,10 +867,342 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
     if !settled.is_empty() {
         doc.section(&format!("Resolved and outdated ({})", settled.len()));
         for (i, thread) in settled {
-            thread_heading(&mut doc.lines, i + 1, thread);
+            settled_row(&mut doc.lines, i + 1, thread);
         }
     }
     doc
+}
+
+/// Widest the PR page lets prose run, whatever the pane's width.
+const PROSE_MEASURE: u16 = 100;
+
+/// Threads at most this long show every comment; longer ones fold their
+/// middle so the opening ask and the latest human word sit together.
+const FOLD_AFTER: usize = 3;
+
+/// How much of a comment shows when it is clipped to set the scene.
+const CLIP_CHARS: usize = 240;
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Shape {
+    Full,
+    Clipped,
+    OneLine,
+}
+
+/// An open thread as a card: a heading band that says where it is and who
+/// spoke last, then its comments behind an author-colored rule. A long thread
+/// keeps the comment that opened it and the last thing a person said, and
+/// folds the back-and-forth between them into a count.
+fn thread_card(doc: &mut Document, n: usize, thread: &link::ReviewThread, pr_author: &str) {
+    let band = Style::default().bg(theme::SURFACE0);
+    let anchor = thread_anchor_label(thread);
+    let (dir, name) = match anchor.rsplit_once('/') {
+        Some((dir, name)) => (format!("{dir}/"), name.to_string()),
+        None => (String::new(), anchor),
+    };
+    let comments = &thread.comments;
+    let last_human = comments.iter().rposition(|c| !c.author.bot);
+    let heading = vec![
+        Span::styled(
+            format!(" Thread {n} "),
+            Style::default()
+                .fg(theme::BASE)
+                .bg(theme::TEAL)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(format!("  {dir}"), Style::default().fg(theme::OVERLAY0)),
+        Span::styled(
+            name,
+            Style::default()
+                .fg(theme::TEXT)
+                .add_modifier(Modifier::BOLD),
+        ),
+    ];
+    let mut status = vec![
+        Span::raw(" ".repeat(format!(" Thread {n} ").len())),
+        Span::styled(
+            format!(
+                "  {} comment{}",
+                comments.len(),
+                if comments.len() == 1 { "" } else { "s" }
+            ),
+            Style::default().fg(theme::SUBTEXT0),
+        ),
+    ];
+    if let Some(i) = last_human {
+        let who = &comments[i].author.login;
+        let role = if who == pr_author { " (author)" } else { "" };
+        status.push(Span::styled(
+            format!(
+                "  ·  last word from @{who}{role}, {}",
+                short_timestamp(&comments[i].created_at)
+            ),
+            Style::default().fg(theme::SUBTEXT0),
+        ));
+    }
+    for row in [heading, status] {
+        doc.bands.insert(doc.lines.len());
+        doc.push(Line::from(row).style(band));
+    }
+    doc.push(Line::default());
+
+    let shapes: Vec<Shape> = if comments.len() <= FOLD_AFTER {
+        vec![Shape::Full; comments.len()]
+    } else {
+        // Keep the opener and the last human word; anything after that word
+        // is a bot acknowledging it, which a single line covers.
+        let keep = last_human.unwrap_or(comments.len() - 1).max(1);
+        (0..comments.len())
+            .map(|i| match i {
+                0 => Shape::Clipped,
+                i if i == keep => Shape::Full,
+                i if i > keep => Shape::OneLine,
+                _ => Shape::OneLine, // folded below
+            })
+            .collect()
+    };
+    let keep = shapes.iter().position(|s| *s == Shape::Full);
+    let folded: Vec<usize> = match keep {
+        Some(keep) if comments.len() > FOLD_AFTER => (1..keep).collect(),
+        _ => Vec::new(),
+    };
+
+    for (i, comment) in comments.iter().enumerate() {
+        if folded.contains(&i) {
+            if i == folded[0] {
+                fold_line(doc, folded.iter().map(|&i| &comments[i]));
+            }
+            continue;
+        }
+        comment_block(doc, comment, pr_author, shapes[i]);
+        if shapes[i] != Shape::OneLine && i + 1 < comments.len() {
+            doc.push(Line::default());
+        }
+    }
+}
+
+fn review_verdict(state: link::ReviewState) -> (&'static str, Color) {
+    match state {
+        link::ReviewState::Approved => ("✓ approved", theme::GREEN),
+        link::ReviewState::ChangesRequested => ("✗ changes requested", theme::RED),
+        link::ReviewState::Commented => ("reviewed", theme::TEAL),
+        link::ReviewState::Dismissed => ("dismissed", theme::OVERLAY0),
+        link::ReviewState::Pending => ("pending", theme::YELLOW),
+        link::ReviewState::Unknown => ("reviewed", theme::SUBTEXT0),
+    }
+}
+
+/// Where a review stands against the code: on the head being looked at, or
+/// on an older commit.
+fn review_commit(review: &link::ReviewSummary, head: &str) -> Option<(String, Color)> {
+    match review.commit_oid.as_deref() {
+        Some(oid) if oid == head => Some(("current head".to_string(), theme::GREEN)),
+        Some(oid) => Some((format!("at {}", short_oid(oid)), theme::YELLOW)),
+        None => None,
+    }
+}
+
+/// A standing review as a card: the verdict as a pill in a shaded band, so a
+/// glance down the section reads approve / comment / block, then the body
+/// behind its author's rule.
+fn review_card(doc: &mut Document, review: &link::ReviewSummary, head: &str) {
+    let band = Style::default().bg(theme::SURFACE0);
+    let (verdict, color) = review_verdict(review.state);
+    let bot = review.author.bot;
+    let mut heading = vec![
+        Span::styled(
+            format!(" {verdict} "),
+            Style::default()
+                .fg(theme::BASE)
+                .bg(color)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(
+            format!("  @{}", review.author.login),
+            if bot {
+                Style::default().fg(theme::SUBTEXT0)
+            } else {
+                Style::default()
+                    .fg(theme::PEACH)
+                    .add_modifier(Modifier::BOLD)
+            },
+        ),
+    ];
+    if bot {
+        heading.push(Span::styled("  bot", Style::default().fg(theme::OVERLAY0)));
+    }
+    if let Some(when) = review.submitted_at.as_deref() {
+        heading.push(Span::styled(
+            format!("  {}", short_timestamp(when)),
+            Style::default().fg(theme::OVERLAY0),
+        ));
+    }
+    if let Some((tag, tag_color)) = review_commit(review, head) {
+        heading.push(Span::styled(
+            format!("  · {tag}"),
+            Style::default().fg(tag_color),
+        ));
+    }
+    doc.bands.insert(doc.lines.len());
+    doc.push(Line::from(heading).style(band));
+    // A bodiless review is just the event; its band already says it. A bot's
+    // verdict is the part worth reading, so its body shrinks to the line that
+    // usually carries the summary, and people's reviews stay whole.
+    let body = review.body.trim();
+    if bot && !body.is_empty() {
+        let first = body
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .unwrap_or("");
+        let text: String = first.replace(['`', '*', '_'], "");
+        let mut row = comment_gutter(true);
+        row.push(Span::styled(
+            clip(text.trim(), 90),
+            Style::default().fg(theme::OVERLAY0),
+        ));
+        doc.push(Line::default());
+        doc.hangs.insert(doc.lines.len(), comment_gutter(true));
+        doc.push(Line::from(row));
+    } else if !body.is_empty() {
+        doc.push(Line::default());
+        gutter_body(doc, &review.body, bot);
+    }
+    doc.push(Line::default());
+    doc.push(Line::default());
+}
+
+/// The rule that runs down a comment: warm for a person, quiet for a bot.
+fn comment_gutter(bot: bool) -> Vec<Span<'static>> {
+    let color = if bot { theme::SURFACE1 } else { theme::PEACH };
+    vec![
+        Span::raw("  "),
+        Span::styled("▎ ", Style::default().fg(color)),
+    ]
+}
+
+fn comment_block(doc: &mut Document, comment: &link::ReviewComment, pr_author: &str, shape: Shape) {
+    let bot = comment.author.bot;
+    let gutter = comment_gutter(bot);
+    let mut header = gutter.clone();
+    header.push(Span::styled(
+        format!("@{}", comment.author.login),
+        if bot {
+            Style::default().fg(theme::SUBTEXT0)
+        } else {
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD)
+        },
+    ));
+    if bot {
+        header.push(Span::styled("  bot", Style::default().fg(theme::OVERLAY0)));
+    } else if comment.author.login == pr_author {
+        header.push(Span::styled("  author", Style::default().fg(theme::PEACH)));
+    }
+    header.push(Span::styled(
+        format!("  {}", short_timestamp(&comment.created_at)),
+        Style::default().fg(theme::OVERLAY0),
+    ));
+
+    if shape == Shape::OneLine {
+        let text: String = comment
+            .body
+            .replace('`', "")
+            .split_whitespace()
+            .collect::<Vec<_>>()
+            .join(" ");
+        header.push(Span::styled(
+            format!("  {}", clip(&text, 70)),
+            Style::default().fg(theme::OVERLAY0),
+        ));
+        doc.hangs.insert(doc.lines.len(), gutter);
+        doc.push(Line::from(header));
+        return;
+    }
+    doc.push(Line::from(header));
+
+    let body = match shape {
+        Shape::Clipped => {
+            let first = comment.body.trim().split("\n\n").next().unwrap_or("");
+            let clipped = clip(first, CLIP_CHARS);
+            if clipped.len() < comment.body.trim().len() && !clipped.ends_with('…') {
+                format!("{clipped} …")
+            } else {
+                clipped
+            }
+        }
+        _ => comment.body.clone(),
+    };
+    gutter_body(doc, &body, bot);
+}
+
+/// A comment's markdown behind its author rule, with the rule carried down
+/// every wrapped row so the comment reads as one block.
+fn gutter_body(doc: &mut Document, body: &str, bot: bool) {
+    let gutter = comment_gutter(bot);
+    for line in markdown::lines(body) {
+        let mut spans = gutter.clone();
+        spans.extend(line.spans.into_iter().map(|span| quiet_span(span, bot)));
+        doc.hangs.insert(doc.lines.len(), gutter.clone());
+        doc.push(Line::from(spans).style(line.style));
+    }
+}
+
+/// Inline code keeps its color but loses the block behind it, which in a
+/// paragraph full of identifiers turned into a field of orange tiles. A bot's
+/// words step down a shade so the people in the thread lead.
+fn quiet_span(mut span: Span<'static>, bot: bool) -> Span<'static> {
+    if span.style.bg == Some(theme::SURFACE0) {
+        span.style.bg = None;
+    }
+    if bot {
+        span.style.fg = Some(match span.style.fg {
+            None | Some(theme::TEXT) => theme::SUBTEXT0,
+            Some(color) => theme::blend(color, theme::BASE, 0.3),
+        });
+    }
+    span
+}
+
+fn fold_line<'a>(doc: &mut Document, folded: impl Iterator<Item = &'a link::ReviewComment>) {
+    let mut count = 0;
+    let mut by_author: Vec<(String, usize)> = Vec::new();
+    for comment in folded {
+        count += 1;
+        let login = format!("@{}", comment.author.login);
+        match by_author.iter_mut().find(|(who, _)| *who == login) {
+            Some((_, n)) => *n += 1,
+            None => by_author.push((login, 1)),
+        }
+    }
+    let who = by_author
+        .iter()
+        .map(|(who, n)| format!("{n} {who}"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let dim = Style::default().fg(theme::OVERLAY0);
+    doc.push(Line::from(vec![
+        Span::raw("  "),
+        Span::styled("┆ ", dim),
+        Span::styled(
+            format!(
+                "⋯ {count} more repl{} ({who})",
+                if count == 1 { "y" } else { "ies" }
+            ),
+            dim.add_modifier(Modifier::ITALIC),
+        ),
+    ]));
+    doc.push(Line::default());
+}
+
+fn clip(text: &str, max: usize) -> String {
+    if text.chars().count() <= max {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(max).collect();
+    let cut = cut.rsplit_once(' ').map_or(cut.as_str(), |(head, _)| head);
+    format!("{}…", cut.trim_end())
 }
 
 pub(crate) fn draw_review_thread(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
@@ -952,24 +1291,35 @@ fn review_thread_lines(thread: &link::ReviewThread) -> Vec<Line<'static>> {
     lines
 }
 
-fn thread_heading(lines: &mut Vec<Line<'static>>, n: usize, thread: &link::ReviewThread) {
-    let state = if thread.outdated {
-        "outdated"
-    } else if thread.resolved {
-        "resolved"
+/// A settled thread is a line in a ledger: its state first, since that is
+/// why it is down here, then where it was.
+fn settled_row(lines: &mut Vec<Line<'static>>, n: usize, thread: &link::ReviewThread) {
+    let (state, color) = if thread.resolved {
+        ("✓ resolved", theme::GREEN)
     } else {
-        "open"
+        ("◌ outdated", theme::OVERLAY0)
     };
     lines.push(Line::from(vec![
+        Span::styled(format!("  {state}  "), Style::default().fg(color)),
         Span::styled(
-            format!("Thread {n}"),
-            Style::default()
-                .fg(theme::TEAL)
-                .add_modifier(Modifier::BOLD),
+            format!("Thread {n:<3}"),
+            Style::default().fg(theme::SUBTEXT0),
         ),
         Span::styled(
-            format!("  {}  {state}", thread_anchor_label(thread)),
-            Style::default().fg(theme::SUBTEXT0),
+            thread_anchor_label(thread),
+            Style::default().fg(theme::OVERLAY0),
+        ),
+        Span::styled(
+            format!(
+                "  {} comments{}",
+                thread.comments.len(),
+                if thread.resolved && thread.outdated {
+                    " · outdated"
+                } else {
+                    ""
+                }
+            ),
+            Style::default().fg(theme::OVERLAY0),
         ),
     ]));
 }
@@ -1119,6 +1469,7 @@ mod tests {
             author: link::Actor {
                 login: "author".into(),
                 name: None,
+                bot: false,
             },
             base_ref: "main".into(),
             base_oid: "base-oid".into(),
@@ -1129,6 +1480,7 @@ mod tests {
                 author: link::Actor {
                     login: "teammate".into(),
                     name: None,
+                    bot: false,
                 },
                 body: "A conversation comment.".into(),
                 created_at: "2026-08-14T12:00:00Z".into(),
@@ -1138,6 +1490,7 @@ mod tests {
                 author: link::Actor {
                     login: "reviewer".into(),
                     name: None,
+                    bot: false,
                 },
                 body: "A review summary.".into(),
                 state: link::ReviewState::ChangesRequested,
@@ -1160,6 +1513,7 @@ mod tests {
                     author: link::Actor {
                         login: "reviewer".into(),
                         name: None,
+                        bot: false,
                     },
                     body: "An inline review comment.".into(),
                     created_at: "2026-08-14T13:01:00Z".into(),
@@ -1189,12 +1543,12 @@ mod tests {
         assert!(text.iter().any(|line| line == "Open threads"));
         assert!(
             text.iter()
-                .any(|line| line.contains("Thread 1  src/main.rs:42  open"))
+                .any(|line| line.contains("Thread 1   src/main.rs:42"))
         );
         assert!(text.iter().any(|line| line == "Resolved and outdated (1)"));
         assert!(
             text.iter()
-                .any(|line| line.contains("Thread 2  src/main.rs:42  resolved"))
+                .any(|line| line.contains("✓ resolved  Thread 2  src/main.rs:42"))
         );
         assert!(
             !text.iter().any(|line| line.contains("Long since handled")),
@@ -1202,7 +1556,7 @@ mod tests {
         );
         assert!(
             text.iter()
-                .any(|line| line.contains("@reviewer  requested changes"))
+                .any(|line| line.contains("✗ changes requested   @reviewer"))
         );
 
         // A later verdict leads, the one it replaced folds, and an inline
@@ -1225,19 +1579,17 @@ mod tests {
             .iter()
             .map(Line::to_string)
             .collect();
-        let headers: Vec<&String> = text
+        let cards: Vec<&String> = text
             .iter()
-            .filter(|line| line.starts_with("@reviewer  requested changes"))
+            .filter(|line| line.contains("✗ changes requested"))
             .collect();
-        assert_eq!(headers.len(), 2, "{headers:?}");
+        assert_eq!(cards.len(), 1, "{cards:?}");
+        assert!(cards[0].contains("· current head"), "{}", cards[0]);
         assert!(
-            !text
-                .iter()
-                .any(|line| line.starts_with("@reviewer  reviewed"))
+            text.iter()
+                .any(|line| line.contains("◌ 1 earlier review from @reviewer, superseded")),
+            "{text:#?}"
         );
-        assert!(headers[0].ends_with("· current head"), "{}", headers[0]);
-        assert!(headers[1].contains("· at abcdef0"), "{}", headers[1]);
-        assert!(headers[1].ends_with("· superseded"), "{}", headers[1]);
         assert!(!text.iter().any(|line| line.contains("Not ready yet")));
         assert!(text.iter().any(|line| line.contains("A review summary.")));
     }

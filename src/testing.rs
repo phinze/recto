@@ -189,6 +189,7 @@ pub(crate) fn empty_pull_request(base_oid: &str) -> link::PullRequest {
         author: link::Actor {
             login: "author".into(),
             name: None,
+            bot: false,
         },
         base_ref: "main".into(),
         base_oid: base_oid.into(),
@@ -215,6 +216,7 @@ pub(crate) fn conversation_comment() -> link::ConversationComment {
         author: link::Actor {
             login: "teammate".into(),
             name: None,
+            bot: false,
         },
         body: "A conversation comment.".into(),
         created_at: "2026-08-14T12:00:00Z".into(),

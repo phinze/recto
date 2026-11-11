@@ -255,6 +255,10 @@ pub struct Actor {
     pub login: String,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub name: Option<String>,
+    /// A GitHub App or other automation rather than a person. The PR page
+    /// quiets bots so the people in a conversation stand out.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub bot: bool,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
