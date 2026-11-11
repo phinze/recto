@@ -11,7 +11,7 @@ use std::ops::Range;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph, Wrap};
+use ratatui::widgets::{Block, Borders, List, ListItem, Paragraph};
 
 use crate::app::{App, Page};
 use crate::ui::diff::{badge, gutter_signature, rows_for_span};
@@ -791,14 +791,12 @@ fn pull_request_document(pr: &link::PullRequest) -> Document {
     if !pr.conversation.is_empty() {
         doc.section("Conversation");
         for comment in &pr.conversation {
-            message_header(
-                &mut doc.lines,
+            doc.push(Line::from(author_header(
                 &comment.author,
-                "commented",
-                Some(&comment.created_at),
-                theme::TEAL,
-            );
-            doc.extend(markdown::lines(&comment.body));
+                &pr.author.login,
+                &comment.created_at,
+            )));
+            gutter_body(&mut doc, &comment.body, comment.author.bot);
             doc.push(Line::default());
         }
     }
@@ -1084,26 +1082,7 @@ fn comment_gutter(bot: bool) -> Vec<Span<'static>> {
 fn comment_block(doc: &mut Document, comment: &link::ReviewComment, pr_author: &str, shape: Shape) {
     let bot = comment.author.bot;
     let gutter = comment_gutter(bot);
-    let mut header = gutter.clone();
-    header.push(Span::styled(
-        format!("@{}", comment.author.login),
-        if bot {
-            Style::default().fg(theme::SUBTEXT0)
-        } else {
-            Style::default()
-                .fg(theme::PEACH)
-                .add_modifier(Modifier::BOLD)
-        },
-    ));
-    if bot {
-        header.push(Span::styled("  bot", Style::default().fg(theme::OVERLAY0)));
-    } else if comment.author.login == pr_author {
-        header.push(Span::styled("  author", Style::default().fg(theme::PEACH)));
-    }
-    header.push(Span::styled(
-        format!("  {}", short_timestamp(&comment.created_at)),
-        Style::default().fg(theme::OVERLAY0),
-    ));
+    let mut header = author_header(&comment.author, pr_author, &comment.created_at);
 
     if shape == Shape::OneLine {
         let text: String = comment
@@ -1135,6 +1114,32 @@ fn comment_block(doc: &mut Document, comment: &link::ReviewComment, pr_author: &
         _ => comment.body.clone(),
     };
     gutter_body(doc, &body, bot);
+}
+
+/// The line a comment opens with: the rule, who, what they are to the PR,
+/// and when.
+fn author_header(author: &link::Actor, pr_author: &str, created_at: &str) -> Vec<Span<'static>> {
+    let mut header = comment_gutter(author.bot);
+    header.push(Span::styled(
+        format!("@{}", author.login),
+        if author.bot {
+            Style::default().fg(theme::SUBTEXT0)
+        } else {
+            Style::default()
+                .fg(theme::PEACH)
+                .add_modifier(Modifier::BOLD)
+        },
+    ));
+    if author.bot {
+        header.push(Span::styled("  bot", Style::default().fg(theme::OVERLAY0)));
+    } else if author.login == pr_author {
+        header.push(Span::styled("  author", Style::default().fg(theme::PEACH)));
+    }
+    header.push(Span::styled(
+        format!("  {}", short_timestamp(created_at)),
+        Style::default().fg(theme::OVERLAY0),
+    ));
+    header
 }
 
 /// A comment's markdown behind its author rule, with the rule carried down
@@ -1245,14 +1250,11 @@ pub(crate) fn draw_review_thread(frame: &mut ratatui::Frame, area: Rect, app: &m
     ];
     frame.render_widget(Paragraph::new(header), rows[0]);
 
-    let lines = review_thread_lines(thread);
+    let document = review_thread_document(thread, &pr.author.login);
     let inner_width = rows[1].width.saturating_sub(4);
     let inner_height = rows[1].height.saturating_sub(2) as usize;
-    let visual_rows: usize = lines
-        .iter()
-        .map(|line| wrap::row_count(line, inner_width, 0))
-        .sum();
-    app.thread_max_scroll = visual_rows.saturating_sub(inner_height);
+    let lines = document.wrap(inner_width).rows;
+    app.thread_max_scroll = lines.len().saturating_sub(inner_height);
     app.thread_scroll = app.thread_scroll.min(app.thread_max_scroll);
     let block = Block::default()
         .borders(Borders::ALL)
@@ -1264,31 +1266,28 @@ pub(crate) fn draw_review_thread(frame: &mut ratatui::Frame, area: Rect, app: &m
     frame.render_widget(
         Paragraph::new(lines)
             .block(block.padding(ratatui::widgets::Padding::horizontal(1)))
-            .wrap(Wrap { trim: false })
             .scroll((app.thread_scroll.min(u16::MAX as usize) as u16, 0)),
         rows[1],
     );
 }
 
-fn review_thread_lines(thread: &link::ReviewThread) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+/// The whole conversation, every comment in full, styled the way the PR
+/// page's cards are so a thread reads the same once opened.
+fn review_thread_document(thread: &link::ReviewThread, pr_author: &str) -> Document {
+    let mut doc = Document {
+        measure: Some(PROSE_MEASURE),
+        ..Document::default()
+    };
     for (i, comment) in thread.comments.iter().enumerate() {
-        message_header(
-            &mut lines,
-            &comment.author,
-            if i == 0 { "commented" } else { "replied" },
-            Some(&comment.created_at),
-            theme::TEAL,
-        );
-        lines.extend(markdown::lines(&comment.body));
+        comment_block(&mut doc, comment, pr_author, Shape::Full);
         if i + 1 < thread.comments.len() {
-            lines.push(Line::default());
+            doc.push(Line::default());
         }
     }
-    if lines.is_empty() {
-        lines.push(dim_line("No comments in this thread."));
+    if doc.lines.is_empty() {
+        doc.push(dim_line("No comments in this thread."));
     }
-    lines
+    doc
 }
 
 /// A settled thread is a line in a ledger: its state first, since that is
@@ -1332,33 +1331,6 @@ fn thread_anchor_label(thread: &link::ReviewThread) -> String {
         (_, Some(line)) => format!("{}:{line}", thread.path),
         _ => thread.path.clone(),
     }
-}
-
-fn message_header(
-    lines: &mut Vec<Line<'static>>,
-    author: &link::Actor,
-    verb: &str,
-    timestamp: Option<&str>,
-    color: ratatui::style::Color,
-) {
-    let when = timestamp.map(short_timestamp).unwrap_or_default();
-    lines.push(Line::from(vec![
-        Span::styled(
-            format!("@{}", author.login),
-            Style::default()
-                .fg(theme::PEACH)
-                .add_modifier(Modifier::BOLD),
-        ),
-        Span::styled(format!("  {verb}"), Style::default().fg(color)),
-        Span::styled(
-            if when.is_empty() {
-                String::new()
-            } else {
-                format!("  {when}")
-            },
-            Style::default().fg(theme::OVERLAY0),
-        ),
-    ]));
 }
 
 fn dim_line(text: &str) -> Line<'static> {
