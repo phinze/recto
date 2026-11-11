@@ -346,6 +346,9 @@ struct DocumentLayout {
     outline_area: Rect,
     quotes: Vec<QuoteSpan>,
     body_area: Rect,
+    /// Visual rows the document wraps to, and how many of them fit at once.
+    rows: usize,
+    height: usize,
 }
 
 /// Render a sectioned document: outline rail on the left, prose on the right.
@@ -358,6 +361,7 @@ fn draw_document(
     title: &str,
     border: Color,
     scroll: usize,
+    focus: Option<usize>,
 ) -> DocumentLayout {
     // A single section is a label rather than a choice, the same rule the tab
     // strip and the side panes use, so it does not earn a rail.
@@ -397,7 +401,7 @@ fn draw_document(
             frame,
             outline_area,
             &sections,
-            active_section(&sections, scroll),
+            focus.or(active_section(&sections, scroll)),
         );
     }
 
@@ -422,6 +426,22 @@ fn draw_document(
         outline_area,
         quotes,
         body_area,
+        rows: visual_rows,
+        height: inner_height,
+    }
+}
+
+/// Scroll that brings rows `start..end` into a `height`-row viewport while
+/// moving as little as possible: none at all when they already show, just
+/// enough to uncover them when they fit, and to `start` when they are taller
+/// than the viewport, since the top of an item is where reading begins.
+fn reveal(scroll: usize, height: usize, start: usize, end: usize) -> usize {
+    if end.saturating_sub(start) > height || start < scroll {
+        start
+    } else if end > scroll + height {
+        end - height
+    } else {
+        scroll
     }
 }
 
@@ -516,6 +536,7 @@ pub(crate) fn draw_tour(frame: &mut ratatui::Frame, area: Rect, app: &mut App) {
         " Tour ",
         theme::MAUVE,
         app.tour_scroll,
+        None,
     );
     app.tour_scroll = layout.scroll;
     app.tour_max_scroll = layout.max_scroll;
@@ -582,7 +603,20 @@ fn snippet_line(row: &Line<'static>, width: usize, commented: bool) -> Option<Li
 fn review_document(app: &App) -> Document {
     let mut doc = Document::default();
     let dim = Style::default().fg(theme::OVERLAY0);
-    doc.section("Summary");
+    let focus = app.review_focus();
+    // The item a companion just pointed at may sit mid-screen rather than at
+    // the top, so its heading carries a band to say which one it is.
+    let section = |doc: &mut Document, title: &str| {
+        let index = doc.sections.len();
+        doc.section(title);
+        if Some(index) == focus {
+            let row = doc.lines.len() - 2;
+            doc.bands.insert(row);
+            let line = std::mem::take(&mut doc.lines[row]);
+            doc.lines[row] = line.style(Style::default().bg(theme::SURFACE0));
+        }
+    };
+    section(&mut doc, "Summary");
     match &app.review_draft_body {
         Some(draft) => {
             doc.push(Line::from(Span::styled(
@@ -611,7 +645,7 @@ fn review_document(app: &App) -> Document {
             format!("{}-{}", comment.start, comment.end)
         };
         let name = comment.path.rsplit('/').next().unwrap_or(&comment.path);
-        doc.section(&format!("✎{} {name}:{span}", i + 1));
+        section(&mut doc, &format!("✎{} {name}:{span}", i + 1));
         let label = Line::from(vec![
             Span::styled("  ", dim),
             Span::styled(
@@ -727,6 +761,7 @@ pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
         " Review ",
         theme::YELLOW,
         app.review_scroll,
+        app.review_focus(),
     );
     app.review_scroll = layout.scroll;
     app.review_max_scroll = layout.max_scroll;
@@ -734,8 +769,18 @@ pub(crate) fn draw_review(frame: &mut ratatui::Frame, area: Rect, app: &mut App)
     app.review_outline_area = layout.outline_area;
     app.review_quotes = layout.quotes;
     app.review_body_area = layout.body_area;
-    if let Some(item) = app.review_pending_item.take() {
-        app.jump_to_section(item);
+    // A draft the agent just wrote or touched should be visible, but jumping
+    // it to the top pushed the rest of a slate that already fit off screen.
+    if let Some(item) = app.review_pending_item.take()
+        && let Some(&(_, start)) = app.review_sections.get(item)
+    {
+        let end = app
+            .review_sections
+            .get(item + 1)
+            .map_or(layout.rows, |(_, next)| *next);
+        app.review_scroll =
+            reveal(app.review_scroll, layout.height, start, end).min(app.review_max_scroll);
+        app.review_focused = Some((item, app.review_scroll));
     }
 }
 
@@ -790,6 +835,7 @@ pub(crate) fn draw_pull_request(frame: &mut ratatui::Frame, area: Rect, app: &mu
         " PR context ",
         theme::SURFACE1,
         app.pr_scroll,
+        None,
     );
     app.pr_scroll = layout.scroll;
     app.pr_max_scroll = layout.max_scroll;
@@ -1448,6 +1494,18 @@ mod tests {
             "{text:#?}"
         );
         assert!(text.iter().any(|line| line.contains("src/gone.rs:99")));
+    }
+
+    #[test]
+    fn reveal_moves_only_as_far_as_it_has_to() {
+        // Already on screen: stay put.
+        assert_eq!(reveal(0, 30, 10, 20), 0);
+        // Below the fold but fits: scroll just enough to show its last row.
+        assert_eq!(reveal(0, 30, 25, 40), 10);
+        // Above the viewport: bring its top to the top.
+        assert_eq!(reveal(50, 30, 10, 20), 10);
+        // Taller than the viewport: start where reading starts.
+        assert_eq!(reveal(0, 30, 40, 100), 40);
     }
 
     #[test]

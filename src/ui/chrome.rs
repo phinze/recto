@@ -169,8 +169,12 @@ fn push_status(spans: &mut Vec<Span<'static>>, text: String, style: Style) {
 /// Where the reader sits in a sectioned document. The rail says the same thing
 /// when it is on screen; this is the half that survives a narrow page, where
 /// the rail hides and `]` / `[` keep working.
-fn document_status(spans: &mut Vec<Span<'static>>, sections: &[(String, usize)], scroll: usize) {
-    let Some(index) = active_section(sections, scroll) else {
+fn document_status(
+    spans: &mut Vec<Span<'static>>,
+    sections: &[(String, usize)],
+    index: Option<usize>,
+) {
+    let Some(index) = index else {
         return;
     };
     push_status(
@@ -187,9 +191,21 @@ fn status_line(app: &App) -> Paragraph<'static> {
     let mut spans: Vec<Span<'static>> = Vec::new();
 
     match app.page {
-        Page::Tour => document_status(&mut spans, &app.tour_sections, app.tour_scroll),
-        Page::Review => document_status(&mut spans, &app.review_sections, app.review_scroll),
-        Page::PullRequest => document_status(&mut spans, &app.pr_sections, app.pr_scroll),
+        Page::Tour => document_status(
+            &mut spans,
+            &app.tour_sections,
+            active_section(&app.tour_sections, app.tour_scroll),
+        ),
+        Page::Review => document_status(
+            &mut spans,
+            &app.review_sections,
+            (!app.review_sections.is_empty()).then(|| app.review_item_in_view()),
+        ),
+        Page::PullRequest => document_status(
+            &mut spans,
+            &app.pr_sections,
+            active_section(&app.pr_sections, app.pr_scroll),
+        ),
         Page::ReviewThread => {}
         Page::Diff => {}
     }

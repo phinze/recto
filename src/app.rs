@@ -460,6 +460,9 @@ pub(crate) struct App {
     /// A slate item a companion asked to see before the page had geometry to
     /// resolve it against. Spent by the next draw.
     pub(crate) review_pending_item: Option<usize>,
+    /// The slate item a companion last pointed at, and the scroll it was
+    /// revealed at. It stays the item in view until the reader scrolls.
+    pub(crate) review_focused: Option<(usize, usize)>,
     /// XDG-backed durable state keyed by this workspace's canonical root.
     pub(crate) persistence: Option<state::Store>,
     pub(crate) persistence_due: Option<Instant>,
@@ -645,6 +648,7 @@ impl App {
             next_review_draft_id: 1,
             review_verdict: None,
             review_pending_item: None,
+            review_focused: None,
             persistence,
             persistence_due: None,
             diff_cursor: None,
@@ -2554,6 +2558,14 @@ mod tests {
             2,
             "draft ✎2 is the one asked for"
         );
+        // The whole slate fits, so pointing at a draft highlights it where it
+        // is instead of scrolling the summary away.
+        assert_eq!(app.review_scroll, 0, "a slate that fits does not scroll");
+        terminal.draw(|frame| draw(frame, &mut app)).unwrap();
+        assert_eq!(app.review_item_in_view(), 2, "and it stays the edit target");
+        // Once the reader scrolls, the top of the view names the item again.
+        app.review_scroll = 1;
+        assert_eq!(app.review_focus(), None);
         assert!(
             !app.handle_request(link::Request::ReviewFocus { id: Some(404) })
                 .ok
