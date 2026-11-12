@@ -457,13 +457,17 @@ fn group_tour(group: &Path, rendered: &[(String, Summary)], budget: &mut usize, 
             return;
         }
     };
+    if let Some(brief) = store.brief().filter(|t| !t.trim().is_empty()) {
+        render_group_doc(&group, "brief", brief, rendered, budget, out);
+    }
     if let Some(tour) = store.tour().filter(|t| !t.trim().is_empty()) {
-        render_group_tour(&group, tour, rendered, budget, out);
+        render_group_doc(&group, "tour", tour, rendered, budget, out);
     }
 }
 
-fn render_group_tour(
+fn render_group_doc(
     group: &Path,
+    class: &str,
     tour: &str,
     rendered: &[(String, Summary)],
     budget: &mut usize,
@@ -477,7 +481,9 @@ fn render_group_tour(
             Some((i, rel.to_string_lossy().into_owned()))
         })
         .collect();
-    let label = if repos.len() > 1 {
+    let label = if class == "brief" {
+        "Briefing".to_string()
+    } else if repos.len() > 1 {
         format!(
             "Tour across {}",
             repos
@@ -489,9 +495,10 @@ fn render_group_tour(
     } else {
         "Tour".to_string()
     };
-    out.push_str("<div class=group-tour>");
-    render_tour(
-        "tg",
+    let _ = write!(out, "<div class=group-{class}>");
+    render_doc(
+        class,
+        if class == "brief" { "bg" } else { "tg" },
         &label,
         tour,
         budget,
@@ -549,7 +556,11 @@ fn workspace(
     budget: usize,
 ) -> (String, Summary) {
     let mut out = String::new();
-    let _ = write!(out, "<section class=repo id=\"repo-{index}\">");
+    let _ = write!(
+        out,
+        "<section class=repo id=\"repo-{index}\" data-repo=\"{}\">",
+        esc(&repo_name(Path::new(root)))
+    );
     let summary = match render_workspace(index, Path::new(root), start, view, budget, &mut out) {
         Ok(summary) => summary,
         Err(e) => {
@@ -895,6 +906,21 @@ fn view_base(backend: &dyn Backend, pull_request: Option<&link::PullRequest>) ->
         .ok_or_else(|| anyhow!("no diff base available"))
 }
 
+/// Where a rig repo's work started, from the environment `rig env` sets up:
+/// `RIG_STARTS` pairs each repo's directory under `RIG_BASEDIR` with its
+/// starting commit. `rig serve` hands the web view the same commits.
+fn rig_start(root: &Path) -> Option<String> {
+    let basedir = Path::new(&std::env::var_os("RIG_BASEDIR")?)
+        .canonicalize()
+        .ok()?;
+    let name = root.strip_prefix(&basedir).ok()?.to_str()?.to_string();
+    let starts = std::env::var("RIG_STARTS").ok()?;
+    starts.split_whitespace().find_map(|pair| {
+        let (dir, commit) = pair.split_once('=')?;
+        (dir == name).then(|| commit.to_string())
+    })
+}
+
 /// `recto focus` with no viewer listening. Focus is "look here now", and the
 /// web view is a viewer too, so it's saved where serve reads it, held to the
 /// rules a TUI applies: the file has to be in the diff, the review can't be
@@ -913,8 +939,20 @@ pub(crate) fn save_focus_offline(path: &str, start: Option<u32>, end: Option<u32
                 )));
             }
         }
-        let base = view_base(backend.as_ref(), store.pull_request())?;
-        let files = parse_diff(&backend.unified_diff(&Scope::Range(base), false)?);
+        // The same range the web view shows, anchored at the rig's start
+        // when rig says where that is.
+        let branch = view_base(backend.as_ref(), store.pull_request())?;
+        let mut files = parse_diff(&backend.unified_diff(&Scope::Range(branch.clone()), false)?);
+        let start_commit = rig_start(backend.root());
+        let anchored = anchor(
+            backend.as_ref(),
+            &branch,
+            start_commit.as_deref(),
+            files.is_empty(),
+        );
+        if anchored.base != branch {
+            files = parse_diff(&backend.unified_diff(&Scope::Range(anchored.base), false)?);
+        }
         let Some(file) = files.iter().find(|f| f.path == path) else {
             return Ok(Err(format!("not in current diff: {path}")));
         };
@@ -1144,7 +1182,8 @@ fn render_files(index: usize, files: &[FileDiff], budget: &mut usize, out: &mut 
         let key = file_key(&file.path);
         let _ = write!(
             out,
-            "<details class=file id=\"f{index}-{key}\"{open}><summary><span class=\"st st-{}\">{}</span><span class=path>{}</span><span class=stat><span class=add>+{}</span> <span class=del>−{}</span>{}</span></summary>",
+            "<details class=file id=\"f{index}-{key}\" data-path=\"{}\"{open}><summary><span class=\"st st-{}\">{}</span><span class=path>{}</span><span class=stat><span class=add>+{}</span> <span class=del>−{}</span>{}</span></summary>",
+            esc(&file.path),
             file.status,
             file.status,
             esc(&file.path),
@@ -1278,12 +1317,40 @@ fn render_tour(
     out: &mut String,
     quote: &mut QuoteFn,
 ) {
+    render_doc("tour", ids, label, source, budget, out, quote);
+}
+
+/// An agent-written Markdown document: a tour, or the briefing. Headings make
+/// an outline, fenced `recto PATH:SPAN` blocks quote the diff, and fenced
+/// `ask ID` blocks are questions the person answers in place.
+fn render_doc(
+    class: &str,
+    ids: &str,
+    label: &str,
+    source: &str,
+    budget: &mut usize,
+    out: &mut String,
+    quote: &mut QuoteFn,
+) {
+    let mut asking: Option<(String, String)> = None;
+    let mut asks = 0;
     let parser = Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION);
     let mut events: Vec<Event> = Vec::new();
     let mut outline: Vec<(String, String)> = Vec::new();
     let mut heading: Option<(String, String)> = None;
     let mut quoting: Option<String> = None;
     for event in parser {
+        if let Some((_, text)) = asking.as_mut() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => {
+                    let (id, text) = asking.take().unwrap_or_default();
+                    events.push(Event::Html(ask_html(&id, &text).into()));
+                }
+                Event::Text(t) => text.push_str(&t),
+                _ => {}
+            }
+            continue;
+        }
         if quoting.is_some() {
             if let Event::End(TagEnd::CodeBlock) = event {
                 let spec = quoting.take().unwrap_or_default();
@@ -1297,6 +1364,15 @@ fn render_tour(
             Event::Start(Tag::CodeBlock(ref kind)) => {
                 if let Some(spec) = markdown::quote_spec(kind) {
                     quoting = Some(spec);
+                    continue;
+                }
+                if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind
+                    && let Some(rest) = info.trim().strip_prefix("ask")
+                    && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+                {
+                    asks += 1;
+                    let id = rest.split_whitespace().next().map(str::to_string);
+                    asking = Some((id.unwrap_or_else(|| format!("ask{asks}")), String::new()));
                     continue;
                 }
                 events.push(event);
@@ -1371,10 +1447,11 @@ fn render_tour(
 
     let _ = write!(
         out,
-        "<article class=tour><div class=tour-label>{}</div>",
+        "<article class={class}><div class=tour-label>{}</div>",
         esc(label)
     );
-    if outline.len() > 1 {
+    // The briefing is short and read top to bottom; an outline is noise.
+    if outline.len() > 1 && class != "brief" {
         // Headings that carry their own number ("1. Setup") would read twice
         // under the list's counter, and an unnumbered intro beside them reads
         // fine without one.
@@ -1400,6 +1477,43 @@ fn render_tour(
 /// Quote `spec`'s lines from `files`, the diff of the repo at `index`.
 /// `caption` is how the tour wrote the spec, which a group tour prefixes with
 /// the repo's directory.
+/// A question the person answers in place. Lines starting `- ` are choices;
+/// the rest is the question. The page sends the answer as a comment anchored
+/// to the ask's id, so answering is the same gesture as commenting.
+fn ask_html(id: &str, text: &str) -> String {
+    let mut question = Vec::new();
+    let mut choices = Vec::new();
+    for line in text.lines() {
+        match line.trim_start().strip_prefix("- ") {
+            Some(choice) => choices.push(choice.trim()),
+            None => question.push(line),
+        }
+    }
+    let question = question.join("\n");
+    let mut out = format!("<div class=ask data-ask=\"{}\"><div class=ask-q>", esc(id));
+    for para in question
+        .split("\n\n")
+        .map(str::trim)
+        .filter(|p| !p.is_empty())
+    {
+        let _ = write!(out, "<p>{}</p>", esc(para).replace('\n', "<br>"));
+    }
+    out.push_str("</div>");
+    if !choices.is_empty() {
+        out.push_str("<div class=ask-choices>");
+        for c in choices {
+            let _ = write!(
+                out,
+                "<button type=button data-choice=\"{0}\">{0}</button>",
+                esc(c)
+            );
+        }
+        out.push_str("</div>");
+    }
+    out.push_str("<div class=ask-answer></div></div>");
+    out
+}
+
 fn quote_html(
     index: usize,
     spec: &str,
@@ -1664,8 +1778,9 @@ mod tests {
             (String::new(), summary("beta")),
         ];
         let mut out = String::new();
-        render_group_tour(
+        render_group_doc(
             group,
+            "tour",
             "# Across\n\n```recto beta/src/a.rs:2\n```\n\n```recto gamma/x.rs:1\n```\n",
             &rendered,
             &mut 0,
@@ -1683,6 +1798,26 @@ mod tests {
         assert!(out.contains("new();"), "{out}");
         assert!(out.contains("no repo here by that name"), "{out}");
         assert!(out.contains("id=\"tg-1\""), "{out}");
+    }
+
+    #[test]
+    fn ask_blocks_become_cards_with_choices() {
+        let mut out = String::new();
+        render_doc(
+            "brief",
+            "bg",
+            "Briefing",
+            "## Needs you\n\n```ask q1\nFold the list <by default>?\n- folded\n- open\n```\n\n```ask\nAnything else?\n```\n",
+            &mut 0,
+            &mut out,
+            &mut |_, _, _| {},
+        );
+        assert!(out.contains("<article class=brief>"), "{out}");
+        assert!(out.contains("data-ask=\"q1\""), "{out}");
+        assert!(out.contains("Fold the list &lt;by default&gt;?"), "{out}");
+        assert!(out.contains("data-choice=\"open\""), "{out}");
+        // An ask without an id gets one by position.
+        assert!(out.contains("data-ask=\"ask2\""), "{out}");
     }
 
     #[test]

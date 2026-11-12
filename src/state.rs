@@ -58,6 +58,11 @@ struct Document {
     /// before tours existed, which reads as no tour.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     tour: Option<String>,
+    /// The briefing: the agent's one page for the person's attention (what
+    /// needs them, what their comments turned into, where things stand).
+    /// Written for a group of repositories, so no viewer owns it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    brief: Option<String>,
     /// Companion tour annotations, in step order.
     #[serde(default)]
     annotations: Vec<Annotation>,
@@ -97,6 +102,7 @@ impl Document {
             },
             reviews: Vec::new(),
             tour: None,
+            brief: None,
             annotations: Vec::new(),
             focus: None,
             comments_visible: true,
@@ -203,6 +209,14 @@ impl Store {
 
     pub fn set_tour(&mut self, tour: Option<&str>) {
         self.document.tour = tour.map(str::to_string);
+    }
+
+    pub fn brief(&self) -> Option<&str> {
+        self.document.brief.as_deref()
+    }
+
+    pub fn set_brief(&mut self, brief: Option<&str>) {
+        self.document.brief = brief.map(str::to_string);
     }
 
     pub fn annotations(&self) -> &[Annotation] {
@@ -468,6 +482,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         notes: legacy.notes,
         reviews: legacy.reviews,
         tour: None,
+        brief: None,
         annotations: Vec::new(),
         focus: None,
         comments_visible: true,

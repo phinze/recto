@@ -69,6 +69,20 @@ pub(crate) enum ClientCommand {
         #[arg(long, value_name = "DIR")]
         group: Option<std::path::PathBuf>,
     },
+    /// Write the briefing: one page that organizes the person's attention,
+    /// rewritten as things change rather than appended to. Markdown, read
+    /// from BODY or stdin; an empty body removes it. Quotes work as in a
+    /// group tour, and a fenced `ask ID` block is a question the person
+    /// answers in place, its `- ` lines offered as choices.
+    ///
+    /// The briefing belongs to a group of repositories: DIR, or
+    /// `$RIG_BASEDIR` when that's set. `recto serve` pins it above the
+    /// tours; no viewer needs to be running.
+    Brief {
+        body: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        group: Option<std::path::PathBuf>,
+    },
     /// Bring the tour into view, optionally scrolled to a numbered SECTION.
     /// Sections are numbered from 1, matching the outline rail's badges.
     TourFocus { section: Option<usize> },
@@ -168,6 +182,28 @@ pub(crate) fn group_repos(dir: &Path) -> Vec<String> {
 /// repository itself, so a mistyped DIR is refused rather than quietly
 /// becoming a group nobody's page asks for.
 fn save_group_tour(dir: &Path, body: &str) -> i32 {
+    save_group_doc(dir, body, false)
+}
+
+/// Read a document body from the argument, or from stdin when there is none.
+fn read_body(body: &Option<String>, what: &str) -> Result<String> {
+    use std::io::{IsTerminal, Read};
+    if let Some(body) = body {
+        return Ok(body.clone());
+    }
+    let mut stdin = io::stdin();
+    if stdin.is_terminal() {
+        return Err(anyhow!(
+            "recto {what} needs a Markdown body as an argument or on stdin"
+        ));
+    }
+    let mut buffer = String::new();
+    stdin.read_to_string(&mut buffer)?;
+    Ok(buffer)
+}
+
+/// Save a group's tour, or its briefing.
+fn save_group_doc(dir: &Path, body: &str, brief: bool) -> i32 {
     // Ok(Err) is a refusal (exit 1); Err is a failure to read or write (2).
     let result = (|| -> Result<std::result::Result<Vec<String>, String>> {
         let dir = match dir.canonicalize() {
@@ -189,14 +225,19 @@ fn save_group_tour(dir: &Path, body: &str) -> i32 {
         }
         let mut store = state::Store::load(&dir, None)?;
         let body = body.trim();
-        store.set_tour((!body.is_empty()).then_some(body));
+        if brief {
+            store.set_brief((!body.is_empty()).then_some(body));
+        } else {
+            store.set_tour((!body.is_empty()).then_some(body));
+        }
         store.save()?;
         Ok(Ok(repos))
     })();
     match result {
         Ok(Ok(repos)) => {
             eprintln!(
-                "recto: saved the group tour across {}; quote paths start with one of those",
+                "recto: saved the group {} across {}; quote paths start with one of those",
+                if brief { "briefing" } else { "tour" },
                 repos.join(", ")
             );
             0
@@ -264,6 +305,24 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
     }
     if let ClientCommand::State { command } = &command {
         return run_state_command(command);
+    }
+    if let ClientCommand::Brief { body, group } = &command {
+        let Some(dir) = group
+            .clone()
+            .or_else(|| std::env::var_os("RIG_BASEDIR").map(std::path::PathBuf::from))
+        else {
+            eprintln!(
+                "recto: a briefing belongs to a group of repositories; pass --group DIR (outside a rig, RIG_BASEDIR isn't set)"
+            );
+            return 2;
+        };
+        return match read_body(body, "brief") {
+            Ok(body) => save_group_doc(&dir, &body, true),
+            Err(e) => {
+                eprintln!("recto: {e}");
+                2
+            }
+        };
     }
     if let ClientCommand::Tour {
         group: Some(dir), ..
@@ -490,7 +549,7 @@ fn wait_for_range(
 /// to workspace-root-relative so the agent can pass whatever form it used.
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
-        ClientCommand::State { .. } | ClientCommand::Serve { .. } => {
+        ClientCommand::State { .. } | ClientCommand::Serve { .. } | ClientCommand::Brief { .. } => {
             Err(anyhow!("this command does not use the workspace socket"))
         }
         ClientCommand::Base { revision } => Ok(link::Request::SetBase {

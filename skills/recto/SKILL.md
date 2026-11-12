@@ -1,12 +1,14 @@
 ---
 name: recto
 description: >-
-  Drive a running recto diff viewer from a companion session: scroll to and
-  highlight code, write a literate tour of prose and quoted diff, lay down
-  numbered tour stops, collect private agent notes, and co-author durable
-  local review drafts. Load whenever you are explaining or reviewing changes
-  where recto might be open, when asked to point at code, when the user says
-  they left notes, or while collaboratively writing PR review comments.
+  Drive recto, in a rig's web window or a terminal viewer: highlight code,
+  write a literate tour of prose and quoted diff, keep the briefing that
+  gathers what needs the person, answer comments sent from the window, lay
+  down numbered tour stops, collect private agent notes, and co-author
+  durable local review drafts. Load whenever you are explaining or reviewing
+  changes, when asked to point at code, when comments arrive from the web
+  window, when the user says they left notes, or while collaboratively
+  writing PR review comments.
 ---
 
 # recto
@@ -23,28 +25,81 @@ through.
 
 ## Inside a multi-repo Rig
 
-Most rigs start with the agent alone, and a repo's recto appears beside the
-agent when someone asks for it. (Review rigs open with one already, since the
-diff is the job.) When `RIG_BASEDIR` is set, route every command through Rig
-and name the repo subdirectory from the generated rig instructions:
+Paul reads an authoring rig in a web window beside Rex. `rig serve` shows
+the rig his Rex app is on, rendered by `recto serve` and refreshed live:
+the briefing, the tours, and each repo's diff. Write to it with plain
+`recto` commands, run from inside the repo they're about. With no terminal
+Recto running they go straight to Recto's state, which is what the window
+reads:
 
-    rig recto cloud ping
-    rig recto cloud base 'trunk()'
-    rig recto cloud focus src/app.rs:42-58
-    rig recto brand annotate 'docs/index.md:10=Update the headline'
-    rig recto cloud notes
-    rig recto cloud clear
+    recto tour < tour.md                       # this repo's story
+    recto tour --group "$RIG_BASEDIR" < t.md   # one story across the repos
+    recto focus src/app.rs:42-58               # point at code
+    recto brief < brief.md                     # the briefing (below)
+    recto clear
 
-`rig recto <repo>` puts that repo's viewer beside the agent, starting it if
-it isn't running and parking whichever repo was there into its own tab. Any
-remaining arguments are forwarded to recto from the correct workspace. The
-command is idempotent when that repo is already visible and preserves
-recto's exit codes. Because every `rig recto` command opens the viewer,
-`ping` included, run one when you want the user looking at the diff, not to
-probe whether a recto exists. Use this form even when you think the right viewer is
-already active, so the user's visible surface and the command target cannot
-drift apart. Do not run tmux pane commands yourself, and do not use `recto -R`
-as a substitute: Rig owns the carousel and must know which viewer to surface.
+The terminal Recto is the escape hatch, for when Paul asks for it or for
+what the window can't do yet: retargeting the base and co-authoring review
+drafts. `rig recto <repo>` puts that repo's viewer beside the agent,
+starting it if needed; any remaining arguments are forwarded to recto from
+the correct workspace (`rig recto cloud base 'trunk()'`). Every `rig recto`
+command opens the viewer, so don't use it to probe. Do not run tmux pane
+commands yourself, and do not use `recto -R` as a substitute: Rig owns the
+panes. While a terminal Recto is up, plain `recto` commands drive it
+instead, and the window still follows.
+
+Review rigs open with a terminal Recto, since the review slate is the job
+there. Route their commands through `rig recto` as before.
+
+### The briefing
+
+The briefing is one page that organizes Paul's attention, pinned above
+everything else in the window. Agents can juggle five threads; a person
+reading them gets scattered. So instead of answering in many places, gather
+it here and keep it current:
+
+    recto brief <<'EOF'
+    ## Needs you
+
+    ```ask fold
+    Should the revision list start folded, or open once work has landed?
+    - folded
+    - open when landed
+    ```
+
+    ## Done since you last looked
+
+    Comment on `serve.rs:60` (the name of `run`): renamed it to `serve`.
+
+    ## Where we stand
+
+    Comments work end to end on the dev build; shipping is next.
+    EOF
+
+Each fenced `ask ID` block is a question Paul answers in place. Its `- `
+lines are offered as choices, and he can add words either way. His answer
+comes back like any other comment, anchored to the ask's ID. Keep the
+section order: what needs him first, then what his comments turned into,
+then a short "where we stand". Rewrite the whole briefing rather than
+append to it, whenever you finish something he asked for or reach a
+decision that's his, and drop asks once they're answered. In a rig it
+belongs to `$RIG_BASEDIR`; outside one, pass `--group DIR`. Quotes work as
+in a group tour. An empty body removes it.
+
+### Comments from the window
+
+Paul can select anything in the window (diff lines, a tour passage, part of
+the briefing) and comment on it. Comments are held until he sends them, and
+then they arrive as one message from "Paul (web window)" with an id, the
+anchor, and the quoted selection for each. Mark each one so he can see where
+it stands:
+
+    rig ack c3f1a start     # taken up
+    rig ack c3f1a done      # handled
+
+Acks carry no text. Don't answer each comment with a message. Put what he
+should read (what each comment turned into, questions back) in the briefing.
+`rig reply` doesn't answer comments.
 
 Outside a Rig, use the ordinary `recto …` commands below.
 

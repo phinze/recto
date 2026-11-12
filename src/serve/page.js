@@ -181,6 +181,7 @@
     } else if (!moved) {
       window.scrollTo(0, y);
     }
+    decorate();
     live.classList.add('pulse');
     setTimeout(() => live.classList.remove('pulse'), 600);
   }
@@ -265,10 +266,215 @@
   }
   listen();
 
+
+  // Comments. Select anything on the page, say something about it, and the
+  // frame around this page (rig serve's) holds it for the agent, sending a
+  // batch as one message. This page only works out what a selection is about;
+  // delivery and tracking belong to the frame, which posts back where each
+  // comment stands so the page can mark the spot. With no frame there's no
+  // one to deliver to, so none of this shows.
+  const framed = window.parent !== window;
+  let comments = [];
+  const pill = document.createElement('button');
+  pill.id = 'comment-pill';
+  pill.type = 'button';
+  pill.textContent = 'comment';
+  const composer = document.createElement('form');
+  composer.id = 'composer';
+  composer.innerHTML = '<div class=c-anchor></div><blockquote class=c-quote></blockquote>'
+    + '<textarea rows=3 placeholder="what should the agent know or do?"></textarea>'
+    + '<div class=c-actions><span class=c-hint>⌘↩ hold · ⇧⌘↩ send now · esc</span>'
+    + '<button type=button class=c-cancel>cancel</button><button type=button class=c-send>send now</button>'
+    + '<button type=submit class=c-hold>hold</button></div>';
+  if (framed) document.body.append(pill, composer);
+  let pending = null; // {anchor, quote} the composer is writing about
+
+  function rowLines(root, range) {
+    const rows = [...root.querySelectorAll('tr')].filter((tr) => tr.cells.length === 3 && range.intersectsNode(tr));
+    const nums = (i) => rows.map((tr) => parseInt(tr.cells[i].textContent, 10)).filter((n) => n > 0);
+    return { added: nums(1), removed: nums(0) };
+  }
+
+  function spanText(nums) {
+    const lo = Math.min(...nums), hi = Math.max(...nums);
+    return lo === hi ? String(lo) : lo + '-' + hi;
+  }
+
+  // What a selection is about, as rig records it: a diff span, a section of
+  // a tour or the briefing, or plain text somewhere in a repo.
+  function anchorFor(range) {
+    let node = range.commonAncestorContainer;
+    if (node.nodeType !== 1) node = node.parentElement;
+    const section = node.closest('section.repo');
+    const repo = section ? section.dataset.repo : '';
+    const figure = node.closest('figure.quote');
+    const file = node.closest('details.file');
+    if (figure || file) {
+      let r = repo, path;
+      if (figure) {
+        path = figure.querySelector('figcaption').textContent.trim().replace(/:[\d-]+$/, '');
+        if (!r) { const i = path.indexOf('/'); r = path.slice(0, i); path = path.slice(i + 1); }
+      } else {
+        path = file.dataset.path;
+      }
+      const { added, removed } = rowLines(figure || file.querySelector('table.diff') || file, range);
+      const anchor = { kind: 'diff', repo: r, path, label: (r ? r + '/' : '') + path };
+      if (added.length) {
+        anchor.start = Math.min(...added);
+        anchor.end = Math.max(...added);
+        anchor.label += ':' + spanText(added);
+      } else if (removed.length) {
+        anchor.label += ' (removed lines ' + spanText(removed) + ')';
+      }
+      return anchor;
+    }
+    const ask = node.closest('.ask');
+    if (ask) return askAnchor(ask);
+    const art = node.closest('article.tour, article.brief');
+    if (art) {
+      let heading = null;
+      for (const h of art.querySelectorAll('h1[id], h2[id]')) {
+        if (h.contains(range.startContainer) || (h.compareDocumentPosition(range.startContainer) & Node.DOCUMENT_POSITION_FOLLOWING)) heading = h;
+      }
+      const brief = art.classList.contains('brief');
+      const what = brief ? 'Briefing' : repo ? repo + ' tour' : 'Group tour';
+      const title = heading ? heading.textContent.trim() : '';
+      return { kind: brief ? 'brief' : 'tour', repo, section: title, label: title ? what + ' › ' + title : what };
+    }
+    return { kind: 'text', repo, label: repo || 'the page' };
+  }
+
+  function askAnchor(card) {
+    const q = card.querySelector('.ask-q').textContent.trim().split('\n')[0];
+    return { kind: 'ask', section: card.dataset.ask, label: 'Ask ' + card.dataset.ask + ': ' + (q.length > 80 ? q.slice(0, 79) + '…' : q) };
+  }
+
+  function send(anchor, quote, body, now) {
+    window.parent.postMessage({ comment: { anchor, quote, body, send: now } }, location.origin);
+  }
+
+  function hidePill() { pill.classList.remove('shown'); }
+  function closeComposer() { composer.classList.remove('shown'); pending = null; }
+
+  document.addEventListener('selectionchange', () => {
+    if (!framed) return;
+    const sel = document.getSelection();
+    if (!sel || sel.isCollapsed || !sel.rangeCount || sel.toString().trim().length < 2) return hidePill();
+    const range = sel.getRangeAt(0);
+    if (!content.contains(range.commonAncestorContainer) || range.commonAncestorContainer.closest?.('.ask')) return hidePill();
+    const rect = range.getBoundingClientRect();
+    pill.style.top = Math.min(window.innerHeight - 40, rect.bottom + 6) + 'px';
+    pill.style.left = Math.max(8, Math.min(window.innerWidth - 100, rect.right - 40)) + 'px';
+    pill.classList.add('shown');
+  });
+  pill.addEventListener('mousedown', (e) => e.preventDefault()); // keep the selection
+  pill.addEventListener('click', () => {
+    const sel = document.getSelection();
+    if (!sel || !sel.rangeCount) return;
+    const range = sel.getRangeAt(0);
+    pending = { anchor: anchorFor(range), quote: sel.toString().trim().slice(0, 4000) };
+    composer.querySelector('.c-anchor').textContent = pending.anchor.label;
+    const q = pending.quote;
+    composer.querySelector('.c-quote').textContent = q.length > 280 ? q.slice(0, 279) + '…' : q;
+    hidePill();
+    composer.classList.add('shown');
+    composer.querySelector('textarea').focus();
+  });
+  function submit(now) {
+    const ta = composer.querySelector('textarea');
+    if (!pending || !ta.value.trim()) return ta.focus();
+    send(pending.anchor, pending.quote, ta.value.trim(), now);
+    ta.value = '';
+    closeComposer();
+    document.getSelection()?.removeAllRanges();
+  }
+  composer.addEventListener('submit', (e) => { e.preventDefault(); submit(false); });
+  composer.querySelector('.c-send').addEventListener('click', () => submit(true));
+  composer.querySelector('.c-cancel').addEventListener('click', closeComposer);
+  composer.addEventListener('keydown', (e) => {
+    if (e.key === 'Escape') { e.stopPropagation(); closeComposer(); }
+    if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(e.shiftKey); }
+  });
+
+  // Asks: questions in the briefing, answered in place. An answer is a
+  // comment anchored to the ask, so it batches with everything else.
+  content.addEventListener('click', (e) => {
+    const choice = e.target.closest('.ask-choices button');
+    if (choice) {
+      for (const b of choice.parentElement.children) b.classList.toggle('picked', b === choice && !b.classList.contains('picked'));
+      return;
+    }
+    const act = e.target.closest('.ask-answer button[data-act]');
+    if (act) {
+      const card = act.closest('.ask');
+      const picked = card.querySelector('.ask-choices .picked');
+      const text = card.querySelector('.ask-answer textarea').value.trim();
+      if (!picked && !text) return card.querySelector('.ask-answer textarea').focus();
+      const body = [picked ? 'Choice: ' + picked.dataset.choice : '', text].filter(Boolean).join('\n');
+      send(askAnchor(card), card.querySelector('.ask-q').textContent.trim(), body, act.dataset.act === 'send');
+    }
+  });
+
+  // Where each comment stands, marked on the page: a dot in the gutter of a
+  // diff line, a badge on a section, an ask showing its answer. Redrawn after
+  // every refresh, since a refresh replaces the page.
+  const stateWords = { held: 'held', failed: 'not delivered', sent: 'sent', start: 'on it', done: 'handled' };
+  function decorate() {
+    for (const el of content.querySelectorAll('.has-comment')) { el.classList.remove('has-comment'); delete el.dataset.cstate; }
+    for (const el of content.querySelectorAll('.c-badge')) el.remove();
+    const answered = new Map();
+    for (const c of comments) {
+      const a = c.anchor;
+      if (a.kind === 'ask') { answered.set(a.section, c); continue; }
+      if (a.kind === 'diff' && a.start) {
+        const section = content.querySelector(`section.repo[data-repo="${CSS.escape(a.repo)}"]`);
+        const file = section && [...section.querySelectorAll('details.file')].find((d) => d.dataset.path === a.path);
+        const end = a.end || a.start;
+        const rows = file ? [...file.querySelectorAll('tr')].filter((tr) => {
+          const n = tr.cells.length === 3 && parseInt(tr.cells[1].textContent, 10);
+          return n >= a.start && n <= end;
+        }) : [];
+        for (const row of rows) { row.classList.add('has-comment'); row.dataset.cstate = c.state; row.title = c.body; }
+      } else if ((a.kind === 'tour' || a.kind === 'brief') && a.section) {
+        const h = [...content.querySelectorAll(`article.${a.kind} h1, article.${a.kind} h2`)].find((x) => x.textContent.trim() === a.section);
+        if (h) {
+          const b = document.createElement('span');
+          b.className = 'c-badge';
+          b.dataset.cstate = c.state;
+          b.textContent = stateWords[c.state] || c.state;
+          b.title = c.body;
+          h.append(b);
+        }
+      }
+    }
+    for (const card of content.querySelectorAll('.ask')) {
+      const c = answered.get(card.dataset.ask);
+      const slot = card.querySelector('.ask-answer');
+      card.classList.toggle('answered', !!c);
+      if (c) {
+        slot.innerHTML = '<div class=ask-given></div><span class=c-badge></span>';
+        slot.querySelector('.ask-given').textContent = c.body;
+        const b = slot.querySelector('.c-badge');
+        b.dataset.cstate = c.state;
+        b.textContent = stateWords[c.state] || c.state;
+      } else if (!slot.querySelector('textarea') && framed) {
+        slot.innerHTML = '<textarea rows=2 placeholder="answer…"></textarea>'
+          + '<div class=c-actions><button type=button data-act=send>send now</button><button type=button data-act=hold class=c-hold>hold answer</button></div>';
+      }
+    }
+    // The frame counts what's waiting on the person.
+    if (framed) {
+      const open = [...content.querySelectorAll('.ask')].filter((c) => !answered.has(c.dataset.ask)).length;
+      window.parent.postMessage({ asks: open }, location.origin);
+    }
+  }
+
   // A parent frame can point this page at code: postMessage({focus: "L0-3-42"}).
   window.addEventListener('message', (e) => {
     if (e.source !== window.parent) return;
     if (e.data && typeof e.data.focus === 'string') reveal(e.data.focus);
     if (e.data && e.data.refresh) refresh();
+    if (e.data && Array.isArray(e.data.comments)) { comments = e.data.comments; decorate(); }
   });
+  decorate();
 })();
