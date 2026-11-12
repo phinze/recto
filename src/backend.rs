@@ -632,7 +632,13 @@ impl Backend for JjBackend {
     }
 
     fn commits(&self, from: &str, to: &str) -> Result<Vec<Commit>> {
-        let me = user_email("jj", &["config", "get", "user.email"], &self.repo_root);
+        // Whoever is working in this workspace authored its working copy.
+        // Asking that instead of jj's config also reads a review rig's PR
+        // commits as someone else's.
+        let me = self
+            .run(&["log", "-r", "@", "--no-graph", "-T", "author.email()"])
+            .map(|e| e.trim().to_lowercase())
+            .unwrap_or_default();
         let out = self.run(&[
             "log",
             "-r",
@@ -1560,36 +1566,34 @@ mod tests {
     /// A jj repo whose own config names the test author, so `commits` can
     /// tell whose work is whose. Starts with a described trunk commit under
     /// `main`, and returns it with that commit's id.
-    fn jj_trunk_repo(name: &str) -> (TempRepo, String) {
+    /// A jj repo with a described trunk commit under `main`, pushed to a bare
+    /// remote so `trunk()` follows `main@origin`. Returns the repo, the remote
+    /// (kept alive beside it, outside the working copy), and the trunk
+    /// commit's id. Nothing here writes jj config: under a build sandbox there
+    /// is no home to write it to.
+    fn jj_trunk_repo(name: &str) -> (TempRepo, TempRepo, String) {
         let repo = TempRepo::new(name);
+        let remote = TempRepo::new(&format!("{name}-remote"));
+        repo.run("git", &["init", "--bare", remote.0.to_str().unwrap()]);
         repo.run("jj", &["git", "init", "--colocate", "."]);
         repo.run(
             "jj",
-            &[
-                "config",
-                "set",
-                "--repo",
-                "user.email",
-                "recto@example.invalid",
-            ],
-        );
-        // trunk() normally follows a remote's main; there's no remote here.
-        repo.run(
-            "jj",
-            &[
-                "config",
-                "set",
-                "--repo",
-                "revset-aliases.\"trunk()\"",
-                "main",
-            ],
+            &["git", "remote", "add", "origin", remote.0.to_str().unwrap()],
         );
         std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
         repo.run("jj", &["describe", "-m", "trunk"]);
         repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
-        let start = JjBackend::new(repo.0.clone()).commit_id("@").unwrap();
-        repo.run("jj", &["new"]);
-        (repo, start)
+        // Pushing makes the trunk commit immutable, so jj starts a fresh
+        // working copy above it on its own.
+        repo.run("jj", &["git", "push", "--bookmark", "main"]);
+        let start = JjBackend::new(repo.0.clone()).commit_id("main").unwrap();
+        (repo, remote, start)
+    }
+
+    /// Lands everything below the working copy on trunk.
+    fn jj_land(repo: &TempRepo) {
+        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+        repo.run("jj", &["git", "push", "--bookmark", "main"]);
     }
 
     fn jj_commit(repo: &TempRepo, file: &str, lines: &str, message: &str) {
@@ -1600,9 +1604,9 @@ mod tests {
 
     #[test]
     fn jj_commits_list_the_range_newest_first_with_stats() {
-        let (repo, start) = jj_trunk_repo("jj-commits");
+        let (repo, _remote, start) = jj_trunk_repo("jj-commits");
         jj_commit(&repo, "a.txt", "one\ntwo\n", "first");
-        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+        jj_land(&repo);
         jj_commit(&repo, "b.txt", "three\n", "second");
 
         let backend = JjBackend::new(repo.0.clone());
@@ -1620,10 +1624,10 @@ mod tests {
 
     #[test]
     fn page_anchors_at_the_rig_start_once_its_work_landed() {
-        let (repo, start) = jj_trunk_repo("jj-anchor-landed");
+        let (repo, _remote, start) = jj_trunk_repo("jj-anchor-landed");
         jj_commit(&repo, "a.txt", "a\n", "pushed one");
         jj_commit(&repo, "b.txt", "b\n", "pushed two");
-        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+        jj_land(&repo);
 
         let backend = JjBackend::new(repo.0.clone());
         let branch = backend.default_bases().remove(0);
@@ -1645,21 +1649,21 @@ mod tests {
 
     #[test]
     fn page_keeps_the_branch_point_when_others_landed_work_in_between() {
-        let (repo, start) = jj_trunk_repo("jj-anchor-foreign");
+        let (repo, _remote, start) = jj_trunk_repo("jj-anchor-foreign");
         jj_commit(&repo, "mine.txt", "mine\n", "mine");
         std::fs::write(repo.0.join("theirs.txt"), "theirs\n").unwrap();
+        repo.run("jj", &["describe", "-m", "theirs"]);
+        repo.run("jj", &["new"]);
         repo.run(
             "jj",
             &[
                 "metaedit",
                 "--author",
                 "Someone Else <someone@example.invalid>",
-                "-m",
-                "theirs",
+                "@-",
             ],
         );
-        repo.run("jj", &["new"]);
-        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+        jj_land(&repo);
 
         let backend = JjBackend::new(repo.0.clone());
         let branch = backend.default_bases().remove(0);
@@ -1670,7 +1674,7 @@ mod tests {
 
     #[test]
     fn page_keeps_the_branch_point_for_unlanded_work() {
-        let (repo, start) = jj_trunk_repo("jj-anchor-branch");
+        let (repo, _remote, start) = jj_trunk_repo("jj-anchor-branch");
         jj_commit(&repo, "lower.txt", "lower\n", "lower");
         repo.run("jj", &["bookmark", "create", "lower", "-r", "@-"]);
         jj_commit(&repo, "top.txt", "top\n", "top");
