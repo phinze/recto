@@ -151,6 +151,100 @@ pub trait Backend: Send + Sync {
     /// copy — i.e. `Scope::Rev`, where reading disk would land on whatever
     /// `@` happens to be instead of the rev being viewed.
     fn file_content(&self, rev: &str, path: &str) -> Result<String>;
+    /// The revision that names "everything up to now" in a range: jj's `@`
+    /// (the working-copy commit) or git's `HEAD`.
+    fn head_rev(&self) -> &'static str {
+        "@"
+    }
+    /// The single commit a revision names, or `None` when it doesn't resolve.
+    fn commit_id(&self, _rev: &str) -> Option<String> {
+        None
+    }
+    /// The commit a base starts from, resolved the way a diff would.
+    fn base_commit(&self, _base: &Base) -> Option<String> {
+        None
+    }
+    /// The trunk tip's commit id.
+    fn trunk(&self) -> Option<String> {
+        None
+    }
+    /// Whether `ancestor` is `of` or one of its ancestors.
+    fn is_ancestor(&self, _ancestor: &str, _of: &str) -> bool {
+        false
+    }
+    /// The commits in `from..to`, newest first, each with its diffstat.
+    fn commits(&self, _from: &str, _to: &str) -> Result<Vec<Commit>> {
+        Ok(Vec::new())
+    }
+}
+
+/// One commit in a range, as a revision list shows it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Commit {
+    pub id: String,
+    /// jj's short change id, or git's short sha.
+    pub change: String,
+    pub summary: String,
+    /// Already on trunk.
+    pub landed: bool,
+    /// Authored by whoever this repository's config says you are.
+    pub mine: bool,
+    pub empty: bool,
+    pub added: u32,
+    pub removed: u32,
+    /// How long ago it was committed, in the VCS's own words.
+    pub when: String,
+}
+
+/// Rows of `id, change, empty, landed, email, added, removed, when, summary`
+/// separated by 0x1f. A working copy with nothing in it and no description is
+/// where the next change will go, not a commit worth listing.
+fn parse_commits(out: &str, me: &str) -> Vec<Commit> {
+    out.lines()
+        .filter_map(|line| {
+            let f: Vec<&str> = line.splitn(9, '\x1f').collect();
+            let [
+                id,
+                change,
+                empty,
+                landed,
+                email,
+                added,
+                removed,
+                when,
+                summary,
+            ] = f[..]
+            else {
+                return None;
+            };
+            let empty = empty == "e";
+            if empty && summary.trim().is_empty() {
+                return None;
+            }
+            Some(Commit {
+                id: id.to_string(),
+                change: change.to_string(),
+                summary: summary.to_string(),
+                landed: landed == "l",
+                mine: !me.is_empty() && email.trim().eq_ignore_ascii_case(me),
+                empty,
+                added: added.parse().unwrap_or(0),
+                removed: removed.parse().unwrap_or(0),
+                when: when.to_string(),
+            })
+        })
+        .collect()
+}
+
+fn user_email(cmd: &str, args: &[&str], root: &Path) -> String {
+    Command::new(cmd)
+        .args(args)
+        .current_dir(root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_lowercase())
+        .unwrap_or_default()
 }
 
 /// First 12 characters of an object id, the width jj and git use for short ids
@@ -519,6 +613,36 @@ impl Backend for JjBackend {
     fn file_content(&self, rev: &str, path: &str) -> Result<String> {
         self.run(&["file", "show", "-r", rev, path])
     }
+
+    fn commit_id(&self, rev: &str) -> Option<String> {
+        Some(self.resolve_commit_id(rev)).filter(|id| !id.is_empty())
+    }
+
+    fn base_commit(&self, base: &Base) -> Option<String> {
+        self.commit_id(&Self::revset(base))
+    }
+
+    fn trunk(&self) -> Option<String> {
+        self.commit_id("trunk()")
+    }
+
+    fn is_ancestor(&self, ancestor: &str, of: &str) -> bool {
+        self.commit_id(&format!("({ancestor}) & ::({of})"))
+            .is_some()
+    }
+
+    fn commits(&self, from: &str, to: &str) -> Result<Vec<Commit>> {
+        let me = user_email("jj", &["config", "get", "user.email"], &self.repo_root);
+        let out = self.run(&[
+            "log",
+            "-r",
+            &format!("({from})..({to})"),
+            "--no-graph",
+            "-T",
+            "commit_id ++ \"\\x1f\" ++ change_id.short(8) ++ \"\\x1f\" ++ if(empty, \"e\") ++ \"\\x1f\" ++ if(self.contained_in(\"::trunk()\"), \"l\") ++ \"\\x1f\" ++ author.email() ++ \"\\x1f\" ++ self.diff().stat().total_added() ++ \"\\x1f\" ++ self.diff().stat().total_removed() ++ \"\\x1f\" ++ committer.timestamp().ago() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"",
+        ])?;
+        Ok(parse_commits(&out, &me))
+    }
 }
 
 pub struct GitBackend {
@@ -778,6 +902,88 @@ impl Backend for GitBackend {
 
     fn file_content(&self, rev: &str, path: &str) -> Result<String> {
         self.run(&["show", &format!("{rev}:{path}")])
+    }
+
+    fn head_rev(&self) -> &'static str {
+        "HEAD"
+    }
+
+    fn commit_id(&self, rev: &str) -> Option<String> {
+        self.run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("{rev}^{{commit}}"),
+        ])
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty())
+    }
+
+    fn base_commit(&self, base: &Base) -> Option<String> {
+        self.commit_id(&self.range_base(base).ok()?)
+    }
+
+    fn trunk(&self) -> Option<String> {
+        self.commit_id(&self.trunk_ref()?)
+    }
+
+    fn is_ancestor(&self, ancestor: &str, of: &str) -> bool {
+        self.run(&["merge-base", "--is-ancestor", ancestor, of])
+            .is_ok()
+    }
+
+    fn commits(&self, from: &str, to: &str) -> Result<Vec<Commit>> {
+        let me = user_email("git", &["config", "user.email"], &self.repo_root);
+        let range = format!("{from}..{to}");
+        let out = self.run(&[
+            "log",
+            "--format=%x1e%H%x1f%h%x1f%ae%x1f%cr%x1f%s",
+            "--numstat",
+            &range,
+        ])?;
+        let unlanded: std::collections::HashSet<String> = match self.trunk_ref() {
+            Some(trunk) => self
+                .run(&["rev-list", &range, "--not", &trunk])?
+                .lines()
+                .map(str::to_string)
+                .collect(),
+            None => out
+                .split('\x1e')
+                .filter_map(|r| r.split('\x1f').next())
+                .map(str::to_string)
+                .collect(),
+        };
+        let mut rows = String::new();
+        for record in out.split('\x1e').filter(|r| !r.trim().is_empty()) {
+            let (head, stats) = record.split_once('\n').unwrap_or((record, ""));
+            let f: Vec<&str> = head.splitn(5, '\x1f').collect();
+            let [id, short, email, when, summary] = f[..] else {
+                continue;
+            };
+            let (mut added, mut removed, mut files) = (0u32, 0u32, 0);
+            for line in stats.lines().filter(|l| !l.is_empty()) {
+                let mut cols = line.split('\t');
+                added += cols.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                removed += cols.next().and_then(|n| n.parse().ok()).unwrap_or(0);
+                files += 1;
+            }
+            let fields = [
+                id,
+                short,
+                if files == 0 { "e" } else { "" },
+                if unlanded.contains(id) { "" } else { "l" },
+                email,
+                &added.to_string(),
+                &removed.to_string(),
+                when,
+                summary,
+            ]
+            .join("\x1f");
+            rows.push_str(&fields);
+            rows.push('\n');
+        }
+        Ok(parse_commits(&rows, &me))
     }
 }
 
@@ -1349,5 +1555,166 @@ mod tests {
             .expect("load working tree against branch point");
         assert_eq!(changes.len(), 1);
         assert_eq!(changes[0].path, "src/main.rs");
+    }
+
+    /// A jj repo whose own config names the test author, so `commits` can
+    /// tell whose work is whose. Starts with a described trunk commit under
+    /// `main`, and returns it with that commit's id.
+    fn jj_trunk_repo(name: &str) -> (TempRepo, String) {
+        let repo = TempRepo::new(name);
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        repo.run(
+            "jj",
+            &[
+                "config",
+                "set",
+                "--repo",
+                "user.email",
+                "recto@example.invalid",
+            ],
+        );
+        // trunk() normally follows a remote's main; there's no remote here.
+        repo.run(
+            "jj",
+            &[
+                "config",
+                "set",
+                "--repo",
+                "revset-aliases.\"trunk()\"",
+                "main",
+            ],
+        );
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+        let start = JjBackend::new(repo.0.clone()).commit_id("@").unwrap();
+        repo.run("jj", &["new"]);
+        (repo, start)
+    }
+
+    fn jj_commit(repo: &TempRepo, file: &str, lines: &str, message: &str) {
+        std::fs::write(repo.0.join(file), lines).unwrap();
+        repo.run("jj", &["describe", "-m", message]);
+        repo.run("jj", &["new"]);
+    }
+
+    #[test]
+    fn jj_commits_list_the_range_newest_first_with_stats() {
+        let (repo, start) = jj_trunk_repo("jj-commits");
+        jj_commit(&repo, "a.txt", "one\ntwo\n", "first");
+        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+        jj_commit(&repo, "b.txt", "three\n", "second");
+
+        let backend = JjBackend::new(repo.0.clone());
+        let commits = backend.commits(&start, "@").expect("list commits");
+        // The empty working copy on top isn't a commit worth listing.
+        let got: Vec<_> = commits
+            .iter()
+            .map(|c| (c.summary.as_str(), c.landed, c.mine, c.added))
+            .collect();
+        assert_eq!(
+            got,
+            vec![("second", false, true, 1), ("first", true, true, 2)]
+        );
+    }
+
+    #[test]
+    fn page_anchors_at_the_rig_start_once_its_work_landed() {
+        let (repo, start) = jj_trunk_repo("jj-anchor-landed");
+        jj_commit(&repo, "a.txt", "a\n", "pushed one");
+        jj_commit(&repo, "b.txt", "b\n", "pushed two");
+        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+
+        let backend = JjBackend::new(repo.0.clone());
+        let branch = backend.default_bases().remove(0);
+        assert!(
+            backend
+                .list_changes(&Scope::Range(branch.clone()), false)
+                .unwrap()
+                .is_empty(),
+            "pushed work leaves the branch point empty"
+        );
+        let anchor = crate::serve::anchor(&backend, &branch, Some(&start), true);
+        assert_eq!(anchor.base, Base::Revision(start.clone()));
+        assert!(anchor.label.unwrap().starts_with("rig start"));
+        let files = backend
+            .list_changes(&Scope::Range(anchor.base), false)
+            .unwrap();
+        assert_eq!(files.len(), 2);
+    }
+
+    #[test]
+    fn page_keeps_the_branch_point_when_others_landed_work_in_between() {
+        let (repo, start) = jj_trunk_repo("jj-anchor-foreign");
+        jj_commit(&repo, "mine.txt", "mine\n", "mine");
+        std::fs::write(repo.0.join("theirs.txt"), "theirs\n").unwrap();
+        repo.run(
+            "jj",
+            &[
+                "metaedit",
+                "--author",
+                "Someone Else <someone@example.invalid>",
+                "-m",
+                "theirs",
+            ],
+        );
+        repo.run("jj", &["new"]);
+        repo.run("jj", &["bookmark", "set", "main", "-r", "@-"]);
+
+        let backend = JjBackend::new(repo.0.clone());
+        let branch = backend.default_bases().remove(0);
+        let anchor = crate::serve::anchor(&backend, &branch, Some(&start), true);
+        assert_eq!(anchor.base, branch);
+        assert!(anchor.note.unwrap().contains("other people"));
+    }
+
+    #[test]
+    fn page_keeps_the_branch_point_for_unlanded_work() {
+        let (repo, start) = jj_trunk_repo("jj-anchor-branch");
+        jj_commit(&repo, "lower.txt", "lower\n", "lower");
+        repo.run("jj", &["bookmark", "create", "lower", "-r", "@-"]);
+        jj_commit(&repo, "top.txt", "top\n", "top");
+
+        let backend = JjBackend::new(repo.0.clone());
+        let branch = backend.default_bases().remove(0);
+        // A stack's lower layer isn't trunk, so the start doesn't pull it in.
+        let anchor = crate::serve::anchor(&backend, &branch, Some(&start), false);
+        assert_eq!(anchor.base, branch);
+        assert!(anchor.note.is_none());
+    }
+
+    #[test]
+    fn git_commits_mark_what_landed() {
+        let repo = TempRepo::new("git-commits");
+        repo.run("git", &["init", "-b", "main"]);
+        repo.run("git", &["config", "user.name", "Recto Test"]);
+        repo.run("git", &["config", "user.email", "recto@example.invalid"]);
+        repo.run("git", &["config", "commit.gpgsign", "false"]);
+        std::fs::write(repo.0.join("a.txt"), "a\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "start"]);
+        let backend = GitBackend::new(repo.0.clone());
+        let start = backend.commit_id("HEAD").unwrap();
+        std::fs::write(repo.0.join("b.txt"), "b\nb\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "landed"]);
+        repo.run("git", &["checkout", "-b", "work"]);
+        std::fs::write(repo.0.join("c.txt"), "c\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "in flight"]);
+
+        let got: Vec<_> = backend
+            .commits(&start, "HEAD")
+            .unwrap()
+            .into_iter()
+            .map(|c| (c.summary, c.landed, c.mine, c.added))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                ("in flight".into(), false, true, 1),
+                ("landed".into(), true, true, 2)
+            ]
+        );
     }
 }

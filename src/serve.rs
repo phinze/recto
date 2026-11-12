@@ -31,7 +31,9 @@ use notify::{RecursiveMode, Watcher};
 use pulldown_cmark::{CowStr, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier};
 
-use crate::backend::{Backend, Base, Scope, detect_backend_from, repository_root, short_oid};
+use crate::backend::{
+    Backend, Base, Commit, Scope, detect_backend_from, repository_root, short_oid,
+};
 use crate::highlight::{Highlighter, expand_tabs, ext_for_path};
 use crate::watch::{WatchTree, is_interesting, may_add_directories};
 use crate::{link, markdown, parse_pathspec, state};
@@ -101,6 +103,13 @@ struct Request {
     /// one. Its own tour reads across every root.
     group: Option<String>,
     label: Option<String>,
+    /// Where each root's work started, as `(root, commit)`: the commit a rig
+    /// made its workspace from. A page can anchor there instead of at the
+    /// branch point once that work has landed on trunk.
+    starts: Vec<(String, String)>,
+    /// A narrowed view per root index: one commit's own diff in place of the
+    /// whole range.
+    views: Vec<(usize, String)>,
 }
 
 fn read_request(stream: &UnixStream) -> Option<Request> {
@@ -124,12 +133,26 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
     let mut roots = Vec::new();
     let mut label = None;
     let mut group = None;
+    let mut starts = Vec::new();
+    let mut views = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
             "root" => roots.push(percent_decode(v)),
             "label" => label = Some(percent_decode(v)),
             "group" => group = Some(percent_decode(v)).filter(|g| !g.is_empty()),
+            "start" => {
+                if let Some((root, commit)) = percent_decode(v).rsplit_once(':') {
+                    starts.push((root.to_string(), commit.to_string()));
+                }
+            }
+            "view" => {
+                if let Some((i, spec)) = percent_decode(v).split_once(':')
+                    && let Ok(i) = i.parse()
+                {
+                    views.push((i, spec.to_string()));
+                }
+            }
             _ => {}
         }
     }
@@ -138,6 +161,8 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
         roots,
         group,
         label,
+        starts,
+        views,
     })
 }
 
@@ -328,7 +353,19 @@ fn fragment(req: &Request) -> String {
         let handles: Vec<_> = roots
             .iter()
             .enumerate()
-            .map(|(i, root)| s.spawn(move || workspace(i, root, share)))
+            .map(|(i, root)| {
+                let start = req
+                    .starts
+                    .iter()
+                    .find(|(r, _)| r == root)
+                    .map(|(_, c)| c.as_str());
+                let view = req
+                    .views
+                    .iter()
+                    .find(|(v, _)| *v == i)
+                    .map(|(_, spec)| spec.as_str());
+                s.spawn(move || workspace(i, root, start, view, share))
+            })
             .collect();
         handles
             .into_iter()
@@ -504,10 +541,16 @@ struct Summary {
     error: bool,
 }
 
-fn workspace(index: usize, root: &str, budget: usize) -> (String, Summary) {
+fn workspace(
+    index: usize,
+    root: &str,
+    start: Option<&str>,
+    view: Option<&str>,
+    budget: usize,
+) -> (String, Summary) {
     let mut out = String::new();
     let _ = write!(out, "<section class=repo id=\"repo-{index}\">");
-    let summary = match render_workspace(index, Path::new(root), budget, &mut out) {
+    let summary = match render_workspace(index, Path::new(root), start, view, budget, &mut out) {
         Ok(summary) => summary,
         Err(e) => {
             let _ = write!(
@@ -529,6 +572,8 @@ fn workspace(index: usize, root: &str, budget: usize) -> (String, Summary) {
 fn render_workspace(
     index: usize,
     root: &Path,
+    start: Option<&str>,
+    view: Option<&str>,
     mut budget: usize,
     out: &mut String,
 ) -> Result<Summary> {
@@ -549,11 +594,37 @@ fn render_workspace(
         }
     };
     let pull_request = store.as_ref().and_then(|s| s.pull_request().cloned());
-    let base = view_base(backend.as_ref(), pull_request.as_ref())?;
+    let branch_base = view_base(backend.as_ref(), pull_request.as_ref())?;
     let raw = backend
-        .unified_diff(&Scope::Range(base.clone()), false)
+        .unified_diff(&Scope::Range(branch_base.clone()), false)
         .context("diff failed")?;
-    let files = parse_diff(&raw);
+    let mut files = parse_diff(&raw);
+    let anchor = anchor(backend.as_ref(), &branch_base, start, files.is_empty());
+    let base = anchor.base.clone();
+    if base != branch_base {
+        let raw = backend
+            .unified_diff(&Scope::Range(base.clone()), false)
+            .context("diff failed")?;
+        files = parse_diff(&raw);
+    }
+    if let Some(note) = &anchor.note {
+        notices.push(note.clone());
+    }
+    // The revision list spans the anchored range. It is where landed work
+    // stays visible, so it isn't worth drawing for fewer than two commits.
+    let commits = backend
+        .base_commit(&base)
+        .and_then(|from| backend.commits(&from, backend.head_rev()).ok())
+        .unwrap_or_default();
+    let narrowed = view.and_then(|v| commits.iter().find(|c| c.id == v));
+    let shown = match narrowed {
+        Some(c) => parse_diff(
+            &backend
+                .unified_diff(&Scope::Rev(c.id.clone()), false)
+                .context("diff failed")?,
+        ),
+        None => Vec::new(),
+    };
     let (added, removed) = files
         .iter()
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
@@ -569,7 +640,10 @@ fn render_workspace(
         out,
         "<span>{}</span><span>{} → {}</span>",
         backend.kind(),
-        esc(&backend.base_display(&base)),
+        esc(&anchor
+            .label
+            .clone()
+            .unwrap_or_else(|| backend.base_display(&base))),
         esc(&backend
             .workspace_revision()
             .map(|r| short_oid(&r).to_string())
@@ -608,6 +682,18 @@ fn render_workspace(
         let _ = write!(out, "<p class=error>{}</p>", esc(n));
     }
     out.push_str("</header>");
+    if commits.len() > 1 {
+        let head = backend.commit_id(backend.head_rev());
+        render_revisions(
+            index,
+            &commits,
+            narrowed.map(|c| c.id.as_str()),
+            head.as_deref(),
+            anchor.label.is_some(),
+            (added, removed),
+            out,
+        );
+    }
     // The saved focus, for the page to highlight and, when it changes, scroll
     // to. A span in a file that left the diff has nowhere to point.
     if let Some(focus) = store.as_ref().and_then(|s| s.focus())
@@ -633,7 +719,19 @@ fn render_workspace(
             &mut |spec, budget, html| quote_html(index, spec, spec, &files, budget, html),
         );
     }
-    if !files.is_empty() {
+    if let Some(c) = narrowed {
+        let _ = write!(
+            out,
+            "<div class=narrowed>Showing <code>{}</code> {} alone. <button type=button data-view=\"{index}:\">show all changes</button></div>",
+            esc(&c.change),
+            esc(&c.summary)
+        );
+        if shown.is_empty() {
+            out.push_str("<p class=empty>This commit changes no files.</p>");
+        } else {
+            render_files(index, &shown, &mut budget, out);
+        }
+    } else if !files.is_empty() {
         render_files(index, &files, &mut budget, out);
     }
     Ok(Summary {
@@ -645,6 +743,146 @@ fn render_workspace(
         tour: tour.is_some(),
         error: false,
     })
+}
+
+/// The base a page diffs from once a rig's starting commit is known, and how
+/// the header names it.
+pub(crate) struct Anchor {
+    pub(crate) base: Base,
+    pub(crate) label: Option<String>,
+    pub(crate) note: Option<String>,
+}
+
+/// A rig that pushes straight to trunk has an empty branch point the moment
+/// its work lands, and a branch that's merged reads the same. Anchoring at
+/// the commit the rig started from keeps that work on the page. It only
+/// applies when everything between the start and the branch point is your
+/// own landed work: a stack's lower layer isn't on trunk, and once someone
+/// else's commits are in between, the range would show their work as yours.
+pub(crate) fn anchor(
+    backend: &dyn Backend,
+    branch_base: &Base,
+    start: Option<&str>,
+    nothing_shown: bool,
+) -> Anchor {
+    let plain = |note: Option<String>| Anchor {
+        base: branch_base.clone(),
+        label: None,
+        note: note.filter(|_| nothing_shown),
+    };
+    let Some(start) = start else {
+        return plain(None);
+    };
+    let Some(s) = backend.commit_id(start) else {
+        return plain(Some(format!(
+            "The commit this rig started from ({}) isn't in this repository.",
+            short_oid(start)
+        )));
+    };
+    let Some(b) = backend.base_commit(branch_base) else {
+        return plain(None);
+    };
+    if s == b || !backend.is_ancestor(&s, &b) {
+        return plain(None);
+    }
+    if !backend.is_ancestor(&s, backend.head_rev()) {
+        return plain(Some(
+            "This workspace no longer descends from the commit the rig started from.".into(),
+        ));
+    }
+    let landed = backend.trunk().is_some_and(|t| backend.is_ancestor(&b, &t));
+    if !landed {
+        return plain(None);
+    }
+    match backend.commits(&s, &b) {
+        Ok(between) if between.iter().all(|c| c.mine || c.empty) => Anchor {
+            base: Base::Revision(s.clone()),
+            label: Some(format!("rig start {}", short_oid(&s))),
+            note: None,
+        },
+        Ok(_) => plain(Some(
+            "Trunk has moved past where this rig started, with other people's commits in between, so this diff starts at the branch point.".into(),
+        )),
+        Err(_) => plain(None),
+    }
+}
+
+/// The commits in the page's range, newest first. Picking one narrows the
+/// file list to that commit; the first row goes back to the whole range.
+fn render_revisions(
+    index: usize,
+    commits: &[Commit],
+    narrowed: Option<&str>,
+    head: Option<&str>,
+    from_start: bool,
+    (added, removed): (u32, u32),
+    out: &mut String,
+) {
+    // The range's own totals, not the commits' sum: a line one commit adds
+    // and a later one rewrites counts once in the range.
+    let landed = commits.iter().filter(|c| c.landed).count();
+    let _ = write!(
+        out,
+        "<details class=revs id=\"revs-{index}\"{}><summary>{} commits{}</summary><ol>",
+        if narrowed.is_some() { " open" } else { "" },
+        commits.len(),
+        if landed == 0 {
+            String::new()
+        } else if landed == commits.len() {
+            " · all landed".into()
+        } else {
+            format!(" · {landed} landed")
+        }
+    );
+    let _ = write!(
+        out,
+        "<li><button type=button data-view=\"{index}:\"{}><span class=rev-id></span><span class=rev-sum>all changes {}</span>{}</button></li>",
+        if narrowed.is_none() {
+            " class=active"
+        } else {
+            ""
+        },
+        if from_start {
+            "since the rig started"
+        } else {
+            "in this range"
+        },
+        rev_stat(added, removed),
+    );
+    for c in commits {
+        let _ = write!(
+            out,
+            "<li><button type=button data-view=\"{index}:{}\"{}{}><span class=rev-id>{}</span><span class=rev-sum>{}</span>{}<span class=rev-when>{}</span>{}</button></li>",
+            esc(&c.id),
+            if narrowed == Some(c.id.as_str()) {
+                " class=active"
+            } else {
+                ""
+            },
+            if c.mine { "" } else { " data-foreign" },
+            esc(&c.change),
+            match (c.summary.is_empty(), head == Some(c.id.as_str())) {
+                (true, true) => "<i>working copy</i>".into(),
+                (true, false) => "<i>no description</i>".into(),
+                (false, true) => format!("{} <i>(working copy)</i>", esc(&c.summary)),
+                (false, false) => esc(&c.summary),
+            },
+            if c.landed {
+                "<span class=landed>landed</span>"
+            } else {
+                ""
+            },
+            esc(&c.when),
+            rev_stat(c.added, c.removed),
+        );
+    }
+    out.push_str("</ol></details>");
+}
+
+fn rev_stat(added: u32, removed: u32) -> String {
+    format!(
+        "<span class=rev-stat><span class=add>+{added}</span> <span class=del>−{removed}</span></span>"
+    )
 }
 
 /// The base a page diffs from, by the TUI's own rule: an attached PR's branch

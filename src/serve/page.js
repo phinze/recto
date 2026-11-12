@@ -11,6 +11,34 @@
   let tab = null;
   try { tab = sessionStorage.getItem(tabKey); } catch {}
 
+  // A repo narrowed to one commit, by index: what the revision list picked.
+  // The server renders whatever the fragment request asks for.
+  const viewKey = 'recto-views:' + location.pathname + qs;
+  let views = new Map();
+  try { views = new Map(JSON.parse(sessionStorage.getItem(viewKey) || '[]')); } catch {}
+  function saveViews() {
+    try { sessionStorage.setItem(viewKey, JSON.stringify([...views])); } catch {}
+  }
+  function fragmentURL() {
+    let url = 'fragment' + qs;
+    for (const [i, spec] of views) {
+      url += (url.includes('?') ? '&' : '?') + 'view=' + encodeURIComponent(i + ':' + spec);
+    }
+    return url;
+  }
+  // A span to light up once the next refresh lands, for a quote or a focus
+  // that points outside the commit a repo is narrowed to.
+  let pendingFocus = null;
+  function widenFor(spec) {
+    const ri = spec.split(':')[0];
+    if (!views.has(ri) || spanRows(spec).length) return false;
+    views.delete(ri);
+    saveViews();
+    pendingFocus = spec;
+    refresh();
+    return true;
+  }
+
   // Focus is one span lit up in the full diff: the last quote clicked, or the
   // agent's `recto focus` when it changes. It survives refreshes.
   let current = null;           // "repo:file:start:end"
@@ -79,7 +107,9 @@
       const val = marker ? marker.dataset.focus : '';
       const changed = markers.has(section.id) && markers.get(section.id) !== val;
       markers.set(section.id, val);
-      if (val && (changed || (initial && !current))) {
+      if (val && changed && !initial && widenFor(val)) {
+        moved = true;
+      } else if (val && (changed || (initial && !current))) {
         focusSpan(val, changed && !initial);
         moved = moved || (changed && !initial);
       } else if (!val && changed && current && current.startsWith(section.id.slice(5) + ':')) {
@@ -97,7 +127,7 @@
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape') clearFocus(); });
 
   content.addEventListener('toggle', (e) => {
-    if (e.target.matches('details.file') && e.target.id) toggled.set(e.target.id, e.target.open);
+    if (e.target.matches('details.file, details.revs') && e.target.id) toggled.set(e.target.id, e.target.open);
   }, true);
 
   function activate(id, remember) {
@@ -131,7 +161,7 @@
   async function refresh() {
     const mine = ++generation;
     let res;
-    try { res = await fetch('fragment' + qs, { cache: 'no-store' }); } catch { return; }
+    try { res = await fetch(fragmentURL(), { cache: 'no-store' }); } catch { return; }
     if (!res.ok) return;
     const html = await res.text();
     if (mine !== generation) return;
@@ -143,7 +173,14 @@
     }
     applyTab();
     syncExpandButtons();
-    if (!syncMarkers(false)) window.scrollTo(0, y);
+    const moved = syncMarkers(false);
+    if (pendingFocus) {
+      const spec = pendingFocus;
+      pendingFocus = null;
+      focusSpan(spec, true);
+    } else if (!moved) {
+      window.scrollTo(0, y);
+    }
     live.classList.add('pulse');
     setTimeout(() => live.classList.remove('pulse'), 600);
   }
@@ -171,6 +208,16 @@
       window.scrollTo(0, 0);
       return;
     }
+    const pick = e.target.closest('button[data-view]');
+    if (pick) {
+      const [ri, ...rest] = pick.dataset.view.split(':');
+      const spec = rest.join(':');
+      if (spec) views.set(ri, spec); else views.delete(ri);
+      saveViews();
+      pick.classList.add('pending');
+      refresh();
+      return;
+    }
     const all = e.target.closest('.expand-all');
     if (all) {
       const files = [...all.closest('section.repo').querySelectorAll('details.file')];
@@ -184,6 +231,8 @@
     e.preventDefault();
     if (a.dataset.focus) {
       backY = window.scrollY;
+      back.classList.add('shown');
+      if (widenFor(a.dataset.focus)) return;
       focusSpan(a.dataset.focus, true);
       back.classList.add('shown');
       return;
@@ -195,6 +244,7 @@
   applyTab();
   syncExpandButtons();
   syncMarkers(true);
+  if (views.size) refresh();
 
   // EventSource retries a dropped connection by itself, but gives up for good
   // on an error response, which is what a proxy sends while recto restarts.

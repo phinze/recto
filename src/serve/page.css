@@ -40,6 +40,29 @@ details.file { scroll-margin-top: 44px; }
 .repo-head .meta { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font: 12px var(--mono); color: var(--subtext); }
 .repo-head .pr { margin-top: 4px; font-size: 13px; }
 .repo-head .notes { margin-top: 4px; font-size: 13px; color: var(--yellow); }
+
+details.revs { margin: 8px 0 12px; font: 12px var(--mono); }
+details.revs > summary { cursor: pointer; color: var(--subtext); list-style: none; display: inline-flex; gap: 6px; align-items: center; }
+details.revs > summary::before { content: "▸"; color: var(--overlay0); }
+details.revs[open] > summary::before { content: "▾"; }
+details.revs > summary:hover { color: var(--text); }
+details.revs ol { list-style: none; margin: 6px 0 0; padding: 0; border-left: 2px solid var(--surface1); max-height: 22em; overflow-y: auto; }
+details.revs li button { all: unset; box-sizing: border-box; cursor: pointer; width: 100%; display: flex; gap: 10px; align-items: baseline;
+  padding: 3px 10px; border-left: 2px solid transparent; margin-left: -2px; color: var(--text); }
+details.revs li button:hover { background: var(--surface0); }
+details.revs li button.active { border-left-color: var(--mauve); background: var(--mantle); }
+details.revs li button.pending { opacity: 0.6; }
+details.revs li button[data-foreign] { color: var(--overlay0); }
+details.revs li:first-child .rev-sum { color: var(--subtext); font-style: italic; }
+.rev-id { color: var(--blue); min-width: 8ch; }
+.rev-sum { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-family: var(--sans); font-size: 13px; }
+.rev-when { color: var(--overlay0); white-space: nowrap; }
+.rev-stat { white-space: nowrap; min-width: 11ch; text-align: right; }
+.landed { color: var(--teal); border: 1px solid var(--teal); border-radius: 8px; padding: 0 6px; font-size: 10px; opacity: 0.8; }
+.narrowed { margin: 4px 0 10px; padding: 6px 10px; border-radius: 6px; background: var(--mantle); border-left: 2px solid var(--mauve); font-size: 13px; }
+.narrowed button { font: 11px var(--mono); color: var(--text); background: var(--surface0); border: 0; border-radius: 10px; padding: 2px 8px; margin-left: 6px; cursor: pointer; }
+.narrowed button:hover { background: var(--surface1); }
+@media (max-width: 640px) { .rev-when { display: none; } }
 .add { color: var(--green); }
 .del { color: var(--red); }
 .error { color: var(--red); background: var(--del-bg); padding: 8px 10px; border-radius: 6px; font: 13px var(--mono); }

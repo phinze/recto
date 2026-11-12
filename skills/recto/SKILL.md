@@ -203,6 +203,14 @@ that repo's tab at the span. It doesn't go through a viewer, so call `recto`
 directly here rather than `rig recto`, and no TUI needs to be running. The TUI
 shows only per-repo tours.
 
+Under `rig serve`, the web view keeps a rig's landed work on the page. Once
+everything since the commit the rig started from is your own work on trunk
+(pushed straight to `main`, say), it diffs from that start instead of the
+empty branch point. Tour quotes resolve against that whole range, so a tour
+written before the push still reads after it. The page's revision list shows
+each commit in the range, marks the landed ones, and narrows to one when
+clicked.
+
 The rule for which to write: in a multi-repo rig whose change spans repos,
 write one group tour. In a single-repo rig, or when the story really is one
 repo's, write that repo's tour. Don't write both for the same story.
