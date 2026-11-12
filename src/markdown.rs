@@ -44,7 +44,7 @@ pub fn with_quotes(source: &str, quote: Quote<'_>) -> Rendered {
 
 /// The pathspec a fence names, if it is a recto quote. `recto` must stand as
 /// its own word so an unrelated `rectoclip` fence stays a code block.
-fn quote_spec(kind: &CodeBlockKind<'_>) -> Option<String> {
+pub(crate) fn quote_spec(kind: &CodeBlockKind<'_>) -> Option<String> {
     let CodeBlockKind::Fenced(info) = kind else {
         return None;
     };

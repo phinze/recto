@@ -183,7 +183,7 @@ pub fn detect_backend() -> Result<Arc<dyn Backend>> {
     })
 }
 
-fn detect_backend_from(start: &Path) -> Option<Arc<dyn Backend>> {
+pub(crate) fn detect_backend_from(start: &Path) -> Option<Arc<dyn Backend>> {
     let root = repository_root(start)?;
     if root.join(".jj").is_dir() {
         Some(Arc::new(JjBackend::new(root)))

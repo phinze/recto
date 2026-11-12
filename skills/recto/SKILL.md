@@ -57,6 +57,7 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
     recto tour < FILE            # lay down a literate tour (Markdown on stdin)
     recto tour BODY              # the same, as an argument; empty removes it
+    recto tour --group DIR < FILE  # one tour across the repos under DIR
     recto tour-focus N           # show the tour, scrolled to section N
     recto tour-focus             # show the tour where it was left
     recto clear                  # remove the highlight and any annotations
@@ -176,6 +177,35 @@ reading the code can reach the prose about it.
 Passing an empty body removes the tour. `clear` deliberately does not, and
 neither does a restart: a tour is authored work, and only an explicit request
 should discard it.
+
+### A story that spans repos
+
+A tour normally belongs to one repo and quotes only its diff. When the change
+is one story told across several repos, write one group tour instead of a tour
+per repo:
+
+    recto tour --group "$RIG_BASEDIR" <<'EOF'
+    ## The server learns a new route
+
+    ```recto rig/serveweb.go:227-241
+    ```
+
+    ## And the renderer answers it
+
+    ```recto recto/src/serve.rs:1-17
+    ```
+    EOF
+
+DIR is the directory holding the repos (a rig's basedir), and each quote's
+path starts with its repo's directory under DIR. The web view (`recto serve`,
+behind `rig serve`) shows a group tour above the repo tabs, and a quote opens
+that repo's tab at the span. It doesn't go through a viewer, so call `recto`
+directly here rather than `rig recto`, and no TUI needs to be running. The TUI
+shows only per-repo tours.
+
+The rule for which to write: in a multi-repo rig whose change spans repos,
+write one group tour. In a single-repo rig, or when the story really is one
+repo's, write that repo's tour. Don't write both for the same story.
 
 ### What to actually write
 
@@ -415,6 +445,16 @@ exception: its scope is the workspace, not the current diff.
   in a repo). Inside a Rig, `rig recto <repo>` starts one, so this
   shouldn't happen there. Outside one, don't keep trying; just describe the
   change in text.
+
+`recto tour`, `recto focus` and `recto clear` are the exceptions: they don't
+need a TUI, because the web view (`recto serve`) is a viewer too. With no TUI
+running, `focus` saves the span and the web view scrolls to and highlights it;
+it still exits 1 for a file that isn't in the diff, and `clear` drops it.
+
+`recto tour` in particular doesn't need a viewer. With none running it
+saves the tour where the next viewer and the web view (`recto serve`) read
+it, says so on stderr, and exits 0. The stale-review rule still applies, so a
+tour against an attached PR whose head doesn't match the workspace exits 1.
 
 `recto notes` is the one command that exits 0 with nothing on stdout: that
 means no notes were pending. It exits 1 only when recto is parked in an

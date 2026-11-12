@@ -673,7 +673,7 @@ pub fn nvim_addr(pid: u32) -> PathBuf {
 
 /// `$XDG_RUNTIME_DIR/recto` (0700 by virtue of its parent), falling back to a
 /// `recto-<uid>` dir under the system temp dir when the runtime dir is unset.
-fn runtime_dir() -> PathBuf {
+pub(crate) fn runtime_dir() -> PathBuf {
     std::env::var_os("XDG_RUNTIME_DIR")
         .map(PathBuf::from)
         .unwrap_or_else(std::env::temp_dir)
@@ -971,13 +971,13 @@ pub fn send(path: &Path, request: &Request) -> Result<Response> {
 }
 
 #[cfg(unix)]
-fn harden_dir(dir: &Path) {
+pub(crate) fn harden_dir(dir: &Path) {
     use std::os::unix::fs::PermissionsExt;
     let _ = std::fs::set_permissions(dir, std::fs::Permissions::from_mode(0o700));
 }
 
 #[cfg(not(unix))]
-fn harden_dir(_dir: &Path) {}
+pub(crate) fn harden_dir(_dir: &Path) {}
 
 #[cfg(test)]
 mod tests {

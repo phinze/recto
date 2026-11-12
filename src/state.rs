@@ -362,6 +362,16 @@ fn forget_at(state_home: &Path, workspace_root: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Where the authored state for `workspace_root` lives, whether or not it
+/// exists yet. `recto serve` watches this file to learn when a viewer or a
+/// companion changed the tour.
+pub fn state_path(workspace_root: &Path) -> Result<PathBuf> {
+    Ok(state_path_at(
+        &state_home()?,
+        &normalize_workspace_root(workspace_root)?,
+    ))
+}
+
 fn state_home() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(value);

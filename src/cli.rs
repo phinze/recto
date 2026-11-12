@@ -27,6 +27,15 @@ pub(crate) enum VerdictArg {
 /// Subcommands that talk to an already-running recto over its workspace socket.
 #[derive(Subcommand, Debug)]
 pub(crate) enum ClientCommand {
+    /// Serve a read-only web page of one or more workspaces as HTTP over a
+    /// unix socket (default `$XDG_RUNTIME_DIR/recto/serve.sock`). Each request
+    /// names its workspaces with repeated `?root=PATH`; the page shows each
+    /// one's tour and diff and refreshes live. Nothing listens on TCP: front
+    /// it with something that authenticates, such as `rig serve`.
+    Serve {
+        #[arg(long, value_name = "PATH")]
+        socket: Option<std::path::PathBuf>,
+    },
     /// Inspect or remove Recto's durable state without opening the TUI.
     State {
         #[command(subcommand)]
@@ -49,7 +58,17 @@ pub(crate) enum ClientCommand {
     /// navigable sections and whose fenced `recto PATH:SPAN` blocks quote the
     /// diff inline. Reads BODY, or stdin when BODY is omitted. An empty body
     /// removes the tour. Coexists with `annotate`.
-    Tour { body: Option<String> },
+    ///
+    /// With `--group DIR`, the tour belongs to a group of repositories instead
+    /// of one: DIR is a directory that holds them (a rig's basedir), and each
+    /// quote's PATH starts with the repository's directory under DIR, as in
+    /// `recto api/server.go:10-20`. A group tour is shown by `recto serve`
+    /// above the group's repositories; no viewer needs to be running.
+    Tour {
+        body: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        group: Option<std::path::PathBuf>,
+    },
     /// Bring the tour into view, optionally scrolled to a numbered SECTION.
     /// Sections are numbered from 1, matching the outline rail's badges.
     TourFocus { section: Option<usize> },
@@ -127,17 +146,152 @@ pub(crate) enum StateCommand {
     },
 }
 
+/// The repositories directly under `dir`, by directory name.
+pub(crate) fn group_repos(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_type().is_ok_and(|t| t.is_dir()))
+        .filter(|e| {
+            crate::backend::repository_root(&e.path())
+                .is_some_and(|root| e.path().canonicalize().is_ok_and(|p| p == root))
+        })
+        .map(|e| e.file_name().to_string_lossy().into_owned())
+        .collect();
+    names.sort();
+    names
+}
+
+/// Write a group tour. The group is a directory holding repositories, not a
+/// repository itself, so a mistyped DIR is refused rather than quietly
+/// becoming a group nobody's page asks for.
+fn save_group_tour(dir: &Path, body: &str) -> i32 {
+    // Ok(Err) is a refusal (exit 1); Err is a failure to read or write (2).
+    let result = (|| -> Result<std::result::Result<Vec<String>, String>> {
+        let dir = match dir.canonicalize() {
+            Ok(dir) => dir,
+            Err(e) => return Ok(Err(format!("--group {}: {e}", dir.display()))),
+        };
+        if crate::backend::repository_root(&dir).is_some_and(|root| root == dir) {
+            return Ok(Err(format!(
+                "{} is a repository; drop --group to give it its own tour",
+                dir.display()
+            )));
+        }
+        let repos = group_repos(&dir);
+        if repos.is_empty() {
+            return Ok(Err(format!(
+                "{} holds no repositories to tour across",
+                dir.display()
+            )));
+        }
+        let mut store = state::Store::load(&dir, None)?;
+        let body = body.trim();
+        store.set_tour((!body.is_empty()).then_some(body));
+        store.save()?;
+        Ok(Ok(repos))
+    })();
+    match result {
+        Ok(Ok(repos)) => {
+            eprintln!(
+                "recto: saved the group tour across {}; quote paths start with one of those",
+                repos.join(", ")
+            );
+            0
+        }
+        Ok(Err(refusal)) => {
+            eprintln!("recto: {refusal}");
+            1
+        }
+        Err(error) => {
+            eprintln!("recto: {error:#}");
+            2
+        }
+    }
+}
+
+/// Write a tour with no viewer running, holding it to the rule a viewer
+/// applies: a new tour against an attached PR is refused while the workspace
+/// isn't at that PR's head. Taking a tour down is always allowed.
+fn save_tour_offline(body: &str) -> i32 {
+    let result = (|| -> Result<Option<String>> {
+        let backend = crate::backend::detect_backend()?;
+        let mut store = state::Store::load(backend.root(), None)?;
+        let body = body.trim();
+        if !body.is_empty()
+            && let Some(pr) = store.pull_request()
+        {
+            let revision = backend.workspace_revision().map_err(|error| {
+                anyhow!(
+                    "could not verify the live workspace revision before targeting the attached review: {error}"
+                )
+            })?;
+            if !pr.head_oid.eq_ignore_ascii_case(&revision) {
+                return Ok(Some(format!(
+                    "stale review: attached head {} does not match workspace revision {revision}; refresh the review before laying down a tour",
+                    pr.head_oid
+                )));
+            }
+        }
+        store.set_tour((!body.is_empty()).then_some(body));
+        store.save()?;
+        Ok(None)
+    })();
+    match result {
+        Ok(None) => {
+            eprintln!("recto: no viewer running; saved the tour for the next one and the web view");
+            0
+        }
+        Ok(Some(refusal)) => {
+            eprintln!("recto: {refusal}");
+            1
+        }
+        Err(error) => {
+            eprintln!("recto: {error:#}");
+            2
+        }
+    }
+}
+
 /// Run a client subcommand against the workspace's running recto. Returns the
 /// process exit code: 0 on `{"ok":true}`, 1 on a refused request (e.g. target
 /// not in the diff), 2 when we couldn't reach a recto at all.
 pub(crate) fn run_client(command: ClientCommand) -> i32 {
+    if let ClientCommand::Serve { socket } = &command {
+        return crate::serve::run(socket.clone());
+    }
     if let ClientCommand::State { command } = &command {
         return run_state_command(command);
+    }
+    if let ClientCommand::Tour {
+        group: Some(dir), ..
+    } = &command
+    {
+        return match build_request(&command) {
+            Ok(link::Request::Tour { body }) => save_group_tour(dir, &body),
+            Ok(_) => 2,
+            Err(e) => {
+                eprintln!("recto: {e}");
+                2
+            }
+        };
     }
     let socket = match link::socket_for_cwd() {
         Ok(p) => p,
         Err(e) => {
             eprintln!("recto: {e}");
+            // A tour aimed at a directory of repositories is almost certainly
+            // meant for the group; say how instead of leaving a bare refusal.
+            if matches!(command, ClientCommand::Tour { .. })
+                && let Ok(cwd) = std::env::current_dir()
+                && !group_repos(&cwd).is_empty()
+            {
+                eprintln!(
+                    "recto: this directory holds repositories; `recto tour --group .` lays down a tour across them"
+                );
+            }
             return 2;
         }
     };
@@ -157,6 +311,20 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
         ClientCommand::Pr { .. } => Some(None),
         _ => None,
     };
+    // A tour is authored state, not a view command, so it doesn't need a
+    // viewer: with none listening it goes straight to the durable store, where
+    // the next viewer and `recto serve` both read it.
+    // Focus and clear are the same: with no TUI, the web view is the viewer.
+    if std::os::unix::net::UnixStream::connect(&socket).is_err() {
+        match &request {
+            link::Request::Tour { body } => return save_tour_offline(body),
+            link::Request::Focus { path, start, end } => {
+                return crate::serve::save_focus_offline(path, *start, *end);
+            }
+            link::Request::Clear => return crate::serve::save_clear_offline(),
+            _ => {}
+        }
+    }
     match link::send(&socket, &request) {
         Ok(resp) if resp.ok => {
             if let Some(requested) = retarget {
@@ -322,8 +490,8 @@ fn wait_for_range(
 /// to workspace-root-relative so the agent can pass whatever form it used.
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
-        ClientCommand::State { .. } => {
-            Err(anyhow!("state commands do not use the workspace socket"))
+        ClientCommand::State { .. } | ClientCommand::Serve { .. } => {
+            Err(anyhow!("this command does not use the workspace socket"))
         }
         ClientCommand::Base { revision } => Ok(link::Request::SetBase {
             revision: revision.clone(),
@@ -332,7 +500,7 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
             pull_request: Box::new(github::fetch_pull_request(locator)?),
         }),
-        ClientCommand::Tour { body } => {
+        ClientCommand::Tour { body, .. } => {
             use std::io::{IsTerminal, Read};
             let body = match body {
                 Some(body) => body.clone(),

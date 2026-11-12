@@ -10,6 +10,7 @@ mod input;
 mod job;
 mod link;
 mod markdown;
+mod serve;
 mod state;
 #[cfg(test)]
 mod testing;
@@ -123,6 +124,20 @@ fn main() -> Result<()> {
         std::process::exit(2);
     });
 
+    // Agent link: companion sessions reach us over a per-workspace socket.
+    // A bind failure shouldn't sink the TUI — the link is best-effort.
+    // `editor_link` lets the listener drive a live neovim (and stay responsive)
+    // while we're parked in the `e` editor handoff.
+    //
+    // It binds before saved state loads. A command that arrives during
+    // startup then queues for this viewer instead of finding no socket and
+    // writing the store directly, which this viewer would then overwrite with
+    // the state it loaded a moment earlier.
+    let editor_link = Arc::new(link::EditorLink::default());
+    let link_rx = link::socket_for_cwd()
+        .and_then(|p| link::spawn_listener(&p, editor_link.clone()))
+        .ok();
+
     let mut startup_notices = Vec::new();
     let rig_info = match info_from_rig(backend.root()) {
         Ok(info) => info,
@@ -192,7 +207,7 @@ fn main() -> Result<()> {
     }
 
     let mut terminal = init_terminal()?;
-    let result = run(&mut terminal, &mut app);
+    let result = run(&mut terminal, &mut app, editor_link, link_rx);
     restore_terminal()?;
     result
 }
@@ -324,7 +339,12 @@ enum Action {
     Quit,
 }
 
-fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> Result<()> {
+fn run(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    editor_link: Arc<link::EditorLink>,
+    link_rx: Option<mpsc::Receiver<link::Incoming>>,
+) -> Result<()> {
     let (tx, rx) = mpsc::channel::<notify::Event>();
     let mut watcher = notify::recommended_watcher(move |res: notify::Result<notify::Event>| {
         if let Ok(event) = res
@@ -335,15 +355,6 @@ fn run(terminal: &mut Terminal<CrosstermBackend<io::Stdout>>, app: &mut App) -> 
     })?;
     let mut watch_tree = watch::WatchTree::new(".");
     watch_tree.refresh(&mut watcher);
-
-    // Agent link: companion sessions reach us over a per-workspace socket.
-    // A bind failure shouldn't sink the TUI — the link is best-effort.
-    // `editor_link` lets the listener drive a live neovim (and stay responsive)
-    // while we're parked in the `e` editor handoff.
-    let editor_link = Arc::new(link::EditorLink::default());
-    let link_rx = link::socket_for_cwd()
-        .and_then(|p| link::spawn_listener(&p, editor_link.clone()))
-        .ok();
 
     let mut pending_reload: Option<Instant> = None;
     let mut needs_redraw = true;
