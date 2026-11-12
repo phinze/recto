@@ -63,6 +63,11 @@ struct Document {
     /// Written for a group of repositories, so no viewer owns it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     brief: Option<String>,
+    /// Other documents the agent keeps for a group (a plan, a PR body), by
+    /// name, in the order they were first written. The group's tour is the
+    /// one named "tour" and lives in `tour`.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    docs: Vec<NamedDoc>,
     /// Companion tour annotations, in step order.
     #[serde(default)]
     annotations: Vec<Annotation>,
@@ -79,6 +84,12 @@ struct Document {
     /// drafts below are keyed to it and are unreachable without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pull_request: Option<PullRequest>,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct NamedDoc {
+    pub name: String,
+    pub body: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -103,6 +114,7 @@ impl Document {
             reviews: Vec::new(),
             tour: None,
             brief: None,
+            docs: Vec::new(),
             annotations: Vec::new(),
             focus: None,
             comments_visible: true,
@@ -217,6 +229,42 @@ impl Store {
 
     pub fn set_brief(&mut self, brief: Option<&str>) {
         self.document.brief = brief.map(str::to_string);
+    }
+
+    /// The group's documents, the tour first when there is one.
+    pub fn docs(&self) -> Vec<NamedDoc> {
+        let tour = self
+            .document
+            .tour
+            .as_deref()
+            .filter(|t| !t.trim().is_empty())
+            .map(|body| NamedDoc {
+                name: "tour".into(),
+                body: body.into(),
+            });
+        tour.into_iter()
+            .chain(self.document.docs.iter().cloned())
+            .collect()
+    }
+
+    /// Write, replace, or (with `None`) remove a named document. "tour" is
+    /// the tour.
+    pub fn set_doc(&mut self, name: &str, body: Option<&str>) {
+        if name == "tour" {
+            return self.set_tour(body);
+        }
+        let docs = &mut self.document.docs;
+        match (docs.iter().position(|d| d.name == name), body) {
+            (Some(i), Some(body)) => docs[i].body = body.to_string(),
+            (Some(i), None) => {
+                docs.remove(i);
+            }
+            (None, Some(body)) => docs.push(NamedDoc {
+                name: name.to_string(),
+                body: body.to_string(),
+            }),
+            (None, None) => {}
+        }
     }
 
     pub fn annotations(&self) -> &[Annotation] {
@@ -483,6 +531,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         reviews: legacy.reviews,
         tour: None,
         brief: None,
+        docs: Vec::new(),
         annotations: Vec::new(),
         focus: None,
         comments_visible: true,
@@ -641,6 +690,28 @@ mod tests {
         assert!(store.comments_visible());
         assert!(store.annotations().is_empty());
         assert_eq!(store.focus(), None);
+    }
+
+    #[test]
+    fn docs_keep_their_order_with_the_tour_first() {
+        let (state_home, workspace) = roots("docs");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        store.set_doc("plan", Some("the plan"));
+        store.set_doc("pr-body", Some("the body"));
+        store.set_doc("tour", Some("the tour"));
+        store.set_brief(Some("the briefing"));
+        store.save().unwrap();
+
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        let names = |s: &Store| s.docs().into_iter().map(|d| d.name).collect::<Vec<_>>();
+        assert_eq!(names(&store), ["tour", "plan", "pr-body"]);
+        assert_eq!(store.tour(), Some("the tour"));
+        assert_eq!(store.brief(), Some("the briefing"));
+
+        store.set_doc("plan", Some("revised"));
+        store.set_doc("pr-body", None);
+        assert_eq!(names(&store), ["tour", "plan"]);
+        assert_eq!(store.docs()[1].body, "revised");
     }
 
     #[test]

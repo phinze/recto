@@ -36,7 +36,15 @@ reads:
     recto tour --group "$RIG_BASEDIR" < t.md   # one story across the repos
     recto focus src/app.rs:42-58               # point at code
     recto brief < brief.md                     # the briefing (below)
+    recto doc plan < plan.md                   # any other doc, as a tab
     recto clear
+
+The window shows the group's docs as tabs beside the repos: the group tour
+first (it's the doc named `tour`), then each `recto doc NAME` in the order
+first written, a plan or a PR body, say. Quotes in a doc jump into the repo
+tabs, as in a tour. Rewrite a doc to update it; an empty body removes it.
+Keep docs few and named for what they are; the briefing, not a doc, is where
+anything that needs Paul goes.
 
 The terminal Recto is the escape hatch, for when Paul asks for it or for
 what the window can't do yet: retargeting the base and co-authoring review

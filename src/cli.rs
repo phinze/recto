@@ -83,6 +83,17 @@ pub(crate) enum ClientCommand {
         #[arg(long, value_name = "DIR")]
         group: Option<std::path::PathBuf>,
     },
+    /// Write a named document for a group of repositories: a plan, a PR
+    /// body, notes worth keeping in view. `recto serve` shows each as a tab
+    /// beside the repos' diffs, the group tour among them as the doc named
+    /// `tour`. Markdown from BODY or stdin, quotes as in a group tour; an
+    /// empty body removes it. DIR defaults to `$RIG_BASEDIR`.
+    Doc {
+        name: String,
+        body: Option<String>,
+        #[arg(long, value_name = "DIR")]
+        group: Option<std::path::PathBuf>,
+    },
     /// Bring the tour into view, optionally scrolled to a numbered SECTION.
     /// Sections are numbered from 1, matching the outline rail's badges.
     TourFocus { section: Option<usize> },
@@ -182,7 +193,20 @@ pub(crate) fn group_repos(dir: &Path) -> Vec<String> {
 /// repository itself, so a mistyped DIR is refused rather than quietly
 /// becoming a group nobody's page asks for.
 fn save_group_tour(dir: &Path, body: &str) -> i32 {
-    save_group_doc(dir, body, false)
+    save_group_doc(dir, body, "tour")
+}
+
+/// A group's directory: the one named, else the rig's.
+fn group_dir(group: &Option<std::path::PathBuf>, what: &str) -> Option<std::path::PathBuf> {
+    let dir = group
+        .clone()
+        .or_else(|| std::env::var_os("RIG_BASEDIR").map(std::path::PathBuf::from));
+    if dir.is_none() {
+        eprintln!(
+            "recto: a {what} belongs to a group of repositories; pass --group DIR (outside a rig, RIG_BASEDIR isn't set)"
+        );
+    }
+    dir
 }
 
 /// Read a document body from the argument, or from stdin when there is none.
@@ -202,8 +226,9 @@ fn read_body(body: &Option<String>, what: &str) -> Result<String> {
     Ok(buffer)
 }
 
-/// Save a group's tour, or its briefing.
-fn save_group_doc(dir: &Path, body: &str, brief: bool) -> i32 {
+/// Save one of a group's documents: "brief", "tour", or any other name.
+fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
+    let brief = name == "brief";
     // Ok(Err) is a refusal (exit 1); Err is a failure to read or write (2).
     let result = (|| -> Result<std::result::Result<Vec<String>, String>> {
         let dir = match dir.canonicalize() {
@@ -225,10 +250,11 @@ fn save_group_doc(dir: &Path, body: &str, brief: bool) -> i32 {
         }
         let mut store = state::Store::load(&dir, None)?;
         let body = body.trim();
+        let body = (!body.is_empty()).then_some(body);
         if brief {
-            store.set_brief((!body.is_empty()).then_some(body));
+            store.set_brief(body);
         } else {
-            store.set_tour((!body.is_empty()).then_some(body));
+            store.set_doc(name, body);
         }
         store.save()?;
         Ok(Ok(repos))
@@ -237,7 +263,11 @@ fn save_group_doc(dir: &Path, body: &str, brief: bool) -> i32 {
         Ok(Ok(repos)) => {
             eprintln!(
                 "recto: saved the group {} across {}; quote paths start with one of those",
-                if brief { "briefing" } else { "tour" },
+                match name {
+                    "brief" => "briefing".to_string(),
+                    "tour" => "tour".to_string(),
+                    other => format!("doc {other:?}"),
+                },
                 repos.join(", ")
             );
             0
@@ -306,18 +336,34 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
     if let ClientCommand::State { command } = &command {
         return run_state_command(command);
     }
-    if let ClientCommand::Brief { body, group } = &command {
-        let Some(dir) = group
-            .clone()
-            .or_else(|| std::env::var_os("RIG_BASEDIR").map(std::path::PathBuf::from))
-        else {
+    if let ClientCommand::Doc { name, body, group } = &command {
+        let valid = !name.is_empty()
+            && name
+                .chars()
+                .all(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || c == '-');
+        if !valid || name == "brief" {
             eprintln!(
-                "recto: a briefing belongs to a group of repositories; pass --group DIR (outside a rig, RIG_BASEDIR isn't set)"
+                "recto: a doc name is lowercase letters, digits and dashes, and \"brief\" is the briefing's (recto brief)"
             );
+            return 2;
+        }
+        let Some(dir) = group_dir(group, "doc") else {
+            return 2;
+        };
+        return match read_body(body, "doc") {
+            Ok(body) => save_group_doc(&dir, &body, name),
+            Err(e) => {
+                eprintln!("recto: {e}");
+                2
+            }
+        };
+    }
+    if let ClientCommand::Brief { body, group } = &command {
+        let Some(dir) = group_dir(group, "briefing") else {
             return 2;
         };
         return match read_body(body, "brief") {
-            Ok(body) => save_group_doc(&dir, &body, true),
+            Ok(body) => save_group_doc(&dir, &body, "brief"),
             Err(e) => {
                 eprintln!("recto: {e}");
                 2
@@ -549,7 +595,10 @@ fn wait_for_range(
 /// to workspace-root-relative so the agent can pass whatever form it used.
 fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
-        ClientCommand::State { .. } | ClientCommand::Serve { .. } | ClientCommand::Brief { .. } => {
+        ClientCommand::State { .. }
+        | ClientCommand::Serve { .. }
+        | ClientCommand::Brief { .. }
+        | ClientCommand::Doc { .. } => {
             Err(anyhow!("this command does not use the workspace socket"))
         }
         ClientCommand::Base { revision } => Ok(link::Request::SetBase {

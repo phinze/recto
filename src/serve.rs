@@ -343,7 +343,9 @@ fn page(req: &Request) -> String {
 /// one shells out to its VCS.
 fn fragment(req: &Request) -> String {
     let roots = &req.roots;
-    if roots.is_empty() {
+    // A group with no repositories (a rig that coordinates rather than
+    // codes) still has a briefing and docs worth showing.
+    if roots.is_empty() && req.group.is_none() {
         return "<p class=empty>No workspaces named. Ask for <code>?root=/path/to/repo</code>, once per repository.</p>".into();
     }
     // One highlight budget per response, split between the repos and the
@@ -382,24 +384,55 @@ fn fragment(req: &Request) -> String {
     });
     let mut out = String::new();
     let mut budget = share;
+    let mut docs: Vec<(String, String)> = Vec::new();
     if let Some(group) = &req.group {
-        group_tour(Path::new(group), &rendered, &mut budget, &mut out);
+        group_docs(
+            Path::new(group),
+            &rendered,
+            &mut budget,
+            &mut out,
+            &mut docs,
+        );
     }
-    if roots.len() > 1 {
-        // Several repos read as tabs, one shown at a time. The page picks
-        // which; the server only suggests a default: the repo with a tour,
-        // else the one with changes, else the first.
-        let default = rendered
-            .iter()
-            .position(|(_, s)| s.tour)
-            .or_else(|| rendered.iter().position(|(_, s)| s.files > 0))
-            .unwrap_or(0);
+    if roots.is_empty() && docs.is_empty() && out.is_empty() {
+        out.push_str("<p class=empty>Nothing here yet. This group has no repositories, and no briefing or docs have been written for it (<code>recto brief</code>, <code>recto doc NAME</code>).</p>");
+    }
+    let tabbed = roots.len() + docs.len() > 1;
+    if tabbed {
+        // Docs and repos read as tabs, one shown at a time. The page picks
+        // which; the server only suggests a default: the group's tour, else
+        // a repo with its own tour, else one with changes, else the first.
+        let default = if docs.iter().any(|(name, _)| name == "tour") {
+            "doc-tour".to_string()
+        } else if rendered.is_empty() {
+            format!("doc-{}", docs[0].0)
+        } else {
+            let i = rendered
+                .iter()
+                .position(|(_, s)| s.tour)
+                .or_else(|| rendered.iter().position(|(_, s)| s.files > 0))
+                .unwrap_or(0);
+            format!("repo-{i}")
+        };
         out.push_str("<div class=tabbed><nav class=tabs>");
+        for (name, _) in &docs {
+            let id = format!("doc-{name}");
+            let _ = write!(
+                out,
+                "<button type=button class=doc-tab data-tab=\"{id}\"{}>{}</button>",
+                if id == default { " data-default" } else { "" },
+                esc(&doc_title(name)),
+            );
+        }
         for (i, (root, (_, sum))) in roots.iter().zip(&rendered).enumerate() {
             let _ = write!(
                 out,
                 "<button type=button data-tab=\"repo-{i}\"{}>{}{}",
-                if i == default { " data-default" } else { "" },
+                if format!("repo-{i}") == default {
+                    " data-default"
+                } else {
+                    ""
+                },
                 if sum.tour {
                     "<span class=tour-dot title=\"has a tour\"></span>"
                 } else {
@@ -420,20 +453,46 @@ fn fragment(req: &Request) -> String {
         }
         out.push_str("</nav>");
     }
+    for (name, html) in &docs {
+        let _ = write!(
+            out,
+            "<section class=doc id=\"doc-{name}\" data-doc=\"{name}\">{html}</section>"
+        );
+    }
     for (html, _) in &rendered {
         out.push_str(html);
     }
-    if roots.len() > 1 {
+    if tabbed {
         out.push_str("</div>");
     }
     let _ = write!(out, "<footer>rendered {}</footer>", chrono_now());
     out
 }
 
-/// The group's own tour, above the repos, quoting from any of them. Each
-/// quote's path starts with its repo's directory under the group, which is
-/// how the tour was written and how it reads.
-fn group_tour(group: &Path, rendered: &[(String, Summary)], budget: &mut usize, out: &mut String) {
+/// A doc's name as its tab reads.
+fn doc_title(name: &str) -> String {
+    let mut c = name.chars();
+    match c.next() {
+        Some(first) => first
+            .to_uppercase()
+            .chain(c)
+            .collect::<String>()
+            .replace('-', " "),
+        None => String::new(),
+    }
+}
+
+/// The group's own documents, quoting from any of its repos: the briefing,
+/// pinned above everything into `out`, and the rest (the tour first) as
+/// `(name, html)` for tabs beside the repos. Each quote's path starts with
+/// its repo's directory under the group, which is how they're written.
+fn group_docs(
+    group: &Path,
+    rendered: &[(String, Summary)],
+    budget: &mut usize,
+    out: &mut String,
+    docs: &mut Vec<(String, String)>,
+) {
     let group = match group.canonicalize() {
         Ok(g) => g,
         Err(e) => {
@@ -458,16 +517,25 @@ fn group_tour(group: &Path, rendered: &[(String, Summary)], budget: &mut usize, 
         }
     };
     if let Some(brief) = store.brief().filter(|t| !t.trim().is_empty()) {
-        render_group_doc(&group, "brief", brief, rendered, budget, out);
+        render_group_doc(&group, "brief", "", brief, rendered, budget, out);
     }
-    if let Some(tour) = store.tour().filter(|t| !t.trim().is_empty()) {
-        render_group_doc(&group, "tour", tour, rendered, budget, out);
+    for doc in store.docs() {
+        if doc.body.trim().is_empty() {
+            continue;
+        }
+        let mut html = String::new();
+        let class = if doc.name == "tour" { "tour" } else { "doc" };
+        render_group_doc(
+            &group, class, &doc.name, &doc.body, rendered, budget, &mut html,
+        );
+        docs.push((doc.name, html));
     }
 }
 
 fn render_group_doc(
     group: &Path,
     class: &str,
+    name: &str,
     tour: &str,
     rendered: &[(String, Summary)],
     budget: &mut usize,
@@ -483,6 +551,8 @@ fn render_group_doc(
         .collect();
     let label = if class == "brief" {
         "Briefing".to_string()
+    } else if class == "doc" {
+        doc_title(name)
     } else if repos.len() > 1 {
         format!(
             "Tour across {}",
@@ -495,10 +565,23 @@ fn render_group_doc(
     } else {
         "Tour".to_string()
     };
-    let _ = write!(out, "<div class=group-{class}>");
+    // The briefing folds to a strip once nothing in it needs the person; the
+    // page decides that, since only it knows which asks are answered.
+    if class == "brief" {
+        out.push_str(
+            "<details class=group-brief open><summary class=brief-strip>Briefing</summary>",
+        );
+    } else {
+        let _ = write!(out, "<div class=group-{class}>");
+    }
+    let ids = match class {
+        "brief" => "bg".to_string(),
+        "tour" => "tg".to_string(),
+        _ => format!("d-{name}"),
+    };
     render_doc(
         class,
-        if class == "brief" { "bg" } else { "tg" },
+        &ids,
         &label,
         tour,
         budget,
@@ -525,7 +608,11 @@ fn render_group_doc(
             }
         },
     );
-    out.push_str("</div>");
+    out.push_str(if class == "brief" {
+        "</details>"
+    } else {
+        "</div>"
+    });
 }
 
 fn repo_name(root: &Path) -> String {
@@ -1781,6 +1868,7 @@ mod tests {
         render_group_doc(
             group,
             "tour",
+            "tour",
             "# Across\n\n```recto beta/src/a.rs:2\n```\n\n```recto gamma/x.rs:1\n```\n",
             &rendered,
             &mut 0,
@@ -1798,6 +1886,12 @@ mod tests {
         assert!(out.contains("new();"), "{out}");
         assert!(out.contains("no repo here by that name"), "{out}");
         assert!(out.contains("id=\"tg-1\""), "{out}");
+    }
+
+    #[test]
+    fn doc_names_read_as_titles() {
+        assert_eq!(doc_title("tour"), "Tour");
+        assert_eq!(doc_title("pr-body"), "Pr body");
     }
 
     #[test]

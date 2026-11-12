@@ -31,8 +31,10 @@ nav.tabs button:hover { color: var(--text); }
 nav.tabs button.active { color: var(--mauve); border-bottom-color: var(--mauve); }
 nav.tabs .stat { font-size: 11px; }
 .tour-dot { width: 6px; height: 6px; border-radius: 50%; background: var(--mauve); }
-.tabbed > section.repo { display: none; }
-.tabbed > section.repo.active { display: block; }
+.tabbed > section { display: none; }
+.tabbed > section.active { display: block; }
+nav.tabs button.doc-tab { color: var(--peach); font-style: italic; }
+nav.tabs button.doc-tab.active { color: var(--peach); border-bottom-color: var(--peach); }
 
 section.repo { margin-bottom: 28px; }
 details.file { scroll-margin-top: 44px; }
@@ -69,16 +71,16 @@ details.revs li:first-child .rev-sum { color: var(--subtext); font-style: italic
 .dim { color: var(--overlay0); font-size: 13px; }
 .empty { color: var(--subtext); }
 
-article.tour { margin: 14px 0 20px; padding: 6px 18px 14px; border-left: 3px solid var(--mauve);
+article:is(.tour, .doc) { margin: 14px 0 20px; padding: 6px 18px 14px; border-left: 3px solid var(--mauve);
   background: linear-gradient(90deg, rgba(203,166,247,0.05), transparent 60%); }
 /* Prose keeps a reading measure; quoted code takes the full width, where
    long lines wrap less. */
-article.tour > * { max-width: 70ch; }
-article.tour > figure.quote, article.tour > pre, article.tour > table { max-width: none; }
+article:is(.tour, .doc) > * { max-width: 70ch; }
+article:is(.tour, .doc) > figure.quote, article:is(.tour, .doc) > pre, article:is(.tour, .doc) > table { max-width: none; }
 .tour-label { font: 600 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--mauve); margin-top: 8px; }
-article.tour h1, article.tour h2 { font-size: 17px; margin: 22px 0 6px; color: var(--text); scroll-margin-top: 48px; }
-article.tour h3 { font-size: 15px; margin: 16px 0 4px; }
-article.tour p, article.tour li { color: var(--text); }
+article:is(.tour, .doc) h1, article:is(.tour, .doc) h2 { font-size: 17px; margin: 22px 0 6px; color: var(--text); scroll-margin-top: 48px; }
+article:is(.tour, .doc) h3 { font-size: 15px; margin: 16px 0 4px; }
+article:is(.tour, .doc) p, article:is(.tour, .doc) li { color: var(--text); }
 ol.outline { font-size: 13px; color: var(--overlay0); margin: 6px 0 4px; padding-left: 20px; columns: 2 220px; }
 ol.outline a { color: var(--subtext); }
 ol.outline.plain { list-style: none; padding-left: 0; }
@@ -127,7 +129,7 @@ footer { color: var(--overlay0); font: 11px var(--mono); text-align: right; marg
 @media (max-width: 640px) {
   main { padding: 8px 10px 40px; }
   table.diff col.ln { width: 2.8em; }
-  article.tour { padding: 4px 10px 10px; }
+  article:is(.tour, .doc) { padding: 4px 10px 10px; }
 }
 
 /* A group's tour is the page's main story, so it sits above the repo tabs. */
@@ -146,6 +148,11 @@ tr.focus td.ln:first-child { box-shadow: inset 3px 0 0 var(--yellow), inset 0 0 
 
 /* The briefing sits above everything, set apart from the tours. */
 .group-brief { border-left: 3px solid var(--peach); padding-left: 16px; margin: 4px 0 24px; }
+.group-brief > summary.brief-strip { cursor: pointer; list-style: none; font: 12px var(--mono); color: var(--peach); padding: 4px 0; }
+.group-brief > summary.brief-strip::before { content: "▸ "; color: var(--overlay0); }
+.group-brief[open] > summary.brief-strip::before { content: "▾ "; }
+.group-brief:not([open]) { margin-bottom: 8px; }
+.group-brief .tour-label { display: none; }
 .group-brief .tour-label { color: var(--peach); }
 article.brief h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0.04em; color: var(--subtext); }
 
@@ -185,3 +192,5 @@ tr.has-comment[data-cstate=failed] td.ln:first-child { box-shadow: inset 3px 0 0
 .c-badge[data-cstate=done] { border-color: var(--green); color: var(--green); }
 .c-badge[data-cstate=held] { border-color: var(--overlay0); color: var(--subtext); }
 .c-badge[data-cstate=failed] { border-color: var(--red); color: var(--red); }
+
+article.doc { border-left-color: var(--peach); }

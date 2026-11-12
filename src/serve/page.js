@@ -136,7 +136,7 @@
       try { sessionStorage.setItem(tabKey, id); } catch {}
     }
     for (const b of content.querySelectorAll('nav.tabs button')) b.classList.toggle('active', b.dataset.tab === id);
-    for (const s of content.querySelectorAll('.tabbed > section.repo')) s.classList.toggle('active', s.id === id);
+    for (const s of content.querySelectorAll('.tabbed > section')) s.classList.toggle('active', s.id === id);
   }
 
   function applyTab() {
@@ -189,7 +189,7 @@
   function reveal(id) {
     const el = document.getElementById(id);
     if (!el) return;
-    const section = el.closest('.tabbed > section.repo');
+    const section = el.closest('.tabbed > section');
     if (section && !section.classList.contains('active')) activate(section.id, true);
     for (let p = el.parentElement; p; p = p.parentElement) {
       if (p.tagName === 'DETAILS') p.open = true;
@@ -330,16 +330,21 @@
     }
     const ask = node.closest('.ask');
     if (ask) return askAnchor(ask);
-    const art = node.closest('article.tour, article.brief');
+    const art = node.closest('article.tour, article.brief, article.doc');
     if (art) {
       let heading = null;
       for (const h of art.querySelectorAll('h1[id], h2[id]')) {
         if (h.contains(range.startContainer) || (h.compareDocumentPosition(range.startContainer) & Node.DOCUMENT_POSITION_FOLLOWING)) heading = h;
       }
       const brief = art.classList.contains('brief');
-      const what = brief ? 'Briefing' : repo ? repo + ' tour' : 'Group tour';
-      const title = heading ? heading.textContent.trim() : '';
-      return { kind: brief ? 'brief' : 'tour', repo, section: title, label: title ? what + ' › ' + title : what };
+      const docSection = art.closest('section.doc');
+      const doc = art.classList.contains('doc') ? docSection.dataset.doc : '';
+      const tabName = docSection ? content.querySelector(`nav.tabs button[data-tab="${docSection.id}"]`)?.textContent.trim() : '';
+      const what = brief ? 'Briefing' : doc ? tabName : repo ? repo + ' tour' : 'Tour';
+      const title = heading ? heading.textContent.trim().replace(/\s*(held|sent|on it|handled|not delivered)$/, '') : '';
+      const anchor = { kind: brief ? 'brief' : doc ? 'doc' : 'tour', repo, section: title, label: title ? what + ' › ' + title : what };
+      if (doc) anchor.path = doc;
+      return anchor;
     }
     return { kind: 'text', repo, label: repo || 'the page' };
   }
@@ -435,8 +440,9 @@
           return n >= a.start && n <= end;
         }) : [];
         for (const row of rows) { row.classList.add('has-comment'); row.dataset.cstate = c.state; row.title = c.body; }
-      } else if ((a.kind === 'tour' || a.kind === 'brief') && a.section) {
-        const h = [...content.querySelectorAll(`article.${a.kind} h1, article.${a.kind} h2`)].find((x) => x.textContent.trim() === a.section);
+      } else if ((a.kind === 'tour' || a.kind === 'brief' || a.kind === 'doc') && a.section) {
+        const scope = a.kind === 'doc' ? `section.doc[data-doc="${CSS.escape(a.path || '')}"] ` : '';
+        const h = [...content.querySelectorAll(`${scope}article.${a.kind} h1, ${scope}article.${a.kind} h2`)].find((x) => x.textContent.trim() === a.section);
         if (h) {
           const b = document.createElement('span');
           b.className = 'c-badge';
@@ -462,12 +468,25 @@
           + '<div class=c-actions><button type=button data-act=send>send now</button><button type=button data-act=hold class=c-hold>hold answer</button></div>';
       }
     }
-    // The frame counts what's waiting on the person.
-    if (framed) {
-      const open = [...content.querySelectorAll('.ask')].filter((c) => !answered.has(c.dataset.ask)).length;
-      window.parent.postMessage({ asks: open }, location.origin);
+    // The frame counts what's waiting on the person, and the briefing folds
+    // to a strip once nothing in it does. A fold or unfold by hand holds until
+    // that count changes.
+    const open = [...content.querySelectorAll('.ask')].filter((c) => !answered.has(c.dataset.ask)).length;
+    if (framed) window.parent.postMessage({ asks: open }, location.origin);
+    const brief = content.querySelector('details.group-brief');
+    if (brief) {
+      if (open !== briefSeen) { briefChoice = null; briefSeen = open; }
+      const want = briefChoice ?? open > 0;
+      if (brief.open !== want) { settingBrief = true; brief.open = want; }
+      brief.querySelector('.brief-strip').textContent = 'Briefing · '
+        + (open ? open + (open === 1 ? ' needs you' : ' need you') : 'nothing needs you');
     }
   }
+  let briefChoice = null, briefSeen = -1, settingBrief = false;
+  content.addEventListener('toggle', (e) => {
+    if (!e.target.matches('details.group-brief')) return;
+    if (settingBrief) settingBrief = false; else briefChoice = e.target.open;
+  }, true);
 
   // A parent frame can point this page at code: postMessage({focus: "L0-3-42"}).
   window.addEventListener('message', (e) => {
