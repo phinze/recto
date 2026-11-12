@@ -258,11 +258,40 @@ impl JjBackend {
     /// candidates are ambiguous and fall back to the ordinary trunk branch
     /// point.
     fn bookmarked_stack_base(&self) -> Option<Base> {
+        let (id, bookmarks) = self.bookmarked_head("@-")?;
+        // A bookmark with only empty commits above it is the branch being
+        // worked on, not a boundary below it: after pushing a branch and
+        // starting a fresh change on top, its own bookmark sits on @-, and
+        // taking it as the base would diff the branch against itself.
+        let work_above = self
+            .run(&[
+                "log",
+                "-r",
+                &format!("({id}..@) ~ empty()"),
+                "--no-graph",
+                "-T",
+                "commit_id ++ \"\\n\"",
+            ])
+            .ok()?;
+        let bookmarks = if work_above.trim().is_empty() {
+            self.bookmarked_head(&format!("{id}-"))?.1
+        } else {
+            bookmarks
+        };
+        Some(Base::MergeBase {
+            against: Box::new(Base::Revision(bookmarks[0].clone())),
+        })
+    }
+
+    /// The nearest bookmarked commit between the trunk fork point (exclusive)
+    /// and `ceiling`, with its bookmark names, when there is exactly one and
+    /// it isn't a review rig's own bookmark.
+    fn bookmarked_head(&self, ceiling: &str) -> Option<(String, Vec<String>)> {
         let out = self
             .run(&[
                 "log",
                 "-r",
-                "heads((bookmarks() | remote_bookmarks()) & fork_point(trunk() | @)::@-)",
+                &format!("heads((bookmarks() | remote_bookmarks()) & fork_point(trunk() | @)::{ceiling})"),
                 "--no-graph",
                 "-T",
                 "commit_id ++ \"\\t\" ++ local_bookmarks.map(|b| b.name()).join(\"\\t\") ++ \"\\t\" ++ remote_bookmarks.map(|b| b.name() ++ \"@\" ++ b.remote()).join(\"\\t\") ++ \"\\n\"",
@@ -277,13 +306,14 @@ impl JjBackend {
         if candidate_id == self.resolve_commit_id("fork_point(trunk() | @)") {
             return None;
         }
-        let bookmarks: Vec<&str> = fields.filter(|name| !name.is_empty()).collect();
+        let bookmarks: Vec<String> = fields
+            .filter(|name| !name.is_empty())
+            .map(str::to_string)
+            .collect();
         if bookmarks.is_empty() || bookmarks.iter().any(|name| name.starts_with("rig-review/")) {
             return None;
         }
-        Some(Base::MergeBase {
-            against: Box::new(Base::Revision(bookmarks[0].into())),
-        })
+        Some((candidate_id.to_string(), bookmarks))
     }
 }
 
@@ -1085,6 +1115,61 @@ mod tests {
                 .iter()
                 .map(|change| change.path.as_str())
                 .collect::<Vec<_>>(),
+            vec!["top.txt"]
+        );
+    }
+
+    #[test]
+    fn jj_default_base_skips_the_branchs_own_bookmark_under_an_empty_change() {
+        // A pushed branch with a fresh, empty change on top: its own bookmark
+        // is on @-, and the diff should still be the branch, not nothing.
+        let repo = TempRepo::new("jj-own-bookmark");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("feature.txt"), "feature\n").unwrap();
+        repo.run("jj", &["describe", "-m", "feature"]);
+        repo.run("jj", &["bookmark", "create", "feature", "-r", "@"]);
+        repo.run("jj", &["new"]);
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = backend.default_bases().remove(0);
+        let changes = backend
+            .list_changes(&Scope::Range(base), false)
+            .expect("load the branch");
+        assert_eq!(
+            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
+            vec!["feature.txt"]
+        );
+    }
+
+    #[test]
+    fn jj_default_base_finds_the_layer_below_a_pushed_top_branch() {
+        let repo = TempRepo::new("jj-own-bookmark-stack");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
+        repo.run("jj", &["describe", "-m", "trunk"]);
+        repo.run("jj", &["bookmark", "create", "main", "-r", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("lower.txt"), "lower\n").unwrap();
+        repo.run("jj", &["describe", "-m", "lower"]);
+        repo.run("jj", &["bookmark", "create", "lower", "-r", "@"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("top.txt"), "top\n").unwrap();
+        repo.run("jj", &["describe", "-m", "top"]);
+        repo.run("jj", &["bookmark", "create", "top", "-r", "@"]);
+        repo.run("jj", &["new"]);
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = backend.default_bases().remove(0);
+        assert_eq!(backend.base_label(&base), "fork_point(lower | @)");
+        let changes = backend
+            .list_changes(&Scope::Range(base), false)
+            .expect("load the top layer");
+        assert_eq!(
+            changes.iter().map(|c| c.path.as_str()).collect::<Vec<_>>(),
             vec!["top.txt"]
         );
     }
