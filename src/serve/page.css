@@ -213,3 +213,4 @@ tr.draft td { padding: 4px 10px 8px 10px; background: var(--base); }
 .draft-lost { margin-top: 8px; }
 .draft-lost .draft-card { margin: 6px 0; }
 .review-body > :last-child, .draft-body > :last-child { margin-bottom: 0; }
+.peer h3 .peer-send { margin-left: 10px; font: 12px var(--sans); vertical-align: middle; }

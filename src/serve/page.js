@@ -450,17 +450,23 @@
       const text = card.querySelector('.ask-answer textarea').value.trim();
       if (!picked && !text) return card.querySelector('.ask-answer textarea').focus();
       const body = [picked ? 'Choice: ' + picked.dataset.choice : '', text].filter(Boolean).join('\n');
-      // An answer for another rig goes straight to it: this page's tray
-      // holds only this rig's comments, so a held one there would be lost.
+      // An answer for another rig is held in that rig's log, under its
+      // heading here, until its rig's answers go out together.
       const rig = card.dataset.rig;
-      send(askAnchor(card), card.querySelector('.ask-q').textContent.trim(), body, rig ? true : act.dataset.act === 'send', rig);
+      send(askAnchor(card), card.querySelector('.ask-q').textContent.trim(), body, rig ? false : act.dataset.act === 'send', rig);
       return;
     }
-    // A link to another rig puts it on screen, in Rex and so in this window.
+    const batch = e.target.closest('.peer-send');
+    if (batch) {
+      sendPeer(batch.closest('.peer'), true);
+      return;
+    }
+    // A link to another rig: the frame shows it, and puts it on screen in Rex
+    // too when a Rex app is there to switch.
     const link = e.target.closest('a[href^="rig:"]');
     if (link) {
       e.preventDefault();
-      if (framed) window.parent.postMessage({ showRig: link.getAttribute('href').slice(4) }, location.origin);
+      if (framed) window.parent.postMessage({ showRig: link.getAttribute('href').slice(4), label: link.textContent.trim() }, location.origin);
     }
   });
 
@@ -526,9 +532,25 @@
       } else if (!slot.querySelector('textarea') && framed) {
         slot.innerHTML = '<textarea rows=2 placeholder="answer…"></textarea>'
           + (card.dataset.rig
-            ? '<div class=c-actions><button type=button data-act=send class=c-hold>send</button></div>'
+            ? '<div class=c-actions><button type=button data-act=hold class=c-hold>answer</button></div>'
             : '<div class=c-actions><button type=button data-act=send>send now</button><button type=button data-act=hold class=c-hold>hold answer</button></div>');
       }
+    }
+    // Each rig's held answers go out as one message: by its button, or on
+    // their own once every ask that rig has open is answered.
+    for (const peer of content.querySelectorAll('.peer[data-rig]')) {
+      const cards = [...peer.querySelectorAll('.ask')];
+      const held = cards.map(answerOf).filter((c) => c && (c.state === 'held' || c.state === 'failed'));
+      let btn = peer.querySelector('.peer-send');
+      if (!held.length) { if (btn) btn.remove(); continue; }
+      if (!btn) {
+        btn = document.createElement('button');
+        btn.type = 'button';
+        btn.className = 'peer-send c-hold';
+        peer.querySelector('h3').append(btn);
+      }
+      btn.textContent = 'send ' + held.length;
+      if (cards.every(answerOf)) sendPeer(peer);
     }
     // The frame counts what's waiting on the person, and the briefing folds
     // to a strip once nothing in it does. A fold or unfold by hand holds until
@@ -546,6 +568,20 @@
     }
   }
   let briefChoice = null, briefSeen = -1, settingBrief = false;
+  // Held answers already handed to the frame to send, so a redraw before
+  // the send lands doesn't send them twice.
+  const sending = new Set();
+  // A press of the button always tries, so a failed send can be retried.
+  function sendPeer(peer, pressed) {
+    const rig = peer.dataset.rig;
+    const ids = [...peer.querySelectorAll('.ask')]
+      .map((card) => (peerComments[rig] || []).filter((c) => c.anchor.kind === 'ask' && c.anchor.section === card.dataset.ask).pop())
+      .filter((c) => c && (c.state === 'held' || c.state === 'failed') && (pressed || !sending.has(c.id)))
+      .map((c) => c.id);
+    if (!ids.length || !framed) return;
+    ids.forEach((id) => sending.add(id));
+    window.parent.postMessage({ sendRig: rig, ids }, location.origin);
+  }
   content.addEventListener('toggle', (e) => {
     if (!e.target.matches('details.group-brief')) return;
     if (settingBrief) settingBrief = false; else briefChoice = e.target.open;
