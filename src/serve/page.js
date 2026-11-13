@@ -361,36 +361,53 @@
   function hidePill() { pill.classList.remove('shown'); }
   function closeComposer() { composer.classList.remove('shown'); pending = null; }
 
+  // The selection as it was last made. A phone clears the selection when the
+  // pill is tapped, before the tap lands, so the pill works from this copy,
+  // and stays up through the tap instead of vanishing with the selection.
+  let lastSel = null;
+  let pressing = false;
   document.addEventListener('selectionchange', () => {
-    if (!framed) return;
+    if (!framed || pressing) return;
     const sel = document.getSelection();
-    if (!sel || sel.isCollapsed || !sel.rangeCount || sel.toString().trim().length < 2) return hidePill();
+    if (!sel || sel.isCollapsed || !sel.rangeCount || sel.toString().trim().length < 2) {
+      // Let a tap on the pill land before it goes away.
+      return setTimeout(() => { if (!pressing && document.getSelection()?.isCollapsed !== false) hidePill(); }, 400);
+    }
     const range = sel.getRangeAt(0);
     if (!content.contains(range.commonAncestorContainer) || range.commonAncestorContainer.closest?.('.ask')) return hidePill();
+    lastSel = { range: range.cloneRange(), text: sel.toString() };
     const rect = range.getBoundingClientRect();
     pill.style.top = Math.min(window.innerHeight - 40, rect.bottom + 6) + 'px';
     pill.style.left = Math.max(8, Math.min(window.innerWidth - 100, rect.right - 40)) + 'px';
     pill.classList.add('shown');
   });
-  pill.addEventListener('mousedown', (e) => e.preventDefault()); // keep the selection
-  pill.addEventListener('click', () => {
-    const sel = document.getSelection();
-    if (!sel || !sel.rangeCount) return;
-    const range = sel.getRangeAt(0);
-    pending = { anchor: anchorFor(range), quote: sel.toString().trim().slice(0, 4000) };
+  // Opening on pointerup, still inside the tap, lets a phone raise its
+  // keyboard for the composer.
+  pill.addEventListener('pointerdown', (e) => {
+    e.preventDefault(); // keep the selection where the browser allows it
+    pressing = true;
+  });
+  pill.addEventListener('pointerup', () => { openComposer(); pressing = false; });
+  pill.addEventListener('pointercancel', () => { pressing = false; });
+  pill.addEventListener('click', openComposer); // keyboard
+  function openComposer() {
+    if (composer.classList.contains('shown') || !lastSel) return;
+    const { range, text } = lastSel;
+    pending = { anchor: anchorFor(range), quote: text.trim().slice(0, 4000) };
     composer.querySelector('.c-anchor').textContent = pending.anchor.label;
     const q = pending.quote;
     composer.querySelector('.c-quote').textContent = q.length > 280 ? q.slice(0, 279) + '…' : q;
     hidePill();
     composer.classList.add('shown');
     composer.querySelector('textarea').focus();
-  });
+  }
   function submit(now) {
     const ta = composer.querySelector('textarea');
     if (!pending || !ta.value.trim()) return ta.focus();
     send(pending.anchor, pending.quote, ta.value.trim(), now);
     ta.value = '';
     closeComposer();
+    lastSel = null;
     document.getSelection()?.removeAllRanges();
   }
   composer.addEventListener('submit', (e) => { e.preventDefault(); submit(false); });
