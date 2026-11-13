@@ -194,3 +194,22 @@ tr.has-comment[data-cstate=failed] td.ln:first-child { box-shadow: inset 3px 0 0
 .c-badge[data-cstate=failed] { border-color: var(--red); color: var(--red); }
 
 article.doc { border-left-color: var(--peach); }
+
+.gathered { margin: 4px 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--surface0); }
+.gathered h2 { font: 600 13px var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--subtext); margin: 4px 0 8px; }
+.gathered .peer h3 { font: 600 15px var(--sans); margin: 12px 0 2px; }
+a[href^="rig:"] { color: var(--blue); text-decoration: none; border-bottom: 1px dotted var(--blue); cursor: pointer; }
+a[href^="rig:"]::after { content: " ↗"; font-size: 0.85em; }
+
+article.review { margin: 10px 0 14px; padding: 10px 14px; background: var(--mantle); border: 1px solid var(--surface1); border-left: 3px solid var(--mauve); border-radius: 6px; max-width: 80ch; }
+.review-head { font: 13px var(--sans); color: var(--subtext); margin-bottom: 6px; }
+.review-head b { color: var(--mauve); font-weight: 600; }
+.review-body p, .draft-body p { margin: 0 0 6px; }
+.review-body, .draft-body { font: 14px/1.5 var(--sans); }
+tr.draft td { padding: 4px 10px 8px 10px; background: var(--base); }
+.draft-card { font-family: var(--sans); white-space: normal; background: var(--mantle); border: 1px solid var(--surface1); border-left: 3px solid var(--mauve); border-radius: 6px; padding: 8px 12px; max-width: 80ch; }
+.draft-head { font: 12px var(--sans); color: var(--mauve); margin-bottom: 4px; }
+.draft-head .dim { color: var(--subtext); }
+.draft-lost { margin-top: 8px; }
+.draft-lost .draft-card { margin: 6px 0; }
+.review-body > :last-child, .draft-body > :last-child { margin-bottom: 0; }

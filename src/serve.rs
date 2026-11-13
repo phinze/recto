@@ -38,6 +38,9 @@ use crate::highlight::{Highlighter, expand_tabs, ext_for_path};
 use crate::watch::{WatchTree, is_interesting, may_add_directories};
 use crate::{link, markdown, parse_pathspec, state};
 
+mod review;
+pub(crate) use review::respond_offline as review_offline;
+
 /// Lines past this many in one response render without syntax highlighting,
 /// so a whole-repo diff still answers promptly.
 const HIGHLIGHT_BUDGET: usize = 20_000;
@@ -110,6 +113,17 @@ struct Request {
     /// A narrowed view per root index: one commit's own diff in place of the
     /// whole range.
     views: Vec<(usize, String)>,
+    /// Other groups whose open asks this page gathers, for a coordinator
+    /// that organizes the person's attention across them.
+    peers: Vec<Peer>,
+}
+
+/// Another group (a rig) whose briefing's asks a coordinator's page gathers.
+/// The slug names it to whoever delivers answers and switches screens.
+struct Peer {
+    slug: String,
+    label: String,
+    basedir: String,
 }
 
 fn read_request(stream: &UnixStream) -> Option<Request> {
@@ -135,6 +149,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
     let mut group = None;
     let mut starts = Vec::new();
     let mut views = Vec::new();
+    let mut peers = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
         match k {
@@ -153,6 +168,19 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
                     views.push((i, spec.to_string()));
                 }
             }
+            // slug, basedir, label, tab-separated.
+            "peer" => {
+                let v = percent_decode(v);
+                let mut f = v.splitn(3, '\t');
+                if let (Some(slug), Some(basedir)) = (f.next(), f.next()) {
+                    let label = f.next().filter(|l| !l.is_empty()).unwrap_or(slug);
+                    peers.push(Peer {
+                        slug: slug.to_string(),
+                        label: label.to_string(),
+                        basedir: basedir.to_string(),
+                    });
+                }
+            }
             _ => {}
         }
     }
@@ -163,6 +191,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
         label,
         starts,
         views,
+        peers,
     })
 }
 
@@ -250,6 +279,9 @@ fn events(mut stream: UnixStream, req: &Request) {
     }
     if let Some(group) = &req.group {
         watch_state(Path::new(group));
+    }
+    for peer in &req.peers {
+        watch_state(Path::new(&peer.basedir));
     }
     let mut trees = Vec::new();
     for root in roots {
@@ -345,7 +377,7 @@ fn fragment(req: &Request) -> String {
     let roots = &req.roots;
     // A group with no repositories (a rig that coordinates rather than
     // codes) still has a briefing and docs worth showing.
-    if roots.is_empty() && req.group.is_none() {
+    if roots.is_empty() && req.group.is_none() && req.peers.is_empty() {
         return "<p class=empty>No workspaces named. Ask for <code>?root=/path/to/repo</code>, once per repository.</p>".into();
     }
     // One highlight budget per response, split between the repos and the
@@ -385,14 +417,18 @@ fn fragment(req: &Request) -> String {
     let mut out = String::new();
     let mut budget = share;
     let mut docs: Vec<(String, String)> = Vec::new();
+    let gathered = gather_asks(&req.peers);
     if let Some(group) = &req.group {
         group_docs(
             Path::new(group),
+            &gathered,
             &rendered,
             &mut budget,
             &mut out,
             &mut docs,
         );
+    } else if !gathered.is_empty() {
+        brief_with(&gathered, "", &mut out);
     }
     if roots.is_empty() && docs.is_empty() && out.is_empty() {
         out.push_str("<p class=empty>Nothing here yet. This group has no repositories, and no briefing or docs have been written for it (<code>recto brief</code>, <code>recto doc NAME</code>).</p>");
@@ -488,6 +524,7 @@ fn doc_title(name: &str) -> String {
 /// its repo's directory under the group, which is how they're written.
 fn group_docs(
     group: &Path,
+    gathered: &str,
     rendered: &[(String, Summary)],
     budget: &mut usize,
     out: &mut String,
@@ -516,8 +553,14 @@ fn group_docs(
             return;
         }
     };
-    if let Some(brief) = store.brief().filter(|t| !t.trim().is_empty()) {
-        render_group_doc(&group, "brief", "", brief, rendered, budget, out);
+    match store.brief().filter(|t| !t.trim().is_empty()) {
+        Some(brief) => {
+            let mut html = String::new();
+            render_group_doc(&group, "brief", "", brief, rendered, budget, &mut html);
+            brief_with(gathered, &html, out);
+        }
+        None if !gathered.is_empty() => brief_with(gathered, "", out),
+        None => {}
     }
     for doc in store.docs() {
         if doc.body.trim().is_empty() {
@@ -530,6 +573,91 @@ fn group_docs(
         );
         docs.push((doc.name, html));
     }
+}
+
+/// The briefing with the asks gathered from other groups leading it. `brief`
+/// is the group's own, already wrapped, or empty when it hasn't written one.
+fn brief_with(gathered: &str, brief: &str, out: &mut String) {
+    const STRIP: &str = "<summary class=brief-strip>Briefing</summary>";
+    if gathered.is_empty() {
+        out.push_str(brief);
+    } else if let Some(at) = brief.find(STRIP) {
+        let at = at + STRIP.len();
+        out.push_str(&brief[..at]);
+        out.push_str(gathered);
+        out.push_str(&brief[at..]);
+    } else {
+        let _ = write!(
+            out,
+            "<details class=group-brief open>{STRIP}{gathered}</details>"
+        );
+    }
+}
+
+/// Every ask in the peers' briefings, under a link to the rig that asked.
+/// Whether each is answered is the page's call, from the comments it's
+/// given; an answer goes to the rig in the card's `data-rig`.
+fn gather_asks(peers: &[Peer]) -> String {
+    let mut out = String::new();
+    for peer in peers {
+        let Ok(dir) = Path::new(&peer.basedir).canonicalize() else {
+            continue;
+        };
+        let Ok(store) = state::Store::load(&dir, None) else {
+            let _ = write!(
+                out,
+                "<div class=peer data-rig=\"{0}\"><h3><a href=\"rig:{0}\">{1}</a></h3><p class=error>could not read its briefing</p></div>",
+                esc(&peer.slug),
+                esc(&peer.label)
+            );
+            continue;
+        };
+        let asks = store.brief().map(brief_asks).unwrap_or_default();
+        if asks.is_empty() {
+            continue;
+        }
+        let _ = write!(
+            out,
+            "<div class=peer data-rig=\"{0}\"><h3><a href=\"rig:{0}\">{1}</a></h3>",
+            esc(&peer.slug),
+            esc(&peer.label)
+        );
+        for (id, text) in asks {
+            out.push_str(&ask_html(&id, &text, Some(&peer.slug)));
+        }
+        out.push_str("</div>");
+    }
+    if out.is_empty() {
+        return out;
+    }
+    format!("<section class=gathered><h2>Across rigs</h2>{out}</section>")
+}
+
+/// The asks in a briefing, as `(id, text)`, numbered the way `render_doc`
+/// numbers an ask that names no id.
+fn brief_asks(source: &str) -> Vec<(String, String)> {
+    let mut out = Vec::new();
+    let mut asking: Option<(String, String)> = None;
+    let mut n = 0;
+    for event in Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION) {
+        if let Some((_, text)) = asking.as_mut() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => out.extend(asking.take()),
+                Event::Text(t) => text.push_str(&t),
+                _ => {}
+            }
+            continue;
+        }
+        if let Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(info))) = event
+            && let Some(rest) = info.trim().strip_prefix("ask")
+            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+        {
+            n += 1;
+            let id = rest.split_whitespace().next().map(str::to_string);
+            asking = Some((id.unwrap_or_else(|| format!("ask{n}")), String::new()));
+        }
+    }
+    out
 }
 
 fn render_group_doc(
@@ -780,6 +908,22 @@ fn render_workspace(
         let _ = write!(out, "<p class=error>{}</p>", esc(n));
     }
     out.push_str("</header>");
+    // A review in progress on the attached PR: its drafts show where they'll
+    // land, so the person can steer them with comments like any other text.
+    let review = pull_request.as_ref().and_then(|pr| {
+        store.as_ref()?.review(&link::PullRequestRef {
+            repository: pr.repository.clone(),
+            number: pr.number,
+            head_oid: pr.head_oid.clone(),
+        })
+    });
+    if let Some(r) = review
+        .as_ref()
+        .filter(|r| r.verdict.is_some() || r.body.is_some() || !r.comments.is_empty())
+    {
+        review_card(r, &files, out);
+    }
+    let drafts: &[link::DraftReviewComment] = review.as_ref().map_or(&[], |r| &r.comments);
     if commits.len() > 1 {
         let head = backend.commit_id(backend.head_rev());
         render_revisions(
@@ -827,10 +971,10 @@ fn render_workspace(
         if shown.is_empty() {
             out.push_str("<p class=empty>This commit changes no files.</p>");
         } else {
-            render_files(index, &shown, &mut budget, out);
+            render_files(index, &shown, &[], &mut budget, out);
         }
     } else if !files.is_empty() {
-        render_files(index, &files, &mut budget, out);
+        render_files(index, &files, drafts, &mut budget, out);
     }
     Ok(Summary {
         root: Some(root),
@@ -1253,7 +1397,13 @@ fn file_key(path: &str) -> String {
     format!("{hash:08x}")
 }
 
-fn render_files(index: usize, files: &[FileDiff], budget: &mut usize, out: &mut String) {
+fn render_files(
+    index: usize,
+    files: &[FileDiff],
+    drafts: &[link::DraftReviewComment],
+    budget: &mut usize,
+    out: &mut String,
+) {
     out.push_str("<div class=files>");
     let lines: usize = files
         .iter()
@@ -1291,6 +1441,15 @@ fn render_files(index: usize, files: &[FileDiff], budget: &mut usize, out: &mut 
                 );
                 for line in &hunk.lines {
                     diff_row(index, &key, line, ext, budget, out);
+                    // A review draft sits under the last line it's about,
+                    // where GitHub will show it.
+                    if let Some(n) = line.new {
+                        for d in drafts.iter().filter(|d| d.path == file.path && d.end == n) {
+                            out.push_str("<tr class=draft><td colspan=3>");
+                            draft_card(d, out);
+                            out.push_str("</td></tr>");
+                        }
+                    }
                 }
             }
             out.push_str("</table>");
@@ -1298,6 +1457,108 @@ fn render_files(index: usize, files: &[FileDiff], budget: &mut usize, out: &mut 
         out.push_str("</details>");
     }
     out.push_str("</div>");
+}
+
+/// One inline review draft, as the reader will see it posted.
+fn draft_card(d: &link::DraftReviewComment, out: &mut String) {
+    let span = if d.start == d.end {
+        d.start.to_string()
+    } else {
+        format!("{}-{}", d.start, d.end)
+    };
+    let who = match d.last_editor {
+        link::DraftEditor::Agent => "agent",
+        link::DraftEditor::User => "you",
+    };
+    let _ = write!(
+        out,
+        "<div class=draft-card data-draft=\"{}\" data-path=\"{}\" data-start={} data-end={}><div class=draft-head>Draft #{} <span class=dim>{}:{span} · last edit {who}</span></div><div class=draft-body>{}</div></div>",
+        d.id,
+        esc(&d.path),
+        d.start,
+        d.end,
+        d.id,
+        esc(&d.path),
+        small_markdown(&d.body)
+    );
+}
+
+/// The review taking shape, at the top of its repo: verdict, summary, and
+/// any draft whose lines have left the diff, so nothing silently vanishes.
+fn review_card(review: &state::RestoredReview, files: &[FileDiff], out: &mut String) {
+    let verdict = review.verdict.map_or("no verdict yet", |v| v.label());
+    let n = review.comments.len();
+    let _ = write!(
+        out,
+        "<article class=review><div class=review-head>Review draft · <b>{verdict}</b> · {n} inline comment{}</div>",
+        if n == 1 { "" } else { "s" }
+    );
+    match review.body.as_ref().filter(|b| !b.body.trim().is_empty()) {
+        Some(b) => {
+            let _ = write!(
+                out,
+                "<div class=review-body>{}</div>",
+                small_markdown(&b.body)
+            );
+        }
+        None => out.push_str("<p class=dim>No summary yet.</p>"),
+    }
+    let lost: Vec<&link::DraftReviewComment> = review
+        .comments
+        .iter()
+        .filter(|d| {
+            !files
+                .iter()
+                .any(|f| f.path == d.path && review::shows_span(f, d.start, d.end))
+        })
+        .collect();
+    if !lost.is_empty() {
+        out.push_str("<div class=draft-lost><p class=dim>Not on this diff any more:</p>");
+        for d in lost {
+            draft_card(d, out);
+        }
+        out.push_str("</div>");
+    }
+    out.push_str("</article>");
+}
+
+/// A short markdown body (a draft comment, a review summary) as HTML, with
+/// the same rules as a tour: raw HTML shows as text, links only go somewhere
+/// safe, and images never load.
+fn small_markdown(body: &str) -> String {
+    let events =
+        Parser::new_ext(body, Options::all() - Options::ENABLE_SMART_PUNCTUATION).map(|event| {
+            match event {
+                Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
+                Event::Start(Tag::Link {
+                    link_type,
+                    dest_url,
+                    title,
+                    id,
+                }) => Event::Start(Tag::Link {
+                    link_type,
+                    dest_url: safe_url(dest_url),
+                    title,
+                    id,
+                }),
+                Event::Start(Tag::Image {
+                    dest_url,
+                    title,
+                    id,
+                    ..
+                }) => Event::Start(Tag::Link {
+                    link_type: pulldown_cmark::LinkType::Inline,
+                    dest_url: safe_url(dest_url),
+                    title,
+                    id,
+                }),
+                Event::End(TagEnd::Image) => Event::End(TagEnd::Link),
+                other => other,
+            }
+        });
+    let mut html = String::new();
+    pulldown_cmark::html::push_html(&mut html, events);
+    html
 }
 
 fn diff_row(
@@ -1431,7 +1692,7 @@ fn render_doc(
             match event {
                 Event::End(TagEnd::CodeBlock) => {
                     let (id, text) = asking.take().unwrap_or_default();
-                    events.push(Event::Html(ask_html(&id, &text).into()));
+                    events.push(Event::Html(ask_html(&id, &text, None).into()));
                 }
                 Event::Text(t) => text.push_str(&t),
                 _ => {}
@@ -1567,7 +1828,7 @@ fn render_doc(
 /// A question the person answers in place. Lines starting `- ` are choices;
 /// the rest is the question. The page sends the answer as a comment anchored
 /// to the ask's id, so answering is the same gesture as commenting.
-fn ask_html(id: &str, text: &str) -> String {
+fn ask_html(id: &str, text: &str, rig: Option<&str>) -> String {
     let mut question = Vec::new();
     let mut choices = Vec::new();
     for line in text.lines() {
@@ -1577,7 +1838,11 @@ fn ask_html(id: &str, text: &str) -> String {
         }
     }
     let question = question.join("\n");
-    let mut out = format!("<div class=ask data-ask=\"{}\"><div class=ask-q>", esc(id));
+    let mut out = format!("<div class=ask data-ask=\"{}\"", esc(id));
+    if let Some(rig) = rig {
+        let _ = write!(out, " data-rig=\"{}\"", esc(rig));
+    }
+    out.push_str("><div class=ask-q>");
     for para in question
         .split("\n\n")
         .map(str::trim)
@@ -1680,6 +1945,14 @@ fn safe_url(url: CowStr<'_>) -> CowStr<'_> {
         None => url,
         Some(s) if s.contains('/') || s.contains('#') || s.contains('?') => url,
         Some("http" | "https" | "mailto") => url,
+        // Another rig, which the page asks its frame to put on screen.
+        Some("rig")
+            if url.trim()[4..]
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || "-_.".contains(c)) =>
+        {
+            url
+        }
         Some(_) => CowStr::from("#"),
     }
 }
@@ -1912,6 +2185,58 @@ mod tests {
         assert!(out.contains("data-choice=\"open\""), "{out}");
         // An ask without an id gets one by position.
         assert!(out.contains("data-ask=\"ask2\""), "{out}");
+    }
+
+    // A coordinator gathers another rig's asks by the ids its own page uses,
+    // so an answer from either page marks the same ask.
+    #[test]
+    fn gathered_asks_keep_the_ids_their_own_page_gives_them() {
+        let asks = brief_asks(
+            "```ask q1\nShip?\n- yes\n```\n\ntext\n\n```ask\nAnything else?\n```\n```rust\nfn x() {}\n```\n",
+        );
+        let ids: Vec<&str> = asks.iter().map(|(id, _)| id.as_str()).collect();
+        assert_eq!(ids, ["q1", "ask2"]);
+        assert_eq!(asks[0].1, "Ship?\n- yes\n");
+        let card = ask_html("q1", &asks[0].1, Some("other-rig"));
+        assert!(
+            card.contains("data-ask=\"q1\" data-rig=\"other-rig\""),
+            "{card}"
+        );
+    }
+
+    #[test]
+    fn gathered_asks_lead_the_briefing() {
+        let mut out = String::new();
+        brief_with(
+            "<section class=gathered></section>",
+            "<details class=group-brief open><summary class=brief-strip>Briefing</summary><article>own</article></details>",
+            &mut out,
+        );
+        assert_eq!(
+            out,
+            "<details class=group-brief open><summary class=brief-strip>Briefing</summary><section class=gathered></section><article>own</article></details>"
+        );
+        // A coordinator that hasn't written a briefing still gets one to hold them.
+        let mut out = String::new();
+        brief_with("<section class=gathered></section>", "", &mut out);
+        assert!(
+            out.starts_with("<details class=group-brief open>") && out.contains("gathered"),
+            "{out}"
+        );
+        // Nothing gathered leaves the briefing as it was.
+        let mut out = String::new();
+        brief_with("", "<p>own</p>", &mut out);
+        assert_eq!(out, "<p>own</p>");
+    }
+
+    #[test]
+    fn a_rig_link_survives_but_only_naming_a_rig() {
+        assert_eq!(
+            &*safe_url("rig:cos-2026-11-12".into()),
+            "rig:cos-2026-11-12"
+        );
+        assert_eq!(&*safe_url("rig:../../etc".into()), "#");
+        assert_eq!(&*safe_url("rig:a b".into()), "#");
     }
 
     #[test]

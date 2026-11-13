@@ -430,7 +430,16 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             _ => {}
         }
     }
-    match link::send(&socket, &request) {
+    // Review drafts too: the web window shows them, so with no viewer the
+    // store takes the write and answers as a viewer would.
+    let offline = (std::os::unix::net::UnixStream::connect(&socket).is_err())
+        .then(|| crate::serve::review_offline(&request))
+        .flatten();
+    let reply = match offline {
+        Some(resp) => Ok(resp),
+        None => link::send(&socket, &request),
+    };
+    match reply {
         Ok(resp) if resp.ok => {
             if let Some(requested) = retarget {
                 // A live TUI returns its status so this client can wait for the

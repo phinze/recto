@@ -94,6 +94,14 @@ decision that's his, and drop asks once they're answered. In a rig it
 belongs to `$RIG_BASEDIR`; outside one, pass `--group DIR`. Quotes work as
 in a group tour. An empty body removes it.
 
+The chief of staff's window gathers every rig's asks at the top of its
+briefing, under a link to the rig that asked, and Paul can answer them
+there; the answer reaches you the same way. So an ask left in a briefing
+after it's settled (answered in the terminal, say) keeps asking him from
+cos's page too: rewrite the briefing to drop it. Link another rig with
+`[label](rig:SLUG)`, its basedir name; clicking it puts that rig on screen
+in Rex, and the window follows.
+
 ### Comments from the window
 
 Paul can select anything in the window (diff lines, a tour passage, part of
@@ -357,6 +365,19 @@ is up.
 
 `recto review-verdict` sets the verdict. The verdict is the user's call: set it
 when they tell you to, never on your own judgment.
+
+### In the web window
+
+The web window shows the draft too: the verdict and summary at the top of
+the repo, and each inline comment under the last line it's about. With no
+terminal Recto running, the review commands write the saved draft directly
+and answer the same way, and `recto pr URL` attaches the PR for the window.
+Paul steers a draft by selecting text in it and commenting. That comment
+arrives like any other, anchored as `REPO draft #ID on PATH:LINES` or
+`REPO review summary`. Revise with `recto review-comment --id ID` or
+`recto review-body`, ack it, and say in the briefing what changed. When the
+draft reads as done, ask in the briefing whether to post it; posting is
+still a separate step that waits on his answer.
 
 These commands require an attached PR, and this workflow does not post
 anything publicly. Do not copy private `recto notes` into the review draft by

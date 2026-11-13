@@ -275,6 +275,9 @@
   // one to deliver to, so none of this shows.
   const framed = window.parent !== window;
   let comments = [];
+  // Comments on other rigs whose asks this page gathers, by rig: the frame
+  // fetches them for the rigs this page names, so an answered ask reads so.
+  let peerComments = {};
   const pill = document.createElement('button');
   pill.id = 'comment-pill';
   pill.type = 'button';
@@ -307,6 +310,18 @@
     if (node.nodeType !== 1) node = node.parentElement;
     const section = node.closest('section.repo');
     const repo = section ? section.dataset.repo : '';
+    // A review draft is the agent's words about some lines, so a comment on
+    // it is about the draft, not the lines under it.
+    const draft = node.closest('.draft-card');
+    if (draft) {
+      const d = draft.dataset;
+      const span = d.start === d.end ? d.start : d.start + '-' + d.end;
+      return { kind: 'draft', repo, path: d.path, start: +d.start, end: +d.end, section: d.draft,
+        label: (repo ? repo + ' ' : '') + 'draft #' + d.draft + ' on ' + d.path + ':' + span };
+    }
+    if (node.closest('article.review')) {
+      return { kind: 'review', repo, label: (repo ? repo + ' ' : '') + 'review summary' };
+    }
     const figure = node.closest('figure.quote');
     const file = node.closest('details.file');
     if (figure || file) {
@@ -354,8 +369,10 @@
     return { kind: 'ask', section: card.dataset.ask, label: 'Ask ' + card.dataset.ask + ': ' + (q.length > 80 ? q.slice(0, 79) + '…' : q) };
   }
 
-  function send(anchor, quote, body, now) {
-    window.parent.postMessage({ comment: { anchor, quote, body, send: now } }, location.origin);
+  // rig names another rig the comment is for (an answer to an ask gathered
+  // from it); absent, it's for the rig this page shows.
+  function send(anchor, quote, body, now, rig) {
+    window.parent.postMessage({ comment: { anchor, quote, body, send: now, rig } }, location.origin);
   }
 
   function hidePill() { pill.classList.remove('shown'); }
@@ -433,7 +450,17 @@
       const text = card.querySelector('.ask-answer textarea').value.trim();
       if (!picked && !text) return card.querySelector('.ask-answer textarea').focus();
       const body = [picked ? 'Choice: ' + picked.dataset.choice : '', text].filter(Boolean).join('\n');
-      send(askAnchor(card), card.querySelector('.ask-q').textContent.trim(), body, act.dataset.act === 'send');
+      // An answer for another rig goes straight to it: this page's tray
+      // holds only this rig's comments, so a held one there would be lost.
+      const rig = card.dataset.rig;
+      send(askAnchor(card), card.querySelector('.ask-q').textContent.trim(), body, rig ? true : act.dataset.act === 'send', rig);
+      return;
+    }
+    // A link to another rig puts it on screen, in Rex and so in this window.
+    const link = e.target.closest('a[href^="rig:"]');
+    if (link) {
+      e.preventDefault();
+      if (framed) window.parent.postMessage({ showRig: link.getAttribute('href').slice(4) }, location.origin);
     }
   });
 
@@ -457,6 +484,19 @@
           return n >= a.start && n <= end;
         }) : [];
         for (const row of rows) { row.classList.add('has-comment'); row.dataset.cstate = c.state; row.title = c.body; }
+      } else if (a.kind === 'draft' || a.kind === 'review') {
+        const scope = content.querySelector(`section.repo[data-repo="${CSS.escape(a.repo || '')}"]`) || content;
+        const head = a.kind === 'draft'
+          ? scope.querySelector(`.draft-card[data-draft="${CSS.escape(a.section || '')}"] .draft-head`)
+          : scope.querySelector('article.review .review-head');
+        if (head) {
+          const b = document.createElement('span');
+          b.className = 'c-badge';
+          b.dataset.cstate = c.state;
+          b.textContent = stateWords[c.state] || c.state;
+          b.title = c.body;
+          head.append(b);
+        }
       } else if ((a.kind === 'tour' || a.kind === 'brief' || a.kind === 'doc') && a.section) {
         const scope = a.kind === 'doc' ? `section.doc[data-doc="${CSS.escape(a.path || '')}"] ` : '';
         const h = [...content.querySelectorAll(`${scope}article.${a.kind} h1, ${scope}article.${a.kind} h2`)].find((x) => x.textContent.trim() === a.section);
@@ -470,8 +510,11 @@
         }
       }
     }
+    const answerOf = (card) => card.dataset.rig
+      ? (peerComments[card.dataset.rig] || []).filter((c) => c.anchor.kind === 'ask' && c.anchor.section === card.dataset.ask).pop()
+      : answered.get(card.dataset.ask);
     for (const card of content.querySelectorAll('.ask')) {
-      const c = answered.get(card.dataset.ask);
+      const c = answerOf(card);
       const slot = card.querySelector('.ask-answer');
       card.classList.toggle('answered', !!c);
       if (c) {
@@ -482,14 +525,17 @@
         b.textContent = stateWords[c.state] || c.state;
       } else if (!slot.querySelector('textarea') && framed) {
         slot.innerHTML = '<textarea rows=2 placeholder="answer…"></textarea>'
-          + '<div class=c-actions><button type=button data-act=send>send now</button><button type=button data-act=hold class=c-hold>hold answer</button></div>';
+          + (card.dataset.rig
+            ? '<div class=c-actions><button type=button data-act=send class=c-hold>send</button></div>'
+            : '<div class=c-actions><button type=button data-act=send>send now</button><button type=button data-act=hold class=c-hold>hold answer</button></div>');
       }
     }
     // The frame counts what's waiting on the person, and the briefing folds
     // to a strip once nothing in it does. A fold or unfold by hand holds until
     // that count changes.
-    const open = [...content.querySelectorAll('.ask')].filter((c) => !answered.has(c.dataset.ask)).length;
-    if (framed) window.parent.postMessage({ asks: open }, location.origin);
+    const open = [...content.querySelectorAll('.ask')].filter((c) => !answerOf(c)).length;
+    const peers = [...new Set([...content.querySelectorAll('.peer[data-rig]')].map((p) => p.dataset.rig))];
+    if (framed) window.parent.postMessage({ asks: open, peers }, location.origin);
     const brief = content.querySelector('details.group-brief');
     if (brief) {
       if (open !== briefSeen) { briefChoice = null; briefSeen = open; }
@@ -511,6 +557,7 @@
     if (e.data && typeof e.data.focus === 'string') reveal(e.data.focus);
     if (e.data && e.data.refresh) refresh();
     if (e.data && Array.isArray(e.data.comments)) { comments = e.data.comments; decorate(); }
+    if (e.data && e.data.peerComments) { peerComments = e.data.peerComments; decorate(); }
   });
   decorate();
 })();
