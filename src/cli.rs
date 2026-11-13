@@ -242,7 +242,10 @@ fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
             )));
         }
         let repos = group_repos(&dir);
-        if repos.is_empty() {
+        // A tour walks through code, so it needs repositories to quote. A
+        // briefing or a doc doesn't: a rig that coordinates rather than codes
+        // (a chief of staff) keeps them all the same.
+        if repos.is_empty() && name == "tour" {
             return Ok(Err(format!(
                 "{} holds no repositories to tour across",
                 dir.display()
@@ -260,6 +263,17 @@ fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
         Ok(Ok(repos))
     })();
     match result {
+        Ok(Ok(repos)) if repos.is_empty() => {
+            eprintln!(
+                "recto: saved the group {}; it holds no repositories, so it has no code to quote",
+                if brief {
+                    "briefing".to_string()
+                } else {
+                    format!("doc {name:?}")
+                }
+            );
+            0
+        }
         Ok(Ok(repos)) => {
             eprintln!(
                 "recto: saved the group {} across {}; quote paths start with one of those",

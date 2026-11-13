@@ -77,3 +77,40 @@ fn state_forget_is_an_offline_idempotent_command() {
     assert!(output.stdout.is_empty());
     assert!(output.stderr.is_empty());
 }
+
+// A rig that coordinates rather than codes has no repositories, but it still
+// keeps a briefing and docs. Only a tour, which quotes code, needs repos.
+#[test]
+fn a_group_without_repositories_keeps_a_briefing_and_docs() {
+    let dir = TempRepos::new();
+    let group = dir.0.join("cos");
+    let state = dir.0.join("state");
+    std::fs::create_dir_all(&group).unwrap();
+    let run = |args: &[&str]| {
+        Command::new(env!("CARGO_BIN_EXE_recto"))
+            .env("XDG_STATE_HOME", &state)
+            .env_remove("RIG_BASEDIR")
+            .args(args)
+            .arg("--group")
+            .arg(&group)
+            .output()
+            .expect("run recto")
+    };
+    let brief = run(&["brief", "## Needs you\n\nNothing."]);
+    assert_eq!(
+        brief.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&brief.stderr)
+    );
+    let doc = run(&["doc", "plan", "The day's plan."]);
+    assert_eq!(
+        doc.status.code(),
+        Some(0),
+        "{}",
+        String::from_utf8_lossy(&doc.stderr)
+    );
+    let tour = run(&["tour", "# A tour"]);
+    assert_eq!(tour.status.code(), Some(1));
+    assert!(String::from_utf8_lossy(&tour.stderr).contains("no repositories to tour across"));
+}
