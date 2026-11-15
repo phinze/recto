@@ -820,6 +820,76 @@
     if (settingBrief) settingBrief = false; else briefChoice = e.target.open;
   }, true);
 
+  // Contents: a sheet listing every section and file on the page, so a phone,
+  // which has room for no navigator pane, can still jump around a long
+  // review. Built fresh each time it opens, from whatever the page shows now.
+  const tocBtn = document.createElement('button');
+  tocBtn.id = 'toc-btn';
+  tocBtn.type = 'button';
+  tocBtn.setAttribute('aria-label', 'contents');
+  tocBtn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>';
+  const toc = document.createElement('div');
+  toc.id = 'toc';
+  toc.innerHTML = '<div class=toc-sheet role=dialog aria-label=contents><div class=toc-head><b>contents</b><button type=button class=toc-close>close</button></div><div class=toc-list></div></div>';
+  document.body.append(tocBtn, toc);
+  const tocList = toc.querySelector('.toc-list');
+  const escHTML = (str) => String(str).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
+
+  function tocHeadings(scope) {
+    return [...scope.querySelectorAll('article h1[id], article h2[id]')]
+      .filter((h) => !h.closest('details.group-brief'))
+      .map((h) => `<button type=button class=toc-h data-goto="${escHTML(h.id)}">${escHTML(h.textContent.replace(/\s*(held|sent|on it|handled|not delivered)$/, '').trim())}</button>`).join('');
+  }
+  function tocFiles(scope) {
+    return [...scope.querySelectorAll('details.file[id]')].map((d) => {
+      const st = d.querySelector('summary .st');
+      const add = d.querySelector('summary .stat .add'), del = d.querySelector('summary .stat .del');
+      const path = d.dataset.path || '';
+      const slash = path.lastIndexOf('/');
+      return `<button type=button class=toc-f data-goto="${escHTML(d.id)}">`
+        + `<span class="st ${st ? escHTML(st.className.replace('st ', '')) : ''}">${st ? escHTML(st.textContent) : ''}</span>`
+        + `<span class=toc-path><span class=toc-dir>${escHTML(path.slice(0, slash + 1))}</span>${escHTML(path.slice(slash + 1))}</span>`
+        + `<span class=toc-stat>${add ? `<span class=add>${escHTML(add.textContent)}</span> ` : ''}${del ? `<span class=del>${escHTML(del.textContent)}</span>` : ''}</span></button>`;
+    }).join('');
+  }
+  function buildToc() {
+    let html = '';
+    const brief = content.querySelector('details.group-brief');
+    if (brief) html += '<button type=button class=toc-top data-goto=":brief">Briefing</button>';
+    const groupTour = content.querySelector('.group-tour');
+    if (groupTour) html += '<button type=button class=toc-top data-goto=":group-tour">Tour</button>' + tocHeadings(groupTour);
+    const tabs = [...content.querySelectorAll('nav.tabs button[data-tab]')];
+    const sections = tabs.length
+      ? tabs.map((b) => [document.getElementById(b.dataset.tab), b.childNodes[b.querySelector('.tour-dot') ? 1 : 0]?.textContent || b.textContent])
+      : [...content.querySelectorAll('section.repo')].map((sec) => [sec, sec.dataset.repo || '']);
+    for (const [sec, name] of sections) {
+      if (!sec) continue;
+      html += `<button type=button class=toc-top data-goto="${escHTML(sec.id)}">${escHTML(String(name).trim())}</button>` + tocHeadings(sec) + tocFiles(sec);
+    }
+    tocList.innerHTML = html || '<p class=dim>Nothing on this page to jump to.</p>';
+  }
+  function openToc() { buildToc(); toc.classList.add('shown'); }
+  function closeToc() { toc.classList.remove('shown'); }
+  tocBtn.addEventListener('click', openToc);
+  toc.addEventListener('click', (e) => {
+    if (e.target === toc || e.target.closest('.toc-close')) return closeToc();
+    const go = e.target.closest('[data-goto]');
+    if (!go) return;
+    closeToc();
+    const id = go.dataset.goto;
+    if (id === ':brief' || id === ':group-tour') {
+      const el = content.querySelector(id === ':brief' ? 'details.group-brief' : '.group-tour');
+      if (el.tagName === 'DETAILS') el.open = true;
+      el.scrollIntoView({ block: 'start', behavior: 'smooth' });
+    } else if (/^(repo|doc)-/.test(id) && document.getElementById(id)?.parentElement.classList.contains('tabbed')) {
+      activate(id, true);
+      document.getElementById(id).scrollIntoView({ block: 'start', behavior: 'smooth' });
+    } else {
+      reveal(id);
+    }
+  });
+  document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && toc.classList.contains('shown')) closeToc(); });
+
   // A parent frame can point this page at code: postMessage({focus: "L0-3-42"}).
   window.addEventListener('message', (e) => {
     if (e.source !== window.parent) return;

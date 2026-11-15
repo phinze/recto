@@ -271,3 +271,30 @@ tr.picked td.ln:first-child { box-shadow: inset 3px 0 0 var(--mauve), inset 0 0 
     font-size: 16px; padding: 12px 22px; border-radius: 24px; white-space: nowrap; }
   #composer { top: 8px; bottom: auto; }
 }
+
+/* Contents: a button in the corner and a sheet that rises from the bottom. */
+#toc-btn { display: none; position: fixed; z-index: 25; left: 12px; bottom: calc(14px + env(safe-area-inset-bottom, 0px));
+  width: 46px; height: 46px; border-radius: 23px; border: 1px solid var(--surface1); background: var(--mantle); color: var(--subtext);
+  align-items: center; justify-content: center; box-shadow: 0 2px 12px rgba(0,0,0,0.45); cursor: pointer; padding: 0; }
+#toc { position: fixed; inset: 0; z-index: 40; display: none; background: rgba(17,17,27,0.55); }
+#toc.shown { display: block; }
+.toc-sheet { position: absolute; left: 0; right: 0; bottom: 0; max-height: 78vh; display: flex; flex-direction: column;
+  background: var(--mantle); border-top: 1px solid var(--surface1); border-radius: 14px 14px 0 0; box-shadow: 0 -8px 30px rgba(0,0,0,0.5); }
+.toc-head { display: flex; align-items: center; padding: 10px 14px; border-bottom: 1px solid var(--surface0); }
+.toc-head b { flex: 1; font: 600 12px var(--mono); text-transform: uppercase; letter-spacing: 0.06em; color: var(--subtext); }
+.toc-head button, .toc-opt button { font: 13px var(--mono); color: var(--text); background: var(--surface0); border: 0; border-radius: 16px; min-height: 32px; padding: 0 14px; cursor: pointer; }
+.toc-list { overflow-y: auto; padding: 4px 0 calc(16px + env(safe-area-inset-bottom, 0px)); -webkit-overflow-scrolling: touch; }
+.toc-list button { all: unset; box-sizing: border-box; display: flex; gap: 8px; align-items: baseline; width: 100%; cursor: pointer;
+  padding: 10px 16px; min-height: 44px; -webkit-tap-highlight-color: transparent; }
+.toc-list button:active { background: var(--surface0); }
+.toc-list .toc-top { font: 600 14px var(--mono); color: var(--mauve); border-top: 1px solid var(--surface0); margin-top: 4px; }
+.toc-list .toc-h { font: 15px var(--sans); color: var(--text); padding-left: 28px !important; }
+.toc-list .toc-f { font: 13px var(--mono); padding-left: 28px !important; }
+.toc-path { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
+.toc-dir { color: var(--overlay0); }
+.toc-stat { font-size: 12px; white-space: nowrap; }
+@media (pointer: coarse), (max-width: 600px) {
+  #toc-btn { display: flex; }
+  /* Clear the contents button's corner. */
+  main { padding-bottom: 80px; }
+}
