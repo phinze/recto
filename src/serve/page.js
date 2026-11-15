@@ -903,6 +903,10 @@
       activate(id, true);
       document.getElementById(id).scrollIntoView({ block: 'start', behavior: 'smooth' });
     } else {
+      // reveal opens the details around its target, not the target itself,
+      // and a file picked from the contents is one to read.
+      const el = document.getElementById(id);
+      if (el && el.matches('details.file') && !el.open) { el.open = true; toggled.set(el.id, true); }
       reveal(id);
     }
   });
