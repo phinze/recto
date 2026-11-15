@@ -331,7 +331,11 @@ fn save_tour_offline(body: &str) -> i32 {
         let located = crate::anchor::locate_quotes(body);
         let named: Vec<String> = located.iter().map(|(spec, ..)| spec.clone()).collect();
         store.stamp_quotes(
-            crate::anchor::stamp_quotes(backend.as_ref(), &located),
+            crate::anchor::stamp_quotes(
+                backend.as_ref(),
+                &crate::anchor::Lens::range(backend.as_ref()),
+                &located,
+            ),
             &named,
         );
         store.save()?;

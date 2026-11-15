@@ -337,7 +337,21 @@ impl Store {
             .map(|review| RestoredReview {
                 verdict: review.verdict,
                 body: review.body.clone(),
-                comments: review.comments.clone(),
+                comments: review
+                    .comments
+                    .iter()
+                    .cloned()
+                    .map(|mut comment| {
+                        // Only a stamp can say where a comment's lines went
+                        // on a new head; one without can't be trusted there.
+                        if review.pull_request.head_oid != pull_request.head_oid
+                            && comment.pin.stamp.is_none()
+                        {
+                            comment.pin.outdated = true;
+                        }
+                        comment
+                    })
+                    .collect(),
                 next_id: review
                     .next_id
                     .max(
@@ -868,6 +882,22 @@ mod tests {
 
         let carried = store.review(&new).expect("the draft follows the PR");
         assert_eq!(carried.body.unwrap().body, "Only for the old diff");
+
+        // A comment with no stamp can't be trusted on a new head.
+        let unstamped = DraftReviewComment {
+            id: 1,
+            path: "src/a.rs".into(),
+            start: 3,
+            end: 3,
+            body: "hm".into(),
+            last_editor: crate::link::DraftEditor::User,
+            revision: 1,
+            snippet: None,
+            pin: Default::default(),
+        };
+        store.set_review(old.clone(), None, None, std::slice::from_ref(&unstamped), 2);
+        assert!(!store.review(&old).unwrap().comments[0].pin.outdated);
+        assert!(store.review(&new).unwrap().comments[0].pin.outdated);
 
         // Saving under the new head replaces the old entry rather than
         // keeping two drafts of one review.

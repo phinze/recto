@@ -1382,6 +1382,96 @@ mod tests {
         );
     }
 
+    /// Restored drafts come back by way of the PR attach, after the load
+    /// that resolved everything else, so the attach has to resolve them: a
+    /// draft written before an amend beneath it lands on its moved line the
+    /// moment the review is back, not after some later reload.
+    #[test]
+    fn a_restored_draft_lands_on_its_moved_line_when_the_pr_reattaches() {
+        let (repo, backend) = jj_stack("app-anchor-draft-restart");
+        let state_home = repo.0.join(".state");
+        let root = backend.root().to_path_buf();
+        let store = state::Store::load_at(&state_home, &root, None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, Some(store)).unwrap();
+        assert!(
+            app.attach_pull_request(empty_pull_request("base"), false)
+                .ok
+        );
+        assert!(
+            app.add_review_draft_comment(
+                "f.txt",
+                10,
+                None,
+                "why A?".into(),
+                link::DraftEditor::Agent
+            )
+            .ok
+        );
+        let change = app.review_draft_comments[0]
+            .pin
+            .stamp
+            .clone()
+            .expect("stamped")
+            .change;
+        app.persist_now().unwrap();
+        drop(app);
+
+        repo.run("jj", &["edit", &change]);
+        let text = std::fs::read_to_string(repo.0.join("f.txt")).unwrap();
+        std::fs::write(repo.0.join("f.txt"), format!("n1\nn2\nn3\n{text}")).unwrap();
+        repo.run("jj", &["new", "heads(all())"]);
+
+        let store = state::Store::load_at(&state_home, &root, None).unwrap();
+        let mut app = App::load(backend, Highlighter::new(), None, Some(store)).unwrap();
+        assert!(
+            app.attach_pull_request(empty_pull_request("base"), false)
+                .ok
+        );
+        let draft = &app.review_draft_comments[0];
+        assert_eq!((draft.start, draft.end), (13, 13));
+        assert!(draft.pin.shown());
+    }
+
+    /// A new head of the same PR keeps its drafts, but only a stamp can say
+    /// where a comment's lines went; one without is outdated on the new head.
+    #[test]
+    fn an_unstamped_draft_goes_outdated_when_its_pr_moves_to_a_new_head() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        load_sample_diff(&mut app);
+        assert!(
+            app.attach_pull_request(empty_pull_request("base"), false)
+                .ok
+        );
+        assert!(
+            app.add_review_draft_comment(
+                "foo.go",
+                111,
+                None,
+                "hm".into(),
+                link::DraftEditor::User
+            )
+            .ok
+        );
+        assert!(
+            app.review_draft_comments[0].pin.stamp.is_none(),
+            "the test double never stamps"
+        );
+
+        let moved = link::PullRequest {
+            head_oid: "def456".into(),
+            ..empty_pull_request("base")
+        };
+        assert!(app.attach_pull_request(moved, false).ok);
+        assert_eq!(
+            app.review_draft_comments.len(),
+            1,
+            "the draft follows its PR"
+        );
+        assert!(app.review_draft_comments[0].pin.outdated);
+        assert!(!app.review_draft_anchored(&app.review_draft_comments[0]));
+    }
+
     fn test_request(generation: u64) -> DiffRequest {
         DiffRequest {
             stamps: Vec::new(),

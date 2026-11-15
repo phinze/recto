@@ -386,14 +386,14 @@ pub fn quote_specs(source: &str) -> Vec<String> {
 /// did.
 pub fn stamp_quotes(
     backend: &dyn Backend,
+    lens: &Lens,
     located: &[(String, String, u32, u32)],
 ) -> Vec<QuoteStamp> {
-    let lens = Lens::range(backend);
     let mut resolver = Resolver::new(backend);
     located
         .iter()
         .filter_map(|(spec, path, start, end)| {
-            let stamp = resolver.stamp(&lens, path, *start, *end)?;
+            let stamp = resolver.stamp(lens, path, *start, *end)?;
             Some(QuoteStamp {
                 spec: spec.clone(),
                 path: path.clone(),
@@ -446,7 +446,11 @@ pub fn stamp_group_quotes(
     let mut out = Vec::new();
     for (repo, located) in by_repo {
         if let Some(backend) = crate::backend::detect_backend_from(&group.join(&repo)) {
-            out.extend(stamp_quotes(backend.as_ref(), &located));
+            out.extend(stamp_quotes(
+                backend.as_ref(),
+                &Lens::range(backend.as_ref()),
+                &located,
+            ));
         }
     }
     out

@@ -148,6 +148,7 @@ impl App {
                         changed |= pin.apply(r, start, end);
                     }
                 }
+                None if pin.outdated => {}
                 None => {
                     if let Some(lens) = lens.filter(|l| !l.narrowed)
                         && let Some(stamp) = resolver.stamp(lens, path, *start, *end)
@@ -175,6 +176,22 @@ impl App {
         if changed {
             self.persist_soon();
         }
+    }
+
+    /// Resolve the draft comments' stamps against the loaded view on the
+    /// spot, for drafts that appear without a load to resolve them.
+    fn resolve_drafts_now(&mut self) {
+        let Some(lens) = self.lens() else {
+            return;
+        };
+        let stamps: Vec<(String, Stamp)> = self
+            .review_draft_comments
+            .iter()
+            .filter_map(|c| Some((c.path.clone(), c.pin.stamp.clone()?)))
+            .collect();
+        let resolved = crate::anchor::resolve_all(&*self.backend, &lens, &stamps);
+        self.apply_resolutions(Some(&lens), &resolved);
+        self.reweave();
     }
 
     pub(crate) fn review_is_stale(&self) -> bool {
@@ -437,6 +454,19 @@ impl App {
             );
         }
 
+        let new_head = self
+            .pull_request
+            .as_ref()
+            .is_some_and(|current| current.head_oid != pull_request.head_oid);
+        if same_review && new_head {
+            // Only a stamp can say where a comment's lines went. One without
+            // (a git repository) can't be trusted on the new diff.
+            for comment in &mut self.review_draft_comments {
+                if comment.pin.stamp.is_none() {
+                    comment.pin.outdated = true;
+                }
+            }
+        }
         if !same_review {
             let restored = self
                 .persistence
@@ -458,6 +488,13 @@ impl App {
                 self.review_draft_comments.clear();
                 self.next_review_draft_id = 1;
             }
+        }
+        // Drafts that arrived with this attach (restored, or carried to a new
+        // head) still hold the lines of the diff they were last saved
+        // against. Resolve them now rather than wait for a reload this path
+        // may never request.
+        if (!same_review || new_head) && !self.review_draft_comments.is_empty() {
+            self.resolve_drafts_now();
         }
 
         let base = Base::branch_point(pull_request.base_oid.clone());

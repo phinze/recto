@@ -294,7 +294,12 @@ impl App {
             .as_deref()
             .map(crate::anchor::locate_quotes)
             .unwrap_or_default();
-        self.quote_stamps = crate::anchor::stamp_quotes(&*self.backend, &located);
+        // Stamp against the view the tour was written from, which may be one
+        // narrowed revision rather than the whole range.
+        let lens = self
+            .lens()
+            .unwrap_or_else(|| crate::anchor::Lens::range(&*self.backend));
+        self.quote_stamps = crate::anchor::stamp_quotes(&*self.backend, &lens, &located);
         self.rebuild_file_rows();
         self.persist_soon();
         link::Response::ok()
