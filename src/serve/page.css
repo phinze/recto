@@ -64,10 +64,33 @@ details.revs li:first-child .rev-sum { color: var(--subtext); font-style: italic
 .rev-when { color: var(--overlay0); white-space: nowrap; }
 .rev-stat { white-space: nowrap; min-width: 11ch; text-align: right; }
 .landed { color: var(--teal); border: 1px solid var(--teal); border-radius: 8px; padding: 0 6px; font-size: 10px; opacity: 0.8; }
-.narrowed { margin: 4px 0 10px; padding: 6px 10px; border-radius: 6px; background: var(--mantle); border-left: 2px solid var(--mauve); font-size: 13px; }
-.narrowed button { font: 11px var(--mono); color: var(--text); background: var(--surface0); border: 0; border-radius: 10px; padding: 2px 8px; margin-left: 6px; cursor: pointer; }
-.narrowed button:hover { background: var(--surface1); }
 @media (max-width: 640px) { .rev-when { display: none; } }
+/* The stack. The bar names the view and steps through changes; it stays in
+   reach while a long diff scrolls, which is where a phone needs it. */
+.lensbar { position: sticky; top: 0; z-index: 6; display: flex; align-items: center; gap: 8px; margin: 6px 0 4px; padding: 6px 8px;
+  background: var(--mantle); border: 1px solid var(--surface0); border-radius: 8px; font: 12px var(--mono); color: var(--subtext); }
+.lensbar .crumbs { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.lensbar b { color: var(--text); font-weight: 600; }
+.lensbar code { color: var(--blue); }
+.lensbar .lens-sum { font-family: var(--sans); font-size: 13px; color: var(--text); }
+.lensbar .crumb { all: unset; cursor: pointer; color: var(--mauve); }
+.lensbar .crumb:hover { text-decoration: underline; }
+.lensbar .step { font: 15px var(--mono); line-height: 1; color: var(--text); background: var(--surface0); border: 0; border-radius: 6px;
+  min-width: 28px; min-height: 24px; cursor: pointer; touch-action: manipulation; }
+.lensbar .step:hover:not(:disabled) { background: var(--surface1); }
+.lensbar .step:disabled { opacity: 0.3; cursor: default; }
+details.revs li.layer > button.layer-head .rev-id { color: var(--peach); min-width: 12ch; font-weight: 600; }
+details.revs li.layer > button.layer-head .rev-sum { color: var(--subtext); font-family: var(--mono); font-size: 12px; }
+details.revs li.layer > ol { border-left: 0; margin: 0 0 0 10px; max-height: none; }
+details.revs li.layer > details.layer-fold { margin: 0 0 4px 10px; }
+details.revs li.layer > details.layer-fold > summary { cursor: pointer; color: var(--overlay0); padding: 2px 10px; }
+details.revs li.layer > details.layer-fold > ol { border-left: 0; max-height: none; }
+details.revs li.layer:first-child .rev-sum { font-style: normal; }
+/* The bar sticks under the tabs, and a file's own sticky bar under it. */
+.tabbed .lensbar { top: 37px; }
+section.repo:has(> .lensbar) details.file > summary { top: 40px; }
+.tabbed section.repo:has(> .lensbar) details.file > summary { top: 77px; }
+section.repo:has(> .lensbar) table.diff tr { scroll-margin-top: 126px; }
 .add { color: var(--green); }
 .del { color: var(--red); }
 .error { color: var(--red); background: var(--del-bg); padding: 8px 10px; border-radius: 6px; font: 13px var(--mono); }
@@ -252,8 +275,14 @@ figure.diagram p.diagram-error { color: var(--red); font: 12px var(--mono); whit
   .c-actions { gap: 8px; margin-top: 8px; }
   .c-actions button, .peer h3 .peer-send { font-size: 14px; min-height: 40px; padding: 0 16px; border-radius: 20px; }
   .c-hint { display: none; }
-  .expand-all, .narrowed button { font-size: 13px; min-height: 32px; padding: 0 12px; border-radius: 16px; }
+  .expand-all { font-size: 13px; min-height: 32px; padding: 0 12px; border-radius: 16px; }
   details.revs li button { padding: 9px 10px; }
+  .lensbar { padding: 6px; gap: 6px; }
+  .lensbar .step { min-width: 40px; min-height: 36px; font-size: 18px; border-radius: 10px; }
+  .tabbed .lensbar { top: 45px; }
+  section.repo:has(> .lensbar) details.file > summary { top: 52px; }
+  .tabbed section.repo:has(> .lensbar) details.file > summary { top: 97px; }
+  section.repo:has(> .lensbar) table.diff tr { scroll-margin-top: 150px; }
   #comment-pill { font-size: 15px; padding: 10px 18px; border-radius: 20px; }
   #back { font-size: 14px; padding: 10px 16px; border-radius: 20px; bottom: calc(16px + var(--safe-b)); }
   #composer { bottom: calc(12px + var(--safe-b)); width: calc(100vw - 20px); padding: 12px; }
@@ -298,6 +327,12 @@ tr.picked td.ln:first-child { box-shadow: inset 3px 0 0 var(--mauve), inset 0 0 
 .toc-path { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
 .toc-dir { color: var(--overlay0); }
 .toc-stat { font-size: 12px; white-space: nowrap; }
+.toc-list .toc-v { font: 13px var(--mono); padding-left: 28px !important; }
+.toc-list .toc-v .rev-id { min-width: 8ch; color: var(--blue); }
+.toc-list .toc-layer .rev-id { color: var(--peach); min-width: 12ch; }
+.toc-list .toc-change { padding-left: 40px !important; }
+.toc-list .toc-v.active { background: var(--surface0); }
+.toc-list .toc-v .toc-path { font-family: var(--sans); }
 @media (pointer: coarse), (max-width: 600px) {
   #toc-btn { display: flex; }
   /* Clear the contents button's corner. */

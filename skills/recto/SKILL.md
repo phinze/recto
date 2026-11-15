@@ -165,6 +165,9 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto tour-focus N           # show the tour, scrolled to section N
     recto tour-focus             # show the tour where it was left
     recto clear                  # remove the highlight and any annotations
+    recto lens CHANGE            # move the view to one change (a unique prefix will do)
+    recto lens layer:CHANGE      # move the view to the layer that change heads
+    recto lens                   # back to the whole stack
     recto comment-visibility hide # hide non-tour comments from the diff and file tree
     recto comment-visibility show # restore non-tour comments
     recto ping                   # is a recto listening here?
@@ -319,9 +322,20 @@ Under `rig serve`, the web view keeps a rig's landed work on the page. Once
 everything since the commit the rig started from is your own work on trunk
 (pushed straight to `main`, say), it diffs from that start instead of the
 empty branch point. Tour quotes resolve against that whole range, so a tour
-written before the push still reads after it. The page's revision list shows
-each commit in the range, marks the landed ones, and narrows to one when
-clicked.
+written before the push still reads after it.
+
+The window shows each repo as a stack. Bookmarks split its commits into
+layers, each a PR or one meant to be; unbookmarked work on top is "unpushed",
+and landed layers fold. A sticky bar names the view (the whole stack, one
+layer, or one change, with the layer it sits in) and steps older or newer
+through the changes in reading order. Paul picks a view by tapping a layer or
+a change, or from the phone's contents sheet. To put a view in front of him,
+use `recto lens`: the window follows it when it changes, the way it follows
+focus, until he picks a view of his own. Use it when the conversation is about
+one change or one layer of a stack ("look at the second PR"), and send him back
+to the whole stack with a bare `recto lens` when you're done. A spec that names
+nothing in the stack is refused. The terminal Recto moves to a change but has
+no layer view yet.
 
 The rule for which to write: in a multi-repo rig whose change spans repos,
 write one group tour. In a single-repo rig, or when the story really is one

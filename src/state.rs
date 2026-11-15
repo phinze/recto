@@ -90,6 +90,11 @@ struct Document {
     /// after they move.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     quotes: Vec<QuoteStamp>,
+    /// Where the agent last moved the view (`recto lens`): a change, a
+    /// `layer:CHANGE`, or absent for the whole stack. The window follows it
+    /// when it changes, the way it follows focus.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    lens: Option<String>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -126,6 +131,7 @@ impl Document {
             comments_visible: true,
             pull_request: None,
             quotes: Vec::new(),
+            lens: None,
         }
     }
 }
@@ -228,6 +234,14 @@ impl Store {
 
     pub fn set_tour(&mut self, tour: Option<&str>) {
         self.document.tour = tour.map(str::to_string);
+    }
+
+    pub fn lens(&self) -> Option<&str> {
+        self.document.lens.as_deref()
+    }
+
+    pub fn set_lens(&mut self, lens: Option<&str>) {
+        self.document.lens = lens.filter(|l| !l.is_empty()).map(str::to_string);
     }
 
     pub fn quotes(&self) -> &[QuoteStamp] {
@@ -580,6 +594,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         comments_visible: true,
         pull_request: None,
         quotes: Vec::new(),
+        lens: None,
     }))
 }
 

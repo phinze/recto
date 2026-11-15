@@ -183,6 +183,11 @@ pub trait Backend: Send + Sync {
     fn commits(&self, _from: &str, _to: &str) -> Result<Vec<Commit>> {
         Ok(Vec::new())
     }
+    /// The unified diff of a run of commits, from just below `bottom` to
+    /// `top`: one layer of a stack, the way a PR made of it reads.
+    fn diff_span(&self, _bottom: &str, _top: &str) -> Result<String> {
+        Err(anyhow!("this backend can't diff a span of commits"))
+    }
     /// The change that last touched each line of `path` at `rev`, one entry
     /// per line. `None` where the backend can't say, which leaves anchors
     /// reading their lines against the current view.
@@ -221,6 +226,10 @@ pub struct Commit {
     pub change: String,
     /// Another visible commit shares this change id.
     pub divergent: bool,
+    /// Local bookmarks (jj) or branch decorations (git) on this commit. A
+    /// bookmark marks the head of a layer in the stack: a PR, or one meant
+    /// to be.
+    pub bookmarks: Vec<String>,
     pub summary: String,
     /// Already on trunk.
     pub landed: bool,
@@ -250,19 +259,21 @@ impl Commit {
     }
 }
 
-/// Rows of `id, change, divergent, empty, landed, email, added, removed, when, summary`
+/// Rows of `id, change, divergent, empty, landed, bookmarks, email, added,
+/// removed, when, summary`
 /// separated by 0x1f. A working copy with nothing in it and no description is
 /// where the next change will go, not a commit worth listing.
 fn parse_commits(out: &str, me: &str) -> Vec<Commit> {
     out.lines()
         .filter_map(|line| {
-            let f: Vec<&str> = line.splitn(10, '\x1f').collect();
+            let f: Vec<&str> = line.splitn(11, '\x1f').collect();
             let [
                 id,
                 change,
                 divergent,
                 empty,
                 landed,
+                bookmarks,
                 email,
                 added,
                 removed,
@@ -280,6 +291,7 @@ fn parse_commits(out: &str, me: &str) -> Vec<Commit> {
                 id: id.to_string(),
                 change: change.to_string(),
                 divergent: divergent == "d",
+                bookmarks: parse_refs(bookmarks, ','),
                 summary: summary.to_string(),
                 landed: landed == "l",
                 mine: !me.is_empty() && email.trim().eq_ignore_ascii_case(me),
@@ -644,18 +656,16 @@ impl Backend for JjBackend {
     }
 
     fn default_bases(&self) -> Vec<Base> {
-        // A named ancestor after the trunk fork point is a stacked branch
-        // boundary. Lead with it when unambiguous, then retain the trunk branch
-        // point as both fallback and an explicit wider choice in the picker.
+        // Open on the whole stack, from where it forks off trunk: the layers
+        // above are what a stack-shaped view navigates. A named ancestor
+        // after the fork point, the top layer's boundary, stays the next
+        // choice for looking at that layer alone.
         let trunk = Base::MergeBase {
             against: Box::new(Base::Revision("trunk()".into())),
         };
-        let mut bases = vec![
-            self.bookmarked_stack_base()
-                .unwrap_or_else(|| trunk.clone()),
-        ];
-        if bases[0] != trunk {
-            bases.push(trunk);
+        let mut bases = vec![trunk.clone()];
+        if let Some(layer) = self.bookmarked_stack_base() {
+            bases.push(layer);
         }
         bases.extend([
             Base::Revision("@-".into()),
@@ -672,6 +682,17 @@ impl Backend for JjBackend {
 
     fn commit_id(&self, rev: &str) -> Option<String> {
         Some(self.resolve_commit_id(rev)).filter(|id| !id.is_empty())
+    }
+
+    fn diff_span(&self, bottom: &str, top: &str) -> Result<String> {
+        self.run(&[
+            "diff",
+            "--git",
+            "--from",
+            &format!("{bottom}-"),
+            "--to",
+            top,
+        ])
     }
 
     fn annotate(&self, rev: &str, path: &str) -> Option<Vec<String>> {
@@ -769,7 +790,7 @@ impl Backend for JjBackend {
             &format!("({from})..({to})"),
             "--no-graph",
             "-T",
-            "commit_id ++ \"\\x1f\" ++ change_id ++ \"\\x1f\" ++ if(divergent, \"d\") ++ \"\\x1f\" ++ if(empty, \"e\") ++ \"\\x1f\" ++ if(self.contained_in(\"::trunk()\"), \"l\") ++ \"\\x1f\" ++ author.email() ++ \"\\x1f\" ++ self.diff().stat().total_added() ++ \"\\x1f\" ++ self.diff().stat().total_removed() ++ \"\\x1f\" ++ committer.timestamp().ago() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"",
+            "commit_id ++ \"\\x1f\" ++ change_id ++ \"\\x1f\" ++ if(divergent, \"d\") ++ \"\\x1f\" ++ if(empty, \"e\") ++ \"\\x1f\" ++ if(self.contained_in(\"::trunk()\"), \"l\") ++ \"\\x1f\" ++ local_bookmarks.map(|b| b.name()).join(\",\") ++ \"\\x1f\" ++ author.email() ++ \"\\x1f\" ++ self.diff().stat().total_added() ++ \"\\x1f\" ++ self.diff().stat().total_removed() ++ \"\\x1f\" ++ committer.timestamp().ago() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"",
         ])?;
         Ok(parse_commits(&out, &me))
     }
@@ -1063,12 +1084,16 @@ impl Backend for GitBackend {
             .is_ok()
     }
 
+    fn diff_span(&self, bottom: &str, top: &str) -> Result<String> {
+        self.run(&["diff", &format!("{bottom}^"), top])
+    }
+
     fn commits(&self, from: &str, to: &str) -> Result<Vec<Commit>> {
         let me = user_email("git", &["config", "user.email"], &self.repo_root);
         let range = format!("{from}..{to}");
         let out = self.run(&[
             "log",
-            "--format=%x1e%H%x1f%h%x1f%ae%x1f%cr%x1f%s",
+            "--format=%x1e%H%x1f%h%x1f%ae%x1f%cr%x1f%D%x1f%s",
             "--numstat",
             &range,
         ])?;
@@ -1087,8 +1112,8 @@ impl Backend for GitBackend {
         let mut rows = String::new();
         for record in out.split('\x1e').filter(|r| !r.trim().is_empty()) {
             let (head, stats) = record.split_once('\n').unwrap_or((record, ""));
-            let f: Vec<&str> = head.splitn(5, '\x1f').collect();
-            let [id, _short, email, when, summary] = f[..] else {
+            let f: Vec<&str> = head.splitn(6, '\x1f').collect();
+            let [id, _short, email, when, decorations, summary] = f[..] else {
                 continue;
             };
             let (mut added, mut removed, mut files) = (0u32, 0u32, 0);
@@ -1104,6 +1129,11 @@ impl Backend for GitBackend {
                 "",
                 if files == 0 { "e" } else { "" },
                 if unlanded.contains(id) { "" } else { "l" },
+                &parse_refs(decorations, ',')
+                    .into_iter()
+                    .filter(|r| !r.starts_with("tag: "))
+                    .collect::<Vec<_>>()
+                    .join(","),
                 email,
                 &added.to_string(),
                 &removed.to_string(),
@@ -1439,7 +1469,7 @@ mod tests {
     }
 
     #[test]
-    fn jj_default_base_prefers_the_nearest_bookmarked_stack_boundary() {
+    fn jj_layer_base_prefers_the_nearest_bookmarked_stack_boundary() {
         let repo = TempRepo::new("jj-stacked-base");
         repo.run("jj", &["git", "init", "--colocate", "."]);
         std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
@@ -1453,7 +1483,13 @@ mod tests {
         std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
 
         let backend = JjBackend::new(repo.0.clone());
-        let base = backend.default_bases().remove(0);
+        let whole = backend.default_bases().remove(0);
+        assert_eq!(
+            backend.base_label(&whole),
+            "fork_point(trunk() | @)",
+            "the default view is the whole stack"
+        );
+        let base = backend.default_bases().remove(1);
         assert_eq!(backend.base_label(&base), "fork_point(stack-base | @)");
         let changes = backend
             .list_changes(&Scope::Range(base), false)
@@ -1468,7 +1504,7 @@ mod tests {
     }
 
     #[test]
-    fn jj_default_base_skips_the_branchs_own_bookmark_under_an_empty_change() {
+    fn jj_layer_base_skips_the_branchs_own_bookmark_under_an_empty_change() {
         // A pushed branch with a fresh, empty change on top: its own bookmark
         // is on @-, and the diff should still be the branch, not nothing.
         let repo = TempRepo::new("jj-own-bookmark");
@@ -1483,7 +1519,7 @@ mod tests {
         repo.run("jj", &["new"]);
 
         let backend = JjBackend::new(repo.0.clone());
-        let base = backend.default_bases().remove(0);
+        let base = backend.default_bases().remove(1);
         let changes = backend
             .list_changes(&Scope::Range(base), false)
             .expect("load the branch");
@@ -1494,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn jj_default_base_finds_the_layer_below_a_pushed_top_branch() {
+    fn jj_layer_base_finds_the_layer_below_a_pushed_top_branch() {
         let repo = TempRepo::new("jj-own-bookmark-stack");
         repo.run("jj", &["git", "init", "--colocate", "."]);
         std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
@@ -1511,7 +1547,7 @@ mod tests {
         repo.run("jj", &["new"]);
 
         let backend = JjBackend::new(repo.0.clone());
-        let base = backend.default_bases().remove(0);
+        let base = backend.default_bases().remove(1);
         assert_eq!(backend.base_label(&base), "fork_point(lower | @)");
         let changes = backend
             .list_changes(&Scope::Range(base), false)
@@ -1523,7 +1559,7 @@ mod tests {
     }
 
     #[test]
-    fn jj_default_base_uses_the_name_of_an_unsynced_bookmark() {
+    fn jj_layer_base_uses_the_name_of_an_unsynced_bookmark() {
         let repo = TempRepo::new("jj-unsynced-stack-base");
         repo.run("jj", &["git", "init", "--colocate", "."]);
         std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
@@ -1550,7 +1586,7 @@ mod tests {
         std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
 
         let backend = JjBackend::new(repo.0.clone());
-        let base = backend.default_bases().remove(0);
+        let base = backend.default_bases().remove(1);
         assert_eq!(backend.base_label(&base), "fork_point(stack-base | @)");
         let changes = backend
             .list_changes(&Scope::Range(base), false)
@@ -1565,7 +1601,7 @@ mod tests {
     }
 
     #[test]
-    fn jj_default_base_uses_a_tracked_bookmark_when_its_local_copy_diverged() {
+    fn jj_layer_base_uses_a_tracked_bookmark_when_its_local_copy_diverged() {
         let repo = TempRepo::new("jj-tracked-stack-base");
         repo.run("jj", &["git", "init", "--colocate", "."]);
         std::fs::write(repo.0.join("trunk.txt"), "trunk\n").unwrap();
@@ -1592,7 +1628,7 @@ mod tests {
         std::fs::write(repo.0.join("top.txt"), "top layer\n").unwrap();
 
         let backend = JjBackend::new(repo.0.clone());
-        let base = backend.default_bases().remove(0);
+        let base = backend.default_bases().remove(1);
         assert_eq!(
             backend.base_label(&base),
             "fork_point(stack-base@origin | @)"

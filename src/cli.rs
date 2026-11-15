@@ -99,6 +99,10 @@ pub(crate) enum ClientCommand {
     TourFocus { section: Option<usize> },
     /// Clear any active focus highlight and annotations in the running recto.
     Clear,
+    /// Move the view: a change (a unique prefix will do), `layer:CHANGE` for
+    /// the layer that change heads, or nothing for the whole stack. The web
+    /// window follows it the way it follows focus.
+    Lens { spec: Option<String> },
     /// Control visibility of published threads, shared drafts, and private
     /// notes without affecting tour annotations.
     CommentVisibility {
@@ -476,6 +480,7 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
                 return crate::serve::save_focus_offline(path, *start, *end);
             }
             link::Request::Clear => return crate::serve::save_clear_offline(),
+            link::Request::Lens { spec } => return crate::serve::save_lens_offline(spec),
             _ => {}
         }
     }
@@ -689,6 +694,9 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         }
         ClientCommand::TourFocus { section } => Ok(link::Request::TourFocus { section: *section }),
         ClientCommand::Clear => Ok(link::Request::Clear),
+        ClientCommand::Lens { spec } => Ok(link::Request::Lens {
+            spec: spec.clone().unwrap_or_default(),
+        }),
         ClientCommand::CommentVisibility { action } => Ok(link::Request::CommentVisibility {
             visible: match action {
                 VisibilityAction::Show => Some(true),

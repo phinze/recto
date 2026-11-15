@@ -911,16 +911,23 @@ fn render_workspace(
         .base_commit(&base)
         .and_then(|from| backend.commits(&from, backend.head_rev()).ok())
         .unwrap_or_default();
-    // A view names a change, so it follows the change through a rewrite. A
-    // commit id still matches, for views picked before views were changes.
-    let narrowed = view.and_then(|v| commits.iter().find(|c| c.target() == v || c.id == v));
-    let shown = match narrowed {
-        Some(c) => parse_diff(
+    // The view names a change or a layer by change, so it follows its work
+    // through a rewrite. The reader's own pick wins; without one, the page
+    // shows the view the agent last moved it to.
+    let agent_lens = store.as_ref().and_then(|s| s.lens().map(str::to_string));
+    let lens_view = crate::stack::view(&commits, view.or(agent_lens.as_deref()));
+    let shown = match &lens_view {
+        crate::stack::View::Change(c) => parse_diff(
             &backend
                 .unified_diff(&Scope::Rev(c.id.clone()), false)
                 .context("diff failed")?,
         ),
-        None => Vec::new(),
+        crate::stack::View::Layer(l) => parse_diff(
+            &backend
+                .diff_span(&l.bottom().id, &l.head().id)
+                .context("diff failed")?,
+        ),
+        crate::stack::View::Stack => Vec::new(),
     };
     let (added, removed) = files
         .iter()
@@ -1013,12 +1020,21 @@ fn render_workspace(
         review_card(r, &files, out);
     }
     let drafts: &[link::DraftReviewComment] = review.as_ref().map_or(&[], |r| &r.comments);
+    // Where the agent last moved the view, for the page to follow when it
+    // changes, the way it follows focus.
+    if store.is_some() {
+        let _ = write!(
+            out,
+            "<i class=lens-marker hidden data-lens=\"{index}:{}\"></i>",
+            esc(agent_lens.as_deref().unwrap_or(""))
+        );
+    }
     if commits.len() > 1 {
         let head = backend.commit_id(backend.head_rev());
-        render_revisions(
+        render_stack(
             index,
             &commits,
-            narrowed.map(|c| c.id.as_str()),
+            &lens_view,
             head.as_deref(),
             anchor.label.is_some(),
             (added, removed),
@@ -1064,15 +1080,12 @@ fn render_workspace(
             },
         );
     }
-    if let Some(c) = narrowed {
-        let _ = write!(
-            out,
-            "<div class=narrowed>Showing <code>{}</code> {} alone. <button type=button data-view=\"{index}:\">show all changes</button></div>",
-            esc(c.short_change()),
-            esc(&c.summary)
-        );
+    if !matches!(lens_view, crate::stack::View::Stack) {
         if shown.is_empty() {
-            out.push_str("<p class=empty>This commit changes no files.</p>");
+            out.push_str(match lens_view {
+                crate::stack::View::Layer(_) => "<p class=empty>This layer changes no files.</p>",
+                _ => "<p class=empty>This commit changes no files.</p>",
+            });
         } else {
             render_files(index, &shown, &[], &mut budget, out);
         }
@@ -1154,23 +1167,121 @@ pub(crate) fn anchor(
 
 /// The commits in the page's range, newest first. Picking one narrows the
 /// file list to that commit; the first row goes back to the whole range.
-fn render_revisions(
+/// The stack: a sticky bar naming the view with a step to the change on
+/// either side, then the layers, each a PR or one meant to be, with their
+/// commits. A stack with one layer lists its commits as before. Landed
+/// layers fold, since their work is done.
+fn render_stack(
     index: usize,
     commits: &[Commit],
-    narrowed: Option<&str>,
+    view: &crate::stack::View,
     head: Option<&str>,
     from_start: bool,
     (added, removed): (u32, u32),
     out: &mut String,
 ) {
-    // The range's own totals, not the commits' sum: a line one commit adds
-    // and a later one rewrites counts once in the range.
-    let landed = commits.iter().filter(|c| c.landed).count();
+    use crate::stack::View;
+    let layers = crate::stack::layers(commits);
+    let layer_of = |c: &Commit| layers.iter().find(|l| l.contains(c));
+
+    // The bar: where the view is, and a step older or newer through the
+    // changes in reading order. Stepping off the newest comes back to the
+    // whole stack, and off the whole stack starts at the oldest.
+    let order: Vec<&Commit> = crate::stack::reading_order(commits).collect();
+    let at = match view {
+        View::Change(c) => order.iter().position(|o| o.id == c.id),
+        _ => None,
+    };
+    let older = match (view, at) {
+        (View::Change(_), Some(0)) | (View::Stack, _) => None,
+        (View::Change(_), Some(i)) => Some(order[i - 1].target().to_string()),
+        (View::Layer(l), _) => order
+            .iter()
+            .position(|o| o.id == l.bottom().id)
+            .and_then(|i| i.checked_sub(1))
+            .map(|i| order[i].target().to_string()),
+        _ => None,
+    };
+    let newer = match (view, at) {
+        (View::Stack, _) => order.first().map(|o| o.target().to_string()),
+        (View::Change(_), Some(i)) => Some(
+            order
+                .get(i + 1)
+                .map(|o| o.target().to_string())
+                .unwrap_or_default(),
+        ),
+        (View::Layer(l), _) => order
+            .iter()
+            .position(|o| o.id == l.head().id)
+            .and_then(|i| order.get(i + 1))
+            .map(|o| o.target().to_string()),
+        _ => None,
+    };
+    let crumb = match view {
+        View::Stack => format!(
+            "<b>whole stack</b><span class=dim> · {} commit{}{}</span>",
+            commits.len(),
+            if commits.len() == 1 { "" } else { "s" },
+            if layers.len() > 1 {
+                format!(" · {} layers", layers.len())
+            } else {
+                String::new()
+            }
+        ),
+        View::Layer(l) => format!(
+            "<button type=button class=crumb data-view=\"{index}:\">stack</button> › <b>{}</b><span class=dim> · {} commit{}</span>",
+            esc(&l.label()),
+            l.commits.len(),
+            if l.commits.len() == 1 { "" } else { "s" }
+        ),
+        View::Change(c) => {
+            let layer = layer_of(c).filter(|_| layers.len() > 1);
+            format!(
+                "<button type=button class=crumb data-view=\"{index}:\">stack</button> › {}<code>{}</code> <span class=lens-sum>{}</span>",
+                layer
+                    .map(|l| format!(
+                        "<button type=button class=crumb data-view=\"{index}:{}\">{}</button> › ",
+                        esc(&l.view()),
+                        esc(&l.label())
+                    ))
+                    .unwrap_or_default(),
+                esc(c.short_change()),
+                esc(if c.summary.is_empty() {
+                    "(no description)"
+                } else {
+                    &c.summary
+                })
+            )
+        }
+    };
+    let step = |label: &str, glyph: &str, target: Option<String>| match target {
+        Some(t) => format!(
+            "<button type=button class=step data-view=\"{index}:{}\" aria-label=\"{label}\" title=\"{label}\">{glyph}</button>",
+            esc(&t)
+        ),
+        None => format!(
+            "<button type=button class=step disabled aria-label=\"{label}\">{glyph}</button>"
+        ),
+    };
     let _ = write!(
         out,
-        "<details class=revs id=\"revs-{index}\"{}><summary>{} commits{}</summary><ol>",
-        if narrowed.is_some() { " open" } else { "" },
+        "<div class=lensbar>{}<span class=crumbs>{crumb}</span>{}</div>",
+        step("older change", "‹", older),
+        step("newer change", "›", newer),
+    );
+
+    let landed = commits.iter().filter(|c| c.landed).count();
+    let narrowed = !matches!(view, View::Stack);
+    let _ = write!(
+        out,
+        "<details class=revs id=\"revs-{index}\"{}><summary>{} commits{}{}</summary><ol>",
+        if narrowed { " open" } else { "" },
         commits.len(),
+        if layers.len() > 1 {
+            format!(" in {} layers", layers.len())
+        } else {
+            String::new()
+        },
         if landed == 0 {
             String::new()
         } else if landed == commits.len() {
@@ -1181,12 +1292,8 @@ fn render_revisions(
     );
     let _ = write!(
         out,
-        "<li><button type=button data-view=\"{index}:\"{}><span class=rev-id></span><span class=rev-sum>all changes {}</span>{}</button></li>",
-        if narrowed.is_none() {
-            " class=active"
-        } else {
-            ""
-        },
+        "<li><button type=button data-view=\"{index}:\"{}><span class=rev-id></span><span class=rev-sum>whole stack {}</span>{}</button></li>",
+        if narrowed { "" } else { " class=active" },
         if from_start {
             "since the rig started"
         } else {
@@ -1194,16 +1301,13 @@ fn render_revisions(
         },
         rev_stat(added, removed),
     );
-    for c in commits {
+    let row = |c: &Commit, out: &mut String| {
+        let active = matches!(view, View::Change(v) if v.id == c.id);
         let _ = write!(
             out,
             "<li><button type=button data-view=\"{index}:{}\"{}{}><span class=rev-id>{}</span><span class=rev-sum>{}</span>{}<span class=rev-when>{}</span>{}</button></li>",
             esc(c.target()),
-            if narrowed == Some(c.id.as_str()) {
-                " class=active"
-            } else {
-                ""
-            },
+            if active { " class=active" } else { "" },
             if c.mine { "" } else { " data-foreign" },
             esc(c.short_change()),
             match (c.summary.is_empty(), head == Some(c.id.as_str())) {
@@ -1220,6 +1324,58 @@ fn render_revisions(
             esc(&c.when),
             rev_stat(c.added, c.removed),
         );
+    };
+    if layers.len() <= 1 {
+        for c in commits {
+            row(c, out);
+        }
+    } else {
+        for layer in &layers {
+            let active = matches!(view, View::Layer(v) if v.head().id == layer.head().id);
+            let (a, r) = layer
+                .commits
+                .iter()
+                .fold((0, 0), |(a, r), c| (a + c.added, r + c.removed));
+            let _ = write!(
+                out,
+                "<li class=layer><button type=button class=\"layer-head{}\" data-view=\"{index}:{}\"><span class=rev-id>{}</span><span class=rev-sum>{} commit{}</span>{}{}</button>",
+                if active { " active" } else { "" },
+                esc(&layer.view()),
+                esc(&layer.label()),
+                layer.commits.len(),
+                if layer.commits.len() == 1 { "" } else { "s" },
+                if layer.landed() {
+                    "<span class=landed>landed</span>"
+                } else {
+                    ""
+                },
+                rev_stat(a, r),
+            );
+            // A landed layer folds unless the view is inside it.
+            let inside = match view {
+                View::Change(c) => layer.contains(c),
+                View::Layer(v) => v.head().id == layer.head().id,
+                View::Stack => false,
+            };
+            if layer.landed() && !inside {
+                let _ = write!(
+                    out,
+                    "<details class=layer-fold><summary>{} landed commit{}</summary><ol>",
+                    layer.commits.len(),
+                    if layer.commits.len() == 1 { "" } else { "s" }
+                );
+            } else {
+                out.push_str("<ol>");
+            }
+            for c in layer.commits {
+                row(c, out);
+            }
+            out.push_str(if layer.landed() && !inside {
+                "</ol></details></li>"
+            } else {
+                "</ol></li>"
+            });
+        }
     }
     out.push_str("</ol></details>");
 }
@@ -1342,6 +1498,52 @@ pub(crate) fn save_focus_offline(path: &str, start: Option<u32>, end: Option<u32
 
 /// `recto clear` with no viewer listening: drop the saved focus and
 /// annotations, leaving notes and the tour alone as a viewer does.
+/// Move the view with no viewer running: the window follows the saved lens.
+/// A spec that names nothing in the stack is refused, so a typo doesn't
+/// quietly leave the window on the whole stack.
+pub(crate) fn save_lens_offline(spec: &str) -> i32 {
+    let result = (|| -> Result<std::result::Result<(), String>> {
+        let backend = crate::backend::detect_backend()?;
+        let mut store = state::Store::load(backend.root(), None)?;
+        let spec = spec.trim();
+        if !spec.is_empty() {
+            let base = view_base(backend.as_ref(), store.pull_request())?;
+            let anchored = anchor(
+                backend.as_ref(),
+                &base,
+                rig_start(backend.root()).as_deref(),
+                false,
+            );
+            let commits = backend
+                .base_commit(&anchored.base)
+                .and_then(|from| backend.commits(&from, backend.head_rev()).ok())
+                .unwrap_or_default();
+            if matches!(
+                crate::stack::view(&commits, Some(spec)),
+                crate::stack::View::Stack
+            ) {
+                return Ok(Err(format!(
+                    "{spec} names no change or layer in this stack (a change id or unique prefix, or layer:CHANGE)"
+                )));
+            }
+        }
+        store.set_lens(Some(spec));
+        store.save()?;
+        Ok(Ok(()))
+    })();
+    match result {
+        Ok(Ok(())) => 0,
+        Ok(Err(refusal)) => {
+            eprintln!("recto: {refusal}");
+            1
+        }
+        Err(e) => {
+            eprintln!("recto: {e:#}");
+            2
+        }
+    }
+}
+
 pub(crate) fn save_clear_offline() -> i32 {
     let result = (|| -> Result<()> {
         let backend = crate::backend::detect_backend()?;
@@ -2335,6 +2537,107 @@ mod tests {
         assert_eq!(lines[3].new, Some(3));
         assert_eq!(files[1].status, 'A');
         assert_eq!(files[1].hunks[0].lines[0].new, Some(1));
+    }
+
+    /// a → b [first] → c → d [second] → e, then an empty @: three layers.
+    fn layered_repo() -> (
+        crate::testing::TempRepo,
+        std::collections::HashMap<&'static str, String>,
+    ) {
+        let repo = crate::testing::TempRepo::new("serve-layers");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        let mut changes = std::collections::HashMap::new();
+        for (name, bookmark) in [
+            ("a", None),
+            ("b", Some("first")),
+            ("c", None),
+            ("d", Some("second")),
+            ("e", None),
+        ] {
+            std::fs::write(repo.0.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
+            repo.run("jj", &["describe", "-m", name]);
+            if let Some(b) = bookmark {
+                repo.run("jj", &["bookmark", "create", b, "-r", "@"]);
+            }
+            changes.insert(
+                name,
+                repo.out("jj", &["log", "-r", "@", "--no-graph", "-T", "change_id"]),
+            );
+            repo.run("jj", &["new"]);
+        }
+        (repo, changes)
+    }
+
+    /// The stack shows its layers, a layer view diffs just that layer, and a
+    /// change view steps to its neighbours in reading order, naming the
+    /// layer it sits in.
+    #[test]
+    fn the_window_shows_a_stack_of_layers_and_steps_through_its_changes() {
+        let (repo, c) = layered_repo();
+        let root = repo.0.to_string_lossy().to_string();
+
+        let (whole, _) = workspace(0, &root, None, None, usize::MAX);
+        assert!(whole.contains("<b>whole stack</b>"), "{whole}");
+        assert!(whole.contains("5 commits in 3 layers"), "{whole}");
+        for layer in ["second", "first", "unpushed"] {
+            assert!(
+                whole.contains(&format!("<span class=rev-id>{layer}</span>")),
+                "{layer}: {whole}"
+            );
+        }
+        assert!(
+            whole.contains(&format!(
+                "data-view=\"0:{}\" aria-label=\"newer change\"",
+                c["a"]
+            )),
+            "from the whole stack, stepping starts at the oldest change: {whole}"
+        );
+
+        let (layer, _) = workspace(
+            0,
+            &root,
+            None,
+            Some(&format!("layer:{}", c["d"])),
+            usize::MAX,
+        );
+        assert!(layer.contains("› <b>second</b>"), "{layer}");
+        assert!(
+            layer.contains("data-path=\"c.txt\"") && layer.contains("data-path=\"d.txt\""),
+            "{layer}"
+        );
+        assert!(
+            !layer.contains("data-path=\"b.txt\"") && !layer.contains("data-path=\"e.txt\""),
+            "only the layer's own files: {layer}"
+        );
+
+        let (change, _) = workspace(0, &root, None, Some(&c["c"][..6]), usize::MAX);
+        assert!(
+            change.contains(&format!(
+                "data-view=\"0:layer:{}\">second</button> › <code>",
+                c["d"]
+            )),
+            "{change}"
+        );
+        assert!(
+            change.contains(&format!(
+                "data-view=\"0:{}\" aria-label=\"older change\"",
+                c["b"]
+            )),
+            "{change}"
+        );
+        assert!(
+            change.contains(&format!(
+                "data-view=\"0:{}\" aria-label=\"newer change\"",
+                c["d"]
+            )),
+            "{change}"
+        );
+
+        let (newest, _) = workspace(0, &root, None, Some(&c["e"]), usize::MAX);
+        assert!(
+            newest.contains("data-view=\"0:\" aria-label=\"newer change\""),
+            "stepping past the newest change comes back to the whole stack: {newest}"
+        );
     }
 
     /// A bare URL anywhere in prose becomes a link, as on GitHub, without

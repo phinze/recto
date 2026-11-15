@@ -418,6 +418,8 @@ pub(crate) struct App {
     /// Stamps for the tour's quotes, so each lifts the lines it was written
     /// about after they move.
     pub(crate) quote_stamps: Vec<crate::anchor::QuoteStamp>,
+    /// Where the agent last moved the view, saved for the window to follow.
+    pub(crate) lens: Option<String>,
     /// A section a companion asked for before the tour page had geometry to
     /// resolve it against. Spent by the next draw.
     pub(crate) tour_pending_section: Option<usize>,
@@ -608,6 +610,9 @@ impl App {
             .as_ref()
             .map(|store| store.quotes().to_vec())
             .unwrap_or_default();
+        let lens = persistence
+            .as_ref()
+            .and_then(|store| store.lens().map(str::to_string));
         let (annotations, restored_focus, show_comments) = persistence
             .as_ref()
             .map(|store| {
@@ -646,6 +651,7 @@ impl App {
             tour_body_area: Rect::default(),
             tour_anchors,
             quote_stamps,
+            lens,
             tour_pending_section: None,
             quote_return: None,
             review_scroll: 0,
@@ -1444,14 +1450,8 @@ mod tests {
                 .ok
         );
         assert!(
-            app.add_review_draft_comment(
-                "foo.go",
-                111,
-                None,
-                "hm".into(),
-                link::DraftEditor::User
-            )
-            .ok
+            app.add_review_draft_comment("foo.go", 111, None, "hm".into(), link::DraftEditor::User)
+                .ok
         );
         assert!(
             app.review_draft_comments[0].pin.stamp.is_none(),

@@ -95,8 +95,9 @@
   let tab = null;
   try { tab = sessionStorage.getItem(tabKey); } catch {}
 
-  // A repo narrowed to one commit, by index: what the revision list picked.
-  // The server renders whatever the fragment request asks for.
+  // The view the reader picked per repo, by index: a change, a layer, or ''
+  // for the whole stack. With no pick, the server shows the view the agent
+  // last moved it to (recto lens).
   const viewKey = 'recto-views:' + location.pathname + qs;
   let views = new Map();
   try { views = new Map(JSON.parse(sessionStorage.getItem(viewKey) || '[]')); } catch {}
@@ -115,8 +116,8 @@
   let pendingFocus = null;
   function widenFor(spec) {
     const ri = spec.split(':')[0];
-    if (!views.has(ri) || spanRows(spec).length) return false;
-    views.delete(ri);
+    if (!views.get(ri) || spanRows(spec).length) return false;
+    views.set(ri, '');
     saveViews();
     pendingFocus = spec;
     refresh();
@@ -202,6 +203,26 @@
     }
     highlight();
     return moved;
+  }
+
+  // Follow the agent's view the way focus is followed: a lens marker that
+  // changed since this page last looked drops the reader's own pick for that
+  // repo, so the server shows where the agent moved it. On the first look it
+  // does nothing; a reader with no pick already sees the agent's view.
+  const lenses = new Map();
+  function syncLenses(initial) {
+    let moved = false;
+    for (const m of content.querySelectorAll('.lens-marker')) {
+      const [ri, ...rest] = m.dataset.lens.split(':');
+      const spec = rest.join(':');
+      const changed = lenses.has(ri) && lenses.get(ri) !== spec;
+      lenses.set(ri, spec);
+      if (changed && !initial && views.has(ri)) {
+        views.delete(ri);
+        moved = true;
+      }
+    }
+    if (moved) { saveViews(); refresh(); }
   }
 
   back.addEventListener('click', () => {
@@ -312,6 +333,7 @@
     applyTab();
     syncExpandButtons();
     const moved = syncMarkers(false);
+    syncLenses(false);
     // Asks get their answer boxes and drafts back before the reader's place
     // is measured again, since they change the page's height.
     decorate();
@@ -362,8 +384,9 @@
     const pick = e.target.closest('button[data-view]');
     if (pick) {
       const [ri, ...rest] = pick.dataset.view.split(':');
-      const spec = rest.join(':');
-      if (spec) views.set(ri, spec); else views.delete(ri);
+      // An explicit pick, the whole stack included, holds until the agent
+      // moves the view again.
+      views.set(ri, rest.join(':'));
       saveViews();
       pick.classList.add('pending');
       refresh();
@@ -396,6 +419,7 @@
   applyTab();
   syncExpandButtons();
   syncMarkers(true);
+  syncLenses(true);
   if (views.size) refresh();
 
   // EventSource retries a dropped connection by itself, but gives up for good
@@ -876,6 +900,19 @@
         + `<span class=toc-stat>${add ? `<span class=add>${escHTML(add.textContent)}</span> ` : ''}${del ? `<span class=del>${escHTML(del.textContent)}</span>` : ''}</span></button>`;
     }).join('');
   }
+  // The stack's views, so a phone can move between the whole stack, a layer
+  // and a change from the sheet. Each picks the same view its row does.
+  function tocStack(scope) {
+    const rows = [...scope.querySelectorAll('details.revs button[data-view]')];
+    if (!rows.length) return '';
+    return '<div class=toc-stack>' + rows.map((b) => {
+      const id = b.querySelector('.rev-id')?.textContent || '';
+      const sum = b.querySelector('.rev-sum')?.textContent || '';
+      const cls = b.classList.contains('layer-head') ? 'toc-layer' : id ? 'toc-change' : 'toc-whole';
+      return `<button type=button class="toc-v ${cls}${b.classList.contains('active') ? ' active' : ''}" data-pick="${escHTML(b.dataset.view)}">`
+        + `<span class=rev-id>${escHTML(id)}</span><span class=toc-path>${escHTML(sum)}</span></button>`;
+    }).join('') + '</div>';
+  }
   function buildToc() {
     let html = '';
     const brief = content.querySelector('details.group-brief');
@@ -888,7 +925,7 @@
       : [...content.querySelectorAll('section.repo')].map((sec) => [sec, sec.dataset.repo || '']);
     for (const [sec, name] of sections) {
       if (!sec) continue;
-      html += `<button type=button class=toc-top data-goto="${escHTML(sec.id)}">${escHTML(String(name).trim())}</button>` + tocHeadings(sec) + tocFiles(sec);
+      html += `<button type=button class=toc-top data-goto="${escHTML(sec.id)}">${escHTML(String(name).trim())}</button>` + tocStack(sec) + tocHeadings(sec) + tocFiles(sec);
     }
     tocList.innerHTML = html || '<p class=dim>Nothing on this page to jump to.</p>';
   }
@@ -917,6 +954,13 @@
   tocBtn.addEventListener('click', openToc);
   toc.addEventListener('click', (e) => {
     if (e.target === toc || e.target.closest('.toc-close')) return closeToc();
+    const pick = e.target.closest('[data-pick]');
+    if (pick) {
+      closeToc();
+      const row = content.querySelector(`button[data-view="${CSS.escape(pick.dataset.pick)}"]`);
+      if (row) row.click();
+      return;
+    }
     const go = e.target.closest('[data-goto]');
     if (!go) return;
     closeToc();

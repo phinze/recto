@@ -13,8 +13,8 @@ use ratatui::text::Line;
 
 use crate::anchor::{Lens, Pin, Resolution, Resolver, Stamp};
 use crate::app::{
-    AgentNote, Annotation, App, ComposerEdit, ComposerKind, FileReviewObject, Focus, FocusAnchor,
-    FocusSpan, Mode, NoteDraft, Page, SCROLLOFF, STATE_DEBOUNCE,
+    AgentNote, Annotation, App, ComposerEdit, ComposerKind, Cursor, FileReviewObject, Focus,
+    FocusAnchor, FocusSpan, Mode, NoteDraft, Page, SCROLLOFF, STATE_DEBOUNCE,
 };
 use crate::backend::{Base, Scope, short_oid};
 use crate::ui::diff::{
@@ -178,6 +178,48 @@ impl App {
         }
     }
 
+    /// Move the view where the agent points: the whole range, or one change.
+    /// The terminal has no layer view yet, so a layer only moves the window,
+    /// which follows the saved lens. Either way the lens is saved for it.
+    pub(crate) fn set_lens(&mut self, spec: String) -> link::Response {
+        let spec = spec.trim().to_string();
+        let mut note = None;
+        if spec.is_empty() {
+            self.cursor = Cursor::All;
+            self.request_current_scope();
+        } else if spec.starts_with("layer:") {
+            note = Some("the terminal has no layer view yet; the window shows it");
+        } else {
+            let exact = self
+                .revs
+                .iter()
+                .position(|r| r.target() == spec || r.id == spec);
+            let prefixed: Vec<usize> = self
+                .revs
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.is_in_range && r.change.starts_with(&spec))
+                .map(|(i, _)| i)
+                .collect();
+            let Some(i) = exact.or(match prefixed.as_slice() {
+                [one] => Some(*one),
+                _ => None,
+            }) else {
+                return link::Response::err(format!(
+                    "{spec} names no single change in this range (a change id or unique prefix, or layer:CHANGE)"
+                ));
+            };
+            self.cursor = Cursor::Rev(i);
+            self.request_current_scope();
+        }
+        self.lens = (!spec.is_empty()).then_some(spec);
+        self.persist_soon();
+        match note {
+            Some(note) => link::Response::ok_note(note),
+            None => link::Response::ok(),
+        }
+    }
+
     /// Resolve the draft comments' stamps against the loaded view on the
     /// spot, for drafts that appear without a load to resolve them.
     fn resolve_drafts_now(&mut self) {
@@ -258,6 +300,7 @@ impl App {
         let store = self.persistence.as_mut().expect("checked above");
         store.set_notes(&self.agent_notes, self.next_agent_note_id);
         store.set_tour(self.tour.as_deref());
+        store.set_lens(self.lens.as_deref());
         let named = self
             .tour
             .as_deref()
@@ -347,6 +390,7 @@ impl App {
                 link::Response::ok()
             }
             link::Request::CommentVisibility { visible } => self.set_comment_visibility(visible),
+            link::Request::Lens { spec } => self.set_lens(spec),
             link::Request::AgentNote {
                 path,
                 start,

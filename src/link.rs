@@ -54,6 +54,11 @@ pub enum Request {
     },
     /// Clear any active focus highlight and annotations.
     Clear,
+    /// Move the view: a change (a unique prefix will do), `layer:CHANGE` for
+    /// the layer that change heads, or empty for the whole stack. The web
+    /// window follows it the way it follows focus.
+    #[serde(rename = "lens")]
+    Lens { spec: String },
     /// Show, hide, or toggle non-tour comments in the diff and file tree.
     /// `None` toggles the current state.
     #[serde(rename = "comment-visibility")]
@@ -813,6 +818,10 @@ fn handle_while_in_editor(
             Response::ok_note(
                 "recto is in an editor; comment visibility will apply when you return",
             )
+        }
+        Request::Lens { .. } => {
+            queue(tx, request.clone());
+            Response::ok_note("recto is in an editor; the view will move when you return")
         }
         Request::Focus { path, start, end } => {
             let drove = nvim

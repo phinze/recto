@@ -13,6 +13,7 @@ mod job;
 mod link;
 mod markdown;
 mod serve;
+mod stack;
 mod state;
 #[cfg(test)]
 mod testing;
