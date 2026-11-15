@@ -1682,8 +1682,79 @@ fn small_markdown(body: &str) -> String {
             }
         });
     let mut html = String::new();
-    pulldown_cmark::html::push_html(&mut html, events);
+    pulldown_cmark::html::push_html(&mut html, autolink(events).into_iter());
     html
+}
+
+/// Turn bare http(s) URLs in prose into links, the way GitHub does: Markdown
+/// itself only links `[text](url)` and `<url>`, so a URL pasted into a
+/// briefing or a draft would otherwise sit there as text. Code and existing
+/// links are left alone.
+fn autolink<'a>(events: impl Iterator<Item = Event<'a>>) -> Vec<Event<'a>> {
+    let mut out = Vec::new();
+    let (mut in_code, mut in_link) = (0usize, 0usize);
+    for event in pulldown_cmark::TextMergeStream::new(events) {
+        match &event {
+            Event::Start(Tag::CodeBlock(_)) => in_code += 1,
+            Event::End(TagEnd::CodeBlock) => in_code = in_code.saturating_sub(1),
+            Event::Start(Tag::Link { .. }) => in_link += 1,
+            Event::End(TagEnd::Link) => in_link = in_link.saturating_sub(1),
+            Event::Text(text) if in_code == 0 && in_link == 0 => {
+                let mut rest: &str = text;
+                while let Some((before, url, after)) = next_url(rest) {
+                    if !before.is_empty() {
+                        out.push(Event::Text(before.to_string().into()));
+                    }
+                    out.push(Event::Start(Tag::Link {
+                        link_type: pulldown_cmark::LinkType::Autolink,
+                        dest_url: url.to_string().into(),
+                        title: "".into(),
+                        id: "".into(),
+                    }));
+                    out.push(Event::Text(url.to_string().into()));
+                    out.push(Event::End(TagEnd::Link));
+                    rest = after;
+                }
+                if !rest.is_empty() {
+                    out.push(Event::Text(rest.to_string().into()));
+                }
+                continue;
+            }
+            _ => {}
+        }
+        out.push(event);
+    }
+    out
+}
+
+/// The first bare http(s) URL in `text`, split as (before, url, after).
+/// Trailing punctuation that ends a sentence stays out of the URL, and so
+/// does a closing paren the URL didn't open.
+fn next_url(text: &str) -> Option<(&str, &str, &str)> {
+    let start = ["https://", "http://"]
+        .iter()
+        .filter_map(|scheme| text.find(scheme))
+        .min()?;
+    let tail = &text[start..];
+    let mut end = tail
+        .find(|c: char| c.is_whitespace() || "<>\"`".contains(c))
+        .unwrap_or(tail.len());
+    loop {
+        let url = &tail[..end];
+        let last = url.chars().last()?;
+        let unbalanced = last == ')' && url.matches('(').count() < url.matches(')').count();
+        if ".,;:!?'*_".contains(last) || unbalanced {
+            end -= last.len_utf8();
+        } else {
+            break;
+        }
+    }
+    let url = &tail[..end];
+    // A scheme with nothing after it is just the word.
+    if url.len() <= "https://".len() {
+        return None;
+    }
+    Some((&text[..start], url, &tail[end..]))
 }
 
 fn diff_row(
@@ -1970,7 +2041,7 @@ fn render_doc(
         }
     }
     let mut body = String::new();
-    pulldown_cmark::html::push_html(&mut body, events.into_iter());
+    pulldown_cmark::html::push_html(&mut body, autolink(events.into_iter()).into_iter());
 
     let _ = write!(
         out,
@@ -2264,6 +2335,52 @@ mod tests {
         assert_eq!(lines[3].new, Some(3));
         assert_eq!(files[1].status, 'A');
         assert_eq!(files[1].hunks[0].lines[0].new, Some(1));
+    }
+
+    /// A bare URL anywhere in prose becomes a link, as on GitHub, without
+    /// swallowing the punctuation that ends its sentence. Code, existing
+    /// links and unsafe schemes are left as they were.
+    #[test]
+    fn bare_urls_in_prose_become_links() {
+        let html = small_markdown(
+            "Open http://foxtrotbase:7745. Or (see https://example.com/a_(b)), \
+             not `https://in.code` and [named](https://named.example).\n\n\
+             ```\nhttps://in.a.block\n```\n\njavascript:alert(1)",
+        );
+        assert!(
+            html.contains(r#"<a href="http://foxtrotbase:7745">http://foxtrotbase:7745</a>."#),
+            "{html}"
+        );
+        assert!(
+            html.contains(r#"<a href="https://example.com/a_(b)">https://example.com/a_(b)</a>)"#),
+            "{html}"
+        );
+        assert!(html.contains("<code>https://in.code</code>"), "{html}");
+        assert!(
+            html.contains(r#"<a href="https://named.example">named</a>"#),
+            "{html}"
+        );
+        assert!(
+            !html.contains(r#"href="https://named.example">https"#),
+            "{html}"
+        );
+        assert!(html.contains("https://in.a.block\n</code>"), "{html}");
+        assert!(!html.contains("href=\"javascript"), "{html}");
+
+        let mut out = String::new();
+        render_doc(
+            "brief",
+            "bg",
+            "Briefing",
+            "## Needs you\n\nThe demo is at http://foxtrotbase:7745 now.",
+            &mut 0,
+            &mut out,
+            &mut |_, _, _| {},
+        );
+        assert!(
+            out.contains(r#"<a href="http://foxtrotbase:7745">"#),
+            "{out}"
+        );
     }
 
     #[test]

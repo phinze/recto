@@ -344,6 +344,15 @@
   }
 
   content.addEventListener('click', (e) => {
+    // A link off the page opens beside it. Followed in place, it would
+    // replace this page inside the window's frame, or show nothing at all
+    // for the many sites that refuse to be framed.
+    const out = e.target.closest('a[href^="http:"], a[href^="https:"], a[href^="mailto:"]');
+    if (out) {
+      out.target = '_blank';
+      out.rel = 'noopener';
+      return;
+    }
     const tabBtn = e.target.closest('nav.tabs button[data-tab]');
     if (tabBtn) {
       activate(tabBtn.dataset.tab, true);
