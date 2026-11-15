@@ -830,7 +830,7 @@
   tocBtn.innerHTML = '<svg viewBox="0 0 24 24" width="20" height="20" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><path d="M4 6h16M4 12h16M4 18h10"/></svg>';
   const toc = document.createElement('div');
   toc.id = 'toc';
-  toc.innerHTML = '<div class=toc-sheet role=dialog aria-label=contents><div class=toc-head><b>contents</b><button type=button class=toc-close>close</button></div><div class=toc-list></div></div>';
+  toc.innerHTML = '<div class=toc-sheet role=dialog aria-label=contents><div class=toc-head><b>contents</b><button type=button class=toc-lines></button><button type=button class=toc-close>close</button></div><div class=toc-list></div></div>';
   document.body.append(tocBtn, toc);
   const tocList = toc.querySelector('.toc-list');
   const escHTML = (str) => String(str).replace(/[&<>"]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;' }[c]));
@@ -868,6 +868,24 @@
     }
     tocList.innerHTML = html || '<p class=dim>Nothing on this page to jump to.</p>';
   }
+  // Long lines wrap by default; scrolling them sideways keeps code's shape,
+  // which some diffs need more than they need everything on screen. The
+  // choice is the reader's, kept across pages.
+  let lines = 'wrap';
+  try { lines = localStorage.getItem('recto-lines') || 'wrap'; } catch {}
+  function applyLines() {
+    document.body.classList.toggle('scroll-lines', lines === 'scroll');
+    toc.querySelector('.toc-lines').textContent = lines === 'scroll' ? 'lines: scroll' : 'lines: wrap';
+  }
+  applyLines();
+  toc.querySelector('.toc-lines').addEventListener('click', (e) => {
+    e.stopPropagation();
+    steady(() => {
+      lines = lines === 'scroll' ? 'wrap' : 'scroll';
+      try { localStorage.setItem('recto-lines', lines); } catch {}
+      applyLines();
+    });
+  });
   function openToc() { buildToc(); toc.classList.add('shown'); }
   function closeToc() { toc.classList.remove('shown'); }
   tocBtn.addEventListener('click', openToc);

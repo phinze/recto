@@ -288,6 +288,7 @@ tr.picked td.ln:first-child { box-shadow: inset 3px 0 0 var(--mauve), inset 0 0 
   padding: 10px 16px; min-height: 44px; -webkit-tap-highlight-color: transparent; }
 .toc-list button:active { background: var(--surface0); }
 .toc-list .toc-top { font: 600 14px var(--mono); color: var(--mauve); border-top: 1px solid var(--surface0); margin-top: 4px; }
+.toc-list .toc-top:first-child { border-top: 0; margin-top: 0; }
 .toc-list .toc-h { font: 15px var(--sans); color: var(--text); padding-left: 28px !important; }
 .toc-list .toc-f { font: 13px var(--mono); padding-left: 28px !important; }
 .toc-path { flex: 1; min-width: 0; overflow-wrap: anywhere; color: var(--text); }
@@ -297,4 +298,36 @@ tr.picked td.ln:first-child { box-shadow: inset 3px 0 0 var(--mauve), inset 0 0 
   #toc-btn { display: flex; }
   /* Clear the contents button's corner. */
   main { padding-bottom: 80px; }
+}
+
+/* Diffs at a phone's width: the old line numbers' column collapses, leaving
+   one gutter, so the code gets the room. The marks that ride the gutter's
+   edge move to the column that's left. */
+@media (pointer: coarse), (max-width: 600px) {
+  table.diff { font-size: 12px; }
+  table.diff col.ln { width: 2.7em; }
+  /* 1px, not 0: under a fixed table layout WebKit reads a zero-width
+     column as auto and splits the spare width between it and the code. */
+  table.diff col.ln:first-child { width: 1px; }
+  table.diff td.ln:first-child { padding: 0; font-size: 0; overflow: hidden; }
+  table.diff td.ln { font-size: 10.5px; padding: 1px 4px 0 2px; }
+  tr.focus td.ln:nth-child(2) { box-shadow: inset 3px 0 0 var(--yellow), inset 0 0 0 9999px rgba(249,226,175,0.10); }
+  tr.has-comment td.ln:nth-child(2) { box-shadow: inset 3px 0 0 var(--mauve); }
+  tr.has-comment[data-cstate=done] td.ln:nth-child(2) { box-shadow: inset 3px 0 0 var(--green); }
+  tr.has-comment[data-cstate=failed] td.ln:nth-child(2) { box-shadow: inset 3px 0 0 var(--red); }
+  tr.picked td.ln:nth-child(2) { box-shadow: inset 3px 0 0 var(--mauve), inset 0 0 0 9999px rgba(203,166,247,0.14); }
+}
+
+/* Long lines scrolled rather than wrapped: each table scrolls sideways on
+   its own, with its line numbers held at the left edge. */
+body.scroll-lines table.diff { display: block; overflow-x: auto; -webkit-overflow-scrolling: touch; }
+body.scroll-lines table.diff td.code { white-space: pre; overflow-wrap: normal; text-indent: 0; padding-left: 6px; padding-right: 16px; }
+body.scroll-lines table.diff td.ln { position: sticky; z-index: 1; background: var(--base); }
+body.scroll-lines table.diff td.ln:first-child { left: 0; }
+body.scroll-lines table.diff td.ln:nth-child(2) { left: var(--ln1, 3.6em); }
+body.scroll-lines tr.add td.ln { background: var(--add-bg); }
+body.scroll-lines tr.del td.ln { background: var(--del-bg); }
+body.scroll-lines tr.hunk td, body.scroll-lines tr.draft td { position: sticky; left: 0; }
+@media (pointer: coarse), (max-width: 600px) {
+  body.scroll-lines table.diff { --ln1: 0px; }
 }
