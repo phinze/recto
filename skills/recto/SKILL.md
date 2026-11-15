@@ -266,9 +266,17 @@ Fenced blocks tagged `recto` become pull quotes. Give one a `PATH:LINE` or a
 `PATH:START-END` and recto lifts that source out of the diff, syntax
 highlighted, with its line numbers and no diff tint. The fence body is ignored,
 so leave it empty. `recto` has to stand as its own word in the info string, so
-an unrelated `rectoclip` fence stays an ordinary code block. A span that no
-longer resolves says so in place rather than vanishing, which matters because a
-tour outlives the diff it was written against.
+an unrelated `rectoclip` fence stays an ordinary code block.
+
+Write each span against the diff as you see it now. In a jj repository recto
+stamps every quote when the tour is saved, to the change that last touched
+those lines, so the quote keeps lifting the same code after that change is
+amended, reordered or rebased, even as its line numbers shift. The fence text
+stays exactly as you wrote it. A quote whose lines were themselves rewritten
+says it's outdated, and one that no longer resolves at all says so in place
+rather than vanishing, which matters because a tour outlives the diff it was
+written against. Notes, review drafts, focus and annotations are stamped the
+same way.
 
 Every quote is a door. `enter` opens the next one below the reader, and a click
 opens the one under the pointer — anywhere on its label row, or on a code row's
@@ -358,8 +366,11 @@ attribute it there instead of asserting it yourself.
 The review being written is a local draft, not published GitHub content and
 not private agent notes: a verdict, a top-level summary, and inline comments.
 Recto saves it beneath `$XDG_STATE_HOME/recto/workspaces/`, keyed by the
-canonical workspace root, whether or not Rig launched it, and restores only the
-draft matching the attached repository, PR number, and head OID. Rig teardown
+canonical workspace root, whether or not Rig launched it, and restores the
+draft matching the attached repository and PR number. The draft follows its PR
+to a new head: each comment is stamped to the change its lines belong to, so it
+lands on those lines in the new diff or, if they were rewritten, is marked
+`outdated` and blocks posting until it's re-anchored or deleted. Rig teardown
 uses `recto state forget` to end that state with the workspace without learning
 Recto's file layout.
 
@@ -376,8 +387,9 @@ as comments arrive; the stable `id` is your handle.
 Read the draft with `recto review`; this is a peek, so calling it repeatedly
 never consumes anything. Comments come back in posting order, each with its
 `id`, `last_editor`, `revision`, and the `snippet` of diff rows the slate
-shows. A comment with no `snippet` no longer resolves in the current diff and
-cannot post until it is re-anchored or deleted. `recto review --markdown`
+shows. A comment with no `snippet` no longer resolves in the current diff, or
+carries `"outdated": true` because its lines changed under it, and cannot post
+until it is re-anchored or deleted. `recto review --markdown`
 prints the same slate as readable Markdown, for reading it back in the
 conversation.
 

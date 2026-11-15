@@ -415,18 +415,18 @@ impl App {
             number: pull_request.number,
             head_oid: pull_request.head_oid.clone(),
         };
-        let same_review = self
-            .pull_request_ref()
-            .is_some_and(|current| current == incoming_ref);
+        // A new head of the same PR keeps its review: the drafts carry
+        // stamps, so the next load moves each to its lines or marks it
+        // outdated.
+        let same_review = self.pull_request.as_ref().is_some_and(|current| {
+            current.repository == pull_request.repository && current.number == pull_request.number
+        });
         if (self.review_draft_body.is_some() || !self.review_draft_comments.is_empty())
-            && self.pull_request.as_ref().is_some_and(|current| {
-                current.repository != pull_request.repository
-                    || current.number != pull_request.number
-                    || current.head_oid != pull_request.head_oid
-            })
+            && self.pull_request.is_some()
+            && !same_review
         {
             return link::Response::err(
-                "another PR or head has shared review drafts; delete them before switching",
+                "another PR has shared review drafts; delete them before switching",
             );
         }
         if !same_review

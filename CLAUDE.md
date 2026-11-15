@@ -61,7 +61,12 @@ is the rule rather than the exception there: tours, annotations, focus, comment
 visibility, notes, drafts and the attached PR snapshot all survive a restart,
 and only an explicit discard or `state forget` ends them. Restoring the PR
 snapshot from disk keeps ordinary startup offline. Review drafts are
-additionally keyed by repository, PR number, and head OID. Inside a
+additionally keyed by repository and PR number, and follow the PR to a new
+head. In a jj repository every anchored object (notes, drafts, focus,
+annotations, tour quotes) carries a stamp naming the change that owns its
+lines and the commit it was; `src/anchor.rs` resolves stamps through line maps
+on each load, so anchors survive rewrites and go outdated rather than astray
+when their own lines change. Inside a
 review Rig, Recto asks Rig's versioned JSON API only for PR context; `rig down`
 asks Recto's public CLI to forget the workspaces whose lifecycle has ended.
 Neither tool reads the other's private persistence format.

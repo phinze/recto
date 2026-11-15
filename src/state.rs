@@ -326,11 +326,14 @@ impl Store {
         self.document.pull_request = pull_request.cloned();
     }
 
+    /// The review drafted for this PR. A draft follows its PR across a new
+    /// head: its comments carry stamps, so each one either lands on its lines
+    /// in the new diff or says it went outdated.
     pub fn review(&self, pull_request: &PullRequestRef) -> Option<RestoredReview> {
         self.document
             .reviews
             .iter()
-            .find(|review| review.pull_request == *pull_request)
+            .rfind(|review| same_pr(&review.pull_request, pull_request))
             .map(|review| RestoredReview {
                 verdict: review.verdict,
                 body: review.body.clone(),
@@ -363,7 +366,7 @@ impl Store {
             .document
             .reviews
             .iter()
-            .find(|saved| saved.pull_request == pull_request)
+            .rfind(|saved| same_pr(&saved.pull_request, &pull_request))
             .and_then(|saved| saved.composer.clone());
         let review = ReviewState {
             pull_request: pull_request.clone(),
@@ -373,15 +376,10 @@ impl Store {
             composer,
             verdict,
         };
-        match self
-            .document
+        self.document
             .reviews
-            .iter()
-            .position(|saved| saved.pull_request == pull_request)
-        {
-            Some(index) => self.document.reviews[index] = review,
-            None => self.document.reviews.push(review),
-        }
+            .retain(|saved| !same_pr(&saved.pull_request, &pull_request));
+        self.document.reviews.push(review);
     }
 
     pub fn set_review_composer(
@@ -393,7 +391,7 @@ impl Store {
             .document
             .reviews
             .iter_mut()
-            .find(|saved| saved.pull_request == *pull_request)
+            .rfind(|saved| same_pr(&saved.pull_request, pull_request))
         {
             review.composer = composer.cloned();
         }
@@ -569,6 +567,11 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         pull_request: None,
         quotes: Vec::new(),
     }))
+}
+
+/// Whether two references name the same pull request, at any head.
+fn same_pr(a: &PullRequestRef, b: &PullRequestRef) -> bool {
+    a.repository == b.repository && a.number == b.number
 }
 
 fn protect_state_dirs(workspaces: &Path) -> Result<()> {
@@ -839,7 +842,7 @@ mod tests {
     }
 
     #[test]
-    fn a_new_pr_head_does_not_inherit_the_old_heads_draft() {
+    fn a_draft_follows_its_pr_to_a_new_head() {
         let (state_home, workspace) = roots("heads");
         let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
         let old = PullRequestRef {
@@ -863,7 +866,19 @@ mod tests {
             1,
         );
 
-        assert!(store.review(&old).is_some());
-        assert!(store.review(&new).is_none());
+        let carried = store.review(&new).expect("the draft follows the PR");
+        assert_eq!(carried.body.unwrap().body, "Only for the old diff");
+
+        // Saving under the new head replaces the old entry rather than
+        // keeping two drafts of one review.
+        store.set_review(new.clone(), None, None, &[], 1);
+        assert_eq!(store.document.reviews.len(), 1);
+        assert_eq!(store.document.reviews[0].pull_request, new);
+
+        let other = PullRequestRef {
+            number: 9,
+            ..old.clone()
+        };
+        assert!(store.review(&other).is_none(), "another PR starts clean");
     }
 }
