@@ -206,6 +206,12 @@ fn apply(
                 last_editor: DraftEditor::Agent,
                 revision: 1,
                 snippet: None,
+                pin: crate::anchor::Pin::stamped(crate::anchor::Resolver::new(backend).stamp(
+                    &crate::anchor::Lens::range(backend),
+                    path,
+                    start,
+                    end,
+                )),
             });
             // Posting order is file then line, the way the viewer keeps them.
             slate.comments.sort_by(|a, b| {
@@ -438,6 +444,7 @@ mod tests {
             "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,4 +1,4 @@\n 1\n-2\n+two\n 3\n 4\n",
         );
         let draft = DraftReviewComment {
+            pin: Default::default(),
             id: 4,
             path: "a.txt".into(),
             start: 2,

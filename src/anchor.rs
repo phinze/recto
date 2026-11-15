@@ -273,6 +273,24 @@ impl<'a> Resolver<'a> {
     }
 }
 
+/// Resolve a batch of `(path, stamp)` pairs against one lens, sharing one
+/// change lookup and one file cache across them.
+pub fn resolve_all(
+    backend: &dyn Backend,
+    lens: &Lens,
+    stamps: &[(String, Stamp)],
+) -> Vec<((String, Stamp), Resolution)> {
+    let mut resolver = Resolver::new(backend);
+    resolver.prefetch(stamps.iter().map(|(_, s)| s.change.as_str()));
+    stamps
+        .iter()
+        .map(|(path, stamp)| {
+            let r = resolver.resolve(lens, path, stamp);
+            ((path.clone(), stamp.clone()), r)
+        })
+        .collect()
+}
+
 /// Carry lines `start..=end` (1-based) of `from` across to `to`. Every line
 /// of the span has to survive unchanged; one that was edited or removed means
 /// the span no longer says what it said, so there is no honest place for it.

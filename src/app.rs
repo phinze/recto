@@ -31,6 +31,7 @@ use ratatui::layout::Rect;
 use ratatui::text::Line;
 use ratatui::widgets::ListState;
 
+use crate::anchor::{Lens, Pin, Resolution, Stamp, resolve_all};
 use crate::backend::{Backend, Base, FileChange, FileStatus, Rev, Scope};
 use crate::diff::{FetchContent, LineInfo, render_diff};
 use crate::highlight::Highlighter;
@@ -48,6 +49,9 @@ pub(crate) struct LoadedDiff {
     /// Populated only when the load was for `Scope::Range`. Rev loads don't
     /// refresh the rev list — selecting a rev shouldn't redraw the strip.
     pub(crate) revs: Option<Vec<Rev>>,
+    /// The view this load is, and where each requested anchor landed in it.
+    pub(crate) lens: Lens,
+    pub(crate) resolutions: Vec<((String, Stamp), Resolution)>,
 }
 
 pub(crate) const SCROLLOFF: u16 = 3;
@@ -82,6 +86,9 @@ pub(crate) struct DiffRequest {
     pub(crate) generation: u64,
     pub(crate) scope: Scope,
     pub(crate) ignore_ws: bool,
+    /// Anchors to resolve against the loaded view, off the UI thread, since
+    /// each can cost a few backend calls.
+    pub(crate) stamps: Vec<(String, Stamp)>,
 }
 
 pub(crate) struct Loading {
@@ -127,15 +134,15 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Resu
     // A narrowed view names a change, and the change may have been rewritten
     // since the view was picked, so ask for whichever commit it is now.
     let resolved;
-    let scope = match &req.scope {
+    let (scope, lens) = match &req.scope {
         Scope::Rev(target) => {
             let commit = backend
                 .commit_id(target)
                 .ok_or_else(|| anyhow::anyhow!("{target} no longer names a single revision"))?;
-            resolved = Scope::Rev(commit);
-            &resolved
+            resolved = Scope::Rev(commit.clone());
+            (&resolved, Lens::narrowed(commit))
         }
-        scope => scope,
+        scope => (scope, Lens::range(backend)),
     };
     let changes = backend.list_changes(scope, req.ignore_ws)?;
     let diff = backend.unified_diff(scope, req.ignore_ws)?;
@@ -154,7 +161,10 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Resu
         }
     };
     let rd = render_diff(&diff, &changes, hl, &*fetch);
+    let resolutions = resolve_all(backend, &lens, &req.stamps);
     Ok(LoadedDiff {
+        lens,
+        resolutions,
         workspace_revision,
         changes,
         rendered: rd.lines,
@@ -250,6 +260,7 @@ pub(crate) struct FocusSpan {
     pub(crate) path: String,
     pub(crate) start: u32,
     pub(crate) end: u32,
+    pub(crate) pin: Pin,
     /// When the span landed; drives the arrival flash and the pulse phase.
     /// Re-focusing the same span resets it — "look here" deserves a fresh
     /// flash even if the eyes-target hasn't moved.
@@ -265,6 +276,8 @@ pub(crate) struct Annotation {
     pub(crate) start: u32,
     pub(crate) end: u32,
     pub(crate) label: String,
+    #[serde(default, flatten)]
+    pub(crate) pin: Pin,
 }
 
 /// The durable half of a [`FocusSpan`]: the span, without the arrival instant
@@ -275,6 +288,8 @@ pub(crate) struct FocusAnchor {
     pub(crate) path: String,
     pub(crate) start: u32,
     pub(crate) end: u32,
+    #[serde(default, flatten)]
+    pub(crate) pin: Pin,
 }
 
 /// A reviewer-authored note waiting to be handed to an agent. Anchored the same
@@ -287,6 +302,8 @@ pub(crate) struct AgentNote {
     pub(crate) start: u32,
     pub(crate) end: u32,
     pub(crate) body: String,
+    #[serde(default, flatten)]
+    pub(crate) pin: Pin,
 }
 
 /// Cached mapping between rendered source lines and the visual rows they
@@ -557,6 +574,7 @@ impl App {
             generation: 0,
             scope: Scope::Range(loaded_base.clone()),
             ignore_ws: false,
+            stamps: Vec::new(),
         };
         let loaded = load_diff(&*backend, &hl, &initial_req)?;
         let revs = loaded.revs.clone().unwrap_or_default();
@@ -665,6 +683,7 @@ impl App {
                 path: anchor.path,
                 start: anchor.start,
                 end: anchor.end,
+                pin: anchor.pin,
                 set_at: Instant::now(),
             }),
             annotations,
@@ -703,6 +722,11 @@ impl App {
         } else {
             Focus::Diff
         };
+        // Restored anchors are resolved here rather than by the first load,
+        // which ran before they were read back.
+        let stamps = app.stamps();
+        let resolved = resolve_all(&*app.backend, &loaded.lens, &stamps);
+        app.apply_resolutions(Some(&loaded.lens), &resolved);
         if !app.agent_notes.is_empty()
             || !app.annotations.is_empty()
             || !app.tour_anchors.is_empty()
@@ -949,6 +973,7 @@ impl App {
             generation: self.next_load_generation,
             scope,
             ignore_ws: self.ignore_ws,
+            stamps: self.stamps(),
         };
         self.next_load_generation = self.next_load_generation.wrapping_add(1);
         self.load_error = None;
@@ -1048,6 +1073,7 @@ impl App {
             .selected_change()
             .and_then(|i| self.changes.get(i).map(|c| c.path.clone()));
 
+        let (lens, resolutions) = (loaded.lens, loaded.resolutions);
         self.workspace_revision = loaded.workspace_revision;
         if self.review_is_stale() {
             self.focus_span = None;
@@ -1060,6 +1086,7 @@ impl App {
         self.base_file_starts = loaded.file_starts;
         self.base_line_info = loaded.line_info;
         self.file_stats = loaded.file_stats;
+        self.apply_resolutions(Some(&lens), &resolutions);
         self.reweave();
         // The cursor is a raw source-line index into the old render; it can't
         // survive a reshuffle, so drop it rather than point it at a stale line.
@@ -1259,8 +1286,91 @@ mod tests {
     use crate::ui::document::active_section;
     use std::sync::atomic::Ordering;
 
+    /// base → A (edits line 10) → B (edits line 15) → @, in a real jj repo.
+    fn jj_stack(name: &str) -> (TempRepo, Arc<dyn Backend>) {
+        let repo = TempRepo::new(name);
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        let body: String = (1..=20).map(|n| format!("line {n}\n")).collect();
+        std::fs::write(repo.0.join("f.txt"), &body).unwrap();
+        repo.run("jj", &["describe", "-m", "base"]);
+        repo.run("jj", &["new", "-m", "A"]);
+        let a = body.replace("line 10\n", "line 10 by A\n");
+        std::fs::write(repo.0.join("f.txt"), &a).unwrap();
+        repo.run("jj", &["new", "-m", "B"]);
+        std::fs::write(
+            repo.0.join("f.txt"),
+            a.replace("line 15\n", "line 15 by B\n"),
+        )
+        .unwrap();
+        repo.run("jj", &["new"]);
+        let backend: Arc<dyn Backend> = Arc::new(crate::backend::JjBackend::new(repo.0.clone()));
+        (repo, backend)
+    }
+
+    /// The promise of change anchors, end to end: a note left in the stack
+    /// view keeps pointing at its line after the change beneath it is amended
+    /// and the viewer restarts, and goes outdated, not astray, once a later
+    /// change rewrites that line.
+    #[test]
+    fn a_note_follows_its_line_through_a_rewrite_beneath_the_stack() {
+        let (repo, backend) = jj_stack("app-anchor-rewrite");
+        let state_home = repo.0.join(".state");
+        let root = backend.root().to_path_buf();
+        let store = state::Store::load_at(&state_home, &root, None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, Some(store)).unwrap();
+        assert!(app.add_agent_note("f.txt", 10, None, "why A?".into()).ok);
+        let stamp = app.agent_notes[0].pin.stamp.clone().expect("stamped");
+        assert_eq!(stamp.snippet, vec!["line 10 by A".to_string()]);
+        app.persist_now().unwrap();
+        drop(app);
+
+        let a = repo.out(
+            "jj",
+            &["log", "-r", &stamp.change, "--no-graph", "-T", "change_id"],
+        );
+        repo.run("jj", &["edit", &a]);
+        let text = std::fs::read_to_string(repo.0.join("f.txt")).unwrap();
+        std::fs::write(repo.0.join("f.txt"), format!("n1\nn2\nn3\n{text}")).unwrap();
+        repo.run("jj", &["new", "heads(all())"]);
+
+        let store = state::Store::load_at(&state_home, &root, None).unwrap();
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, Some(store)).unwrap();
+        let note = &app.agent_notes[0];
+        assert_eq!(
+            (note.start, note.end),
+            (13, 13),
+            "moved with the lines above it"
+        );
+        assert!(note.pin.shown());
+        let response = app.handle_request(link::Request::ReadAgentNotes);
+        let notes = response.comments.expect("notes");
+        assert!(
+            notes[0].snippet.is_some(),
+            "the agent still sees what was quoted"
+        );
+
+        let text = std::fs::read_to_string(repo.0.join("f.txt")).unwrap();
+        std::fs::write(
+            repo.0.join("f.txt"),
+            text.replace("line 10 by A", "line 10 reworded"),
+        )
+        .unwrap();
+        let resolved = resolve_all(&*backend, &Lens::range(&*backend), &app.stamps());
+        app.apply_resolutions(Some(&Lens::range(&*backend)), &resolved);
+        assert!(app.agent_notes[0].pin.outdated);
+        let notes = app
+            .handle_request(link::Request::ReadAgentNotes)
+            .comments
+            .expect("notes");
+        assert!(
+            notes[0].snippet.is_none(),
+            "an outdated note quotes nothing"
+        );
+    }
+
     fn test_request(generation: u64) -> DiffRequest {
         DiffRequest {
+            stamps: Vec::new(),
             generation,
             scope: Scope::Range(Base::Revision("base".into())),
             ignore_ws: false,
@@ -1500,6 +1610,7 @@ mod tests {
             body: "## Step one".into(),
         });
         app.annotations.push(Annotation {
+            pin: Default::default(),
             path: "src/main.rs".into(),
             start: 1,
             end: 1,
@@ -1682,6 +1793,7 @@ mod tests {
         app.page = Page::Diff;
         app.search_query = Some("needle".into());
         app.annotations.push(Annotation {
+            pin: Default::default(),
             path: "foo.go".into(),
             start: 111,
             end: 111,
@@ -2316,6 +2428,7 @@ mod tests {
                 revision: 0,
             }),
             &[link::DraftReviewComment {
+                pin: Default::default(),
                 id: 7,
                 path: "src/main.rs".into(),
                 start: 12,
@@ -2416,6 +2529,7 @@ mod tests {
         load_sample_diff(&mut app);
         app.pull_request = Some(empty_pull_request("base"));
         app.review_draft_comments.push(link::DraftReviewComment {
+            pin: Default::default(),
             id: 1,
             path: "gone.rs".into(),
             start: 3,
@@ -2477,6 +2591,7 @@ mod tests {
             assert!(response.ok);
         }
         app.review_draft_comments.push(link::DraftReviewComment {
+            pin: Default::default(),
             id: 99,
             path: "gone.rs".into(),
             start: 4,
@@ -2763,6 +2878,7 @@ mod tests {
         let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
         app.agent_notes = vec![
             AgentNote {
+                pin: Default::default(),
                 id: 4,
                 path: "one".into(),
                 start: 1,
@@ -2770,6 +2886,7 @@ mod tests {
                 body: "first".into(),
             },
             AgentNote {
+                pin: Default::default(),
                 id: 5,
                 path: "two".into(),
                 start: 2,
@@ -2904,6 +3021,11 @@ mod tests {
         app.apply_loaded(
             Scope::Range(Base::Revision("base".into())),
             LoadedDiff {
+                lens: crate::anchor::Lens {
+                    head: "@".into(),
+                    narrowed: false,
+                },
+                resolutions: Vec::new(),
                 workspace_revision: "abc123".into(),
                 changes,
                 rendered: rendered.lines,
@@ -2914,12 +3036,14 @@ mod tests {
             },
         );
         app.annotations.push(Annotation {
+            pin: Default::default(),
             path: "foo.go".into(),
             start: 2,
             end: 2,
             label: "Tour stop".into(),
         });
         app.review_draft_comments.push(link::DraftReviewComment {
+            pin: Default::default(),
             id: 7,
             path: "foo.go".into(),
             start: 2,
@@ -2930,6 +3054,7 @@ mod tests {
             snippet: None,
         });
         app.agent_notes.push(AgentNote {
+            pin: Default::default(),
             id: 8,
             path: "foo.go".into(),
             start: 2,
@@ -2995,12 +3120,14 @@ mod tests {
                 .ok
         );
         app.focus_span = Some(FocusSpan {
+            pin: Default::default(),
             path: "src/main.rs".into(),
             start: 12,
             end: 12,
             set_at: Instant::now(),
         });
         app.annotations.push(Annotation {
+            pin: Default::default(),
             path: "src/main.rs".into(),
             start: 12,
             end: 12,
@@ -3429,6 +3556,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
     fn comment_lookup_covers_the_whole_span() {
         let comments = vec![
             AgentNote {
+                pin: Default::default(),
                 id: 1,
                 path: "src/main.rs".into(),
                 start: 10,
@@ -3436,6 +3564,7 @@ func extractHTTPPort(spec *Sandbox) (int64, bool) {
                 body: "range note".into(),
             },
             AgentNote {
+                pin: Default::default(),
                 id: 2,
                 path: "src/link.rs".into(),
                 start: 3,

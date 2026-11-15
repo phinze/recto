@@ -710,8 +710,11 @@ fn review_document(app: &App) -> Document {
                 dim,
             ),
         ]);
-        let snippet = app
-            .snippet_rows(&comment.path, comment.start, comment.end)
+        let snippet = comment
+            .pin
+            .shown()
+            .then(|| app.snippet_rows(&comment.path, comment.start, comment.end))
+            .flatten()
             .map(|(rows, span)| {
                 let width = comment.end.to_string().len() + 1;
                 rows.filter_map(|row| {
@@ -730,12 +733,17 @@ fn review_document(app: &App) -> Document {
                     format!("{}:{}-{}", comment.path, comment.start, comment.end),
                 ));
             }
-            // The comment outlived the diff it was anchored to. Say so where
-            // the code would be: it cannot post until it is re-anchored.
+            // The comment outlived the diff it was anchored to, or its lines
+            // changed under it. Say which where the code would be: either way
+            // it cannot post until it is re-anchored.
             None => doc.push(Line::from(vec![
                 Span::styled("  ", dim),
                 Span::styled(
-                    "not in this diff · re-anchor or delete before posting",
+                    if comment.pin.outdated {
+                        "outdated: its lines changed since it was written · re-anchor or delete before posting"
+                    } else {
+                        "not in this diff · re-anchor or delete before posting"
+                    },
                     Style::default().fg(theme::RED),
                 ),
             ])),

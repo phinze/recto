@@ -994,6 +994,7 @@ mod tests {
             }),
             comments: vec![
                 link::DraftReviewComment {
+                    pin: Default::default(),
                     id: 9,
                     path: "src/a.rs".into(),
                     start: 3,
@@ -1009,6 +1010,7 @@ mod tests {
                     }]),
                 },
                 link::DraftReviewComment {
+                    pin: Default::default(),
                     id: 2,
                     path: "gone.rs".into(),
                     start: 1,

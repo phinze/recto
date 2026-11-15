@@ -527,6 +527,7 @@ mod tests {
     fn review_objects_nest_under_their_file_without_losing_type() {
         let changes = [change("src/main.rs"), change("src/link.rs")];
         let annotations = [Annotation {
+            pin: Default::default(),
             path: "src/link.rs".into(),
             start: 42,
             end: 42,
@@ -545,6 +546,7 @@ mod tests {
             comments: Vec::new(),
         }];
         let drafts = [link::DraftReviewComment {
+            pin: Default::default(),
             id: 7,
             path: "src/link.rs".into(),
             start: 42,
@@ -555,6 +557,7 @@ mod tests {
             snippet: None,
         }];
         let notes = [AgentNote {
+            pin: Default::default(),
             id: 9,
             path: "src/link.rs".into(),
             start: 42,

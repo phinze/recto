@@ -221,6 +221,8 @@ pub struct DraftReviewComment {
     /// a companion. Absent means the span no longer resolves in this diff.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub snippet: Option<Vec<SnippetRow>>,
+    #[serde(default, flatten)]
+    pub pin: crate::anchor::Pin,
 }
 
 #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
@@ -1130,6 +1132,7 @@ mod tests {
                 revision: 0,
             }),
             comments: vec![DraftReviewComment {
+                pin: Default::default(),
                 id: 1,
                 path: "src/main.rs".into(),
                 start: 42,

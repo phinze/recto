@@ -11,11 +11,12 @@ use anyhow::Result;
 
 use ratatui::text::Line;
 
+use crate::anchor::{Lens, Pin, Resolution, Resolver, Stamp};
 use crate::app::{
     AgentNote, Annotation, App, ComposerEdit, ComposerKind, FileReviewObject, Focus, FocusAnchor,
     FocusSpan, Mode, NoteDraft, Page, SCROLLOFF, STATE_DEBOUNCE,
 };
-use crate::backend::{Base, short_oid};
+use crate::backend::{Base, Scope, short_oid};
 use crate::ui::diff::{
     SNIPPET_CONTEXT, agent_note_index_at, agent_note_line, body_text, gutter_signature, note_line,
     review_draft_line, review_thread_line, review_thread_span, rows_for_span,
@@ -83,6 +84,90 @@ impl App {
                 head_oid: pr.head_oid.clone(),
             }),
             stale_review: self.review_is_stale_at(&workspace_revision),
+        }
+    }
+
+    /// The lens the loaded diff is: a range read at its head, or one commit.
+    pub(crate) fn lens(&self) -> Option<Lens> {
+        match &self.loaded_scope {
+            Scope::Range(_) => Some(Lens::range(&*self.backend)),
+            Scope::Rev(target) => self.backend.commit_id(target).map(Lens::narrowed),
+        }
+    }
+
+    /// A pin for lines the loaded diff shows, stamped to the change that
+    /// last touched them.
+    pub(crate) fn pin_at(&self, path: &str, start: u32, end: u32) -> Pin {
+        let Some(lens) = self.lens() else {
+            return Pin::default();
+        };
+        Pin::stamped(Resolver::new(&*self.backend).stamp(&lens, path, start, end))
+    }
+
+    /// Every stamped anchor, for the worker to resolve against the next load.
+    pub(crate) fn stamps(&self) -> Vec<(String, Stamp)> {
+        let mut out = Vec::new();
+        let mut add = |path: &str, pin: &Pin| {
+            if let Some(stamp) = &pin.stamp {
+                out.push((path.to_string(), stamp.clone()));
+            }
+        };
+        for a in &self.annotations {
+            add(&a.path, &a.pin);
+        }
+        for n in &self.agent_notes {
+            add(&n.path, &n.pin);
+        }
+        for c in &self.review_draft_comments {
+            add(&c.path, &c.pin);
+        }
+        if let Some(f) = &self.focus_span {
+            add(&f.path, &f.pin);
+        }
+        out
+    }
+
+    /// Fold the worker's resolutions into each anchored object's lines, and
+    /// stamp any anchor still reading its lines against the view: state from
+    /// before stamps existed, adopted against the diff it was written for.
+    pub(crate) fn apply_resolutions(
+        &mut self,
+        lens: Option<&Lens>,
+        resolved: &[((String, Stamp), Resolution)],
+    ) {
+        let mut resolver = Resolver::new(&*self.backend);
+        let mut changed = false;
+        let mut settle =
+            |path: &str, pin: &mut Pin, start: &mut u32, end: &mut u32| match &pin.stamp {
+                Some(stamp) => {
+                    let key = (path.to_string(), stamp.clone());
+                    if let Some((_, r)) = resolved.iter().find(|(k, _)| *k == key) {
+                        changed |= pin.apply(r, start, end);
+                    }
+                }
+                None => {
+                    if let Some(lens) = lens.filter(|l| !l.narrowed)
+                        && let Some(stamp) = resolver.stamp(lens, path, *start, *end)
+                    {
+                        pin.stamp = Some(stamp);
+                        changed = true;
+                    }
+                }
+            };
+        for a in &mut self.annotations {
+            settle(&a.path, &mut a.pin, &mut a.start, &mut a.end);
+        }
+        for n in &mut self.agent_notes {
+            settle(&n.path, &mut n.pin, &mut n.start, &mut n.end);
+        }
+        for c in &mut self.review_draft_comments {
+            settle(&c.path, &mut c.pin, &mut c.start, &mut c.end);
+        }
+        if let Some(f) = &mut self.focus_span {
+            settle(&f.path, &mut f.pin, &mut f.start, &mut f.end);
+        }
+        if changed {
+            self.persist_soon();
         }
     }
 
@@ -158,6 +243,7 @@ impl App {
                     path: span.path.clone(),
                     start: span.start,
                     end: span.end,
+                    pin: span.pin.clone(),
                 })
                 .as_ref(),
         );
@@ -451,6 +537,7 @@ impl App {
             path: path.to_string(),
             start,
             end,
+            pin: self.pin_at(path, start, end),
             set_at: Instant::now(),
         });
         self.persist_soon();
@@ -503,7 +590,7 @@ impl App {
     /// reloads even as rendered indices shift. `None` when nothing's focused or
     /// the span's lines aren't currently shown.
     pub(crate) fn focus_rows(&self) -> Option<std::ops::RangeInclusive<usize>> {
-        let span = self.focus_span.as_ref()?;
+        let span = self.focus_span.as_ref().filter(|s| s.pin.shown())?;
         let file_idx = self.changes.iter().position(|c| c.path == span.path)?;
         rows_for_span(&self.line_info, file_idx, span.start, span.end)
     }
@@ -526,6 +613,9 @@ impl App {
         self.rebuild_file_rows();
         let mut inserts: Vec<(usize, Line<'static>, Option<FileReviewObject>)> = Vec::new();
         for (i, a) in self.annotations.iter().enumerate() {
+            if !a.pin.shown() {
+                continue;
+            }
             let Some(file_idx) = self.changes.iter().position(|c| c.path == a.path) else {
                 continue;
             };
@@ -560,6 +650,9 @@ impl App {
                 }
             }
             for (i, comment) in self.review_draft_comments.iter().enumerate() {
+                if !comment.pin.shown() {
+                    continue;
+                }
                 let Some(file_idx) = self.changes.iter().position(|ch| ch.path == comment.path)
                 else {
                     continue;
@@ -578,6 +671,9 @@ impl App {
                 }
             }
             for (i, c) in self.agent_notes.iter().enumerate() {
+                if !c.pin.shown() {
+                    continue;
+                }
                 let Some(file_idx) = self.changes.iter().position(|ch| ch.path == c.path) else {
                     continue;
                 };
@@ -646,8 +742,10 @@ impl App {
         let line_info = &self.base_line_info;
         self.review_draft_comments.sort_by_cached_key(|comment| {
             let file_idx = changes.iter().position(|c| c.path == comment.path);
-            let anchored = file_idx
-                .is_some_and(|i| rows_for_span(line_info, i, comment.start, comment.end).is_some());
+            let anchored = comment.pin.shown()
+                && file_idx.is_some_and(|i| {
+                    rows_for_span(line_info, i, comment.start, comment.end).is_some()
+                });
             (
                 !anchored,
                 file_idx.unwrap_or(usize::MAX),
@@ -710,11 +808,15 @@ impl App {
     fn annotate(&mut self, sites: Vec<link::Site>) -> link::Response {
         self.annotations = sites
             .into_iter()
-            .map(|s| Annotation {
-                end: s.end.unwrap_or(s.start).max(s.start),
-                path: s.path,
-                start: s.start,
-                label: s.label,
+            .map(|s| {
+                let end = s.end.unwrap_or(s.start).max(s.start);
+                Annotation {
+                    pin: self.pin_at(&s.path, s.start, end),
+                    end,
+                    path: s.path,
+                    start: s.start,
+                    label: s.label,
+                }
             })
             .collect();
         self.reweave();
@@ -731,11 +833,13 @@ impl App {
             .annotations
             .iter()
             .filter(|a| {
-                self.changes
-                    .iter()
-                    .position(|c| c.path == a.path)
-                    .and_then(|fi| rows_for_span(&self.line_info, fi, a.start, a.end))
-                    .is_none()
+                !a.pin.shown()
+                    || self
+                        .changes
+                        .iter()
+                        .position(|c| c.path == a.path)
+                        .and_then(|fi| rows_for_span(&self.line_info, fi, a.start, a.end))
+                        .is_none()
             })
             .map(|a| format!("{}:{}-{}", a.path, a.start, a.end))
             .collect();
@@ -777,12 +881,14 @@ impl App {
         }
         let id = self.next_agent_note_id;
         self.next_agent_note_id += 1;
+        let pin = self.pin_at(path, start, end);
         self.agent_notes.push(AgentNote {
             id,
             path: path.to_string(),
             start,
             end,
             body,
+            pin,
         });
         self.persist_soon();
         self.reweave();
@@ -829,7 +935,11 @@ impl App {
             .map(|(i, c)| link::AgentNote {
                 id: c.id,
                 n: i + 1,
-                snippet: self.snippet_for(&c.path, c.start, c.end),
+                snippet: c
+                    .pin
+                    .shown()
+                    .then(|| self.snippet_for(&c.path, c.start, c.end))
+                    .flatten(),
                 path: c.path.clone(),
                 start: c.start,
                 end: c.end,
@@ -877,7 +987,11 @@ impl App {
                 .review_draft_comments
                 .iter()
                 .map(|comment| link::DraftReviewComment {
-                    snippet: self.snippet_for(&comment.path, comment.start, comment.end),
+                    snippet: comment
+                        .pin
+                        .shown()
+                        .then(|| self.snippet_for(&comment.path, comment.start, comment.end))
+                        .flatten(),
                     ..comment.clone()
                 })
                 .collect(),
@@ -1003,6 +1117,7 @@ impl App {
         }
         let id = self.next_review_draft_id;
         self.next_review_draft_id += 1;
+        let pin = self.pin_at(path, start, end);
         self.review_draft_comments.push(link::DraftReviewComment {
             id,
             path: path.to_string(),
@@ -1012,6 +1127,7 @@ impl App {
             last_editor,
             revision: 1,
             snippet: None,
+            pin,
         });
         self.persist_soon();
         self.settle_draft_write(last_editor, Some((file_idx, start, end)));
@@ -1200,12 +1316,14 @@ impl App {
     /// Whether a draft's span still resolves in the current diff. An
     /// unanchored draft cannot post until it is re-anchored or deleted.
     pub(crate) fn review_draft_anchored(&self, comment: &link::DraftReviewComment) -> bool {
-        self.changes
-            .iter()
-            .position(|c| c.path == comment.path)
-            .is_some_and(|i| {
-                rows_for_span(&self.base_line_info, i, comment.start, comment.end).is_some()
-            })
+        comment.pin.shown()
+            && self
+                .changes
+                .iter()
+                .position(|c| c.path == comment.path)
+                .is_some_and(|i| {
+                    rows_for_span(&self.base_line_info, i, comment.start, comment.end).is_some()
+                })
     }
 
     /// What stands between the slate and posting it. Mechanical checks only:
@@ -1299,6 +1417,7 @@ impl App {
     pub(crate) fn annotation_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
         self.annotations
             .iter()
+            .filter(|a| a.pin.shown())
             .filter_map(|a| {
                 let file_idx = self.changes.iter().position(|c| c.path == a.path)?;
                 rows_for_span(&self.line_info, file_idx, a.start, a.end)
@@ -1311,6 +1430,7 @@ impl App {
     pub(crate) fn agent_note_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
         self.agent_notes
             .iter()
+            .filter(|c| c.pin.shown())
             .filter_map(|c| {
                 let file_idx = self.changes.iter().position(|ch| ch.path == c.path)?;
                 rows_for_span(&self.line_info, file_idx, c.start, c.end)
@@ -1321,6 +1441,7 @@ impl App {
     pub(crate) fn review_draft_rows(&self) -> Vec<std::ops::RangeInclusive<usize>> {
         self.review_draft_comments
             .iter()
+            .filter(|comment| comment.pin.shown())
             .filter_map(|comment| {
                 let file_idx = self.changes.iter().position(|c| c.path == comment.path)?;
                 rows_for_span(&self.line_info, file_idx, comment.start, comment.end)

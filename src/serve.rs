@@ -1240,6 +1240,12 @@ pub(crate) fn save_focus_offline(path: &str, start: Option<u32>, end: Option<u32
             path: path.to_string(),
             start,
             end,
+            pin: crate::anchor::Pin::stamped(crate::anchor::Resolver::new(backend.as_ref()).stamp(
+                &crate::anchor::Lens::range(backend.as_ref()),
+                path,
+                start,
+                end,
+            )),
         }));
         store.save()?;
         let shown = file

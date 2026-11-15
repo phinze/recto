@@ -201,7 +201,7 @@ pub(crate) fn rows_for_span(
 pub(crate) fn agent_note_index_at(notes: &[AgentNote], path: &str, line: u32) -> Option<usize> {
     notes
         .iter()
-        .position(|c| c.path == path && c.start <= line && line <= c.end)
+        .position(|c| c.pin.shown() && c.path == path && c.start <= line && line <= c.end)
 }
 
 /// The row `delta` pointable rows from `from`, where a pointable row is one

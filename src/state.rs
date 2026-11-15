@@ -591,6 +591,7 @@ mod tests {
         let (state_home, workspace) = roots("round-trip");
         let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
         let note = AgentNote {
+            pin: Default::default(),
             id: 4,
             path: "src/lib.rs".into(),
             start: 8,
@@ -632,6 +633,7 @@ mod tests {
                 revision: 0,
             }),
             &[DraftReviewComment {
+                pin: Default::default(),
                 id: 7,
                 path: "src/state.rs".into(),
                 start: 20,
@@ -664,12 +666,14 @@ mod tests {
         let (state_home, workspace) = roots("companion");
         let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
         let annotation = Annotation {
+            pin: Default::default(),
             path: "src/link.rs".into(),
             start: 30,
             end: 34,
             label: "Step 2: the new request variant".into(),
         };
         let focus = FocusAnchor {
+            pin: Default::default(),
             path: "src/main.rs".into(),
             start: 12,
             end: 18,
@@ -761,6 +765,7 @@ mod tests {
             notes: NoteState {
                 next_id: 2,
                 items: vec![AgentNote {
+                    pin: Default::default(),
                     id: 1,
                     path: "src/main.rs".into(),
                     start: 4,
