@@ -216,6 +216,7 @@ tr.draft td { padding: 4px 10px 8px 10px; background: var(--base); }
 .draft-card { font-family: var(--sans); white-space: normal; background: var(--mantle); border: 1px solid var(--surface1); border-left: 3px solid var(--mauve); border-radius: 6px; padding: 8px 12px; max-width: 80ch; }
 .draft-head { font: 12px var(--sans); color: var(--mauve); margin-bottom: 4px; }
 .draft-head .dim { color: var(--subtext); }
+.outdated { color: var(--peach); border: 1px solid currentColor; border-radius: 3px; padding: 0 4px; margin-left: 4px; font-size: 11px; }
 .draft-lost { margin-top: 8px; }
 .draft-lost .draft-card { margin: 6px 0; }
 .review-body > :last-child, .draft-body > :last-child { margin-bottom: 0; }

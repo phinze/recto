@@ -306,6 +306,12 @@ pub(crate) struct AgentNote {
     pub(crate) pin: Pin,
 }
 
+impl crate::anchor::Pinned for FocusAnchor {
+    fn parts(&mut self) -> (&str, &mut Pin, &mut u32, &mut u32) {
+        (&self.path, &mut self.pin, &mut self.start, &mut self.end)
+    }
+}
+
 /// Cached mapping between rendered source lines and the visual rows they
 /// occupy after wrapping. `starts[i]` is the first visual row of source line
 /// `i`; the final sentinel is the total visual-row count.
@@ -409,6 +415,9 @@ pub(crate) struct App {
     /// Where each of the tour's quotes points. Derived from `tour`, refreshed
     /// with it, and independent of any draw.
     pub(crate) tour_anchors: Vec<TourQuote>,
+    /// Stamps for the tour's quotes, so each lifts the lines it was written
+    /// about after they move.
+    pub(crate) quote_stamps: Vec<crate::anchor::QuoteStamp>,
     /// A section a companion asked for before the tour page had geometry to
     /// resolve it against. Spent by the next draw.
     pub(crate) tour_pending_section: Option<usize>,
@@ -595,6 +604,10 @@ impl App {
             .as_ref()
             .and_then(|store| store.tour().map(str::to_string));
         let tour_anchors = tour.as_deref().map(tour_quote_anchors).unwrap_or_default();
+        let quote_stamps = persistence
+            .as_ref()
+            .map(|store| store.quotes().to_vec())
+            .unwrap_or_default();
         let (annotations, restored_focus, show_comments) = persistence
             .as_ref()
             .map(|store| {
@@ -632,6 +645,7 @@ impl App {
             tour_quotes: Vec::new(),
             tour_body_area: Rect::default(),
             tour_anchors,
+            quote_stamps,
             tour_pending_section: None,
             quote_return: None,
             review_scroll: 0,

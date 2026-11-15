@@ -256,12 +256,15 @@ fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
             Err(e) => return Ok(Err(format!("{e:#}"))),
         };
         let mut store = state::Store::load(&dir, None)?;
+        let fresh = crate::anchor::stamp_group_quotes(&dir, &repos, &body);
+        let named = crate::anchor::quote_specs(&body);
         let body = (!body.is_empty()).then_some(body.as_str());
         if brief {
             store.set_brief(body);
         } else {
             store.set_doc(name, body);
         }
+        store.stamp_quotes(fresh, &named);
         store.save()?;
         let _ = crate::assets::sweep();
         Ok(Ok(repos))
@@ -325,6 +328,12 @@ fn save_tour_offline(body: &str) -> i32 {
             }
         }
         store.set_tour((!body.is_empty()).then_some(body));
+        let located = crate::anchor::locate_quotes(body);
+        let named: Vec<String> = located.iter().map(|(spec, ..)| spec.clone()).collect();
+        store.stamp_quotes(
+            crate::anchor::stamp_quotes(backend.as_ref(), &located),
+            &named,
+        );
         store.save()?;
         let _ = crate::assets::sweep();
         Ok(None)

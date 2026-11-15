@@ -124,6 +124,9 @@ impl App {
         if let Some(f) = &self.focus_span {
             add(&f.path, &f.pin);
         }
+        for q in &self.quote_stamps {
+            add(&q.path, &q.pin);
+        }
         out
     }
 
@@ -165,6 +168,9 @@ impl App {
         }
         if let Some(f) = &mut self.focus_span {
             settle(&f.path, &mut f.pin, &mut f.start, &mut f.end);
+        }
+        for q in &mut self.quote_stamps {
+            settle(&q.path, &mut q.pin, &mut q.start, &mut q.end);
         }
         if changed {
             self.persist_soon();
@@ -235,6 +241,12 @@ impl App {
         let store = self.persistence.as_mut().expect("checked above");
         store.set_notes(&self.agent_notes, self.next_agent_note_id);
         store.set_tour(self.tour.as_deref());
+        let named = self
+            .tour
+            .as_deref()
+            .map(crate::anchor::quote_specs)
+            .unwrap_or_default();
+        store.stamp_quotes(self.quote_stamps.clone(), &named);
         store.set_annotations(&self.annotations);
         store.set_focus(
             self.focus_span

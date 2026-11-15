@@ -291,6 +291,194 @@ pub fn resolve_all(
         .collect()
 }
 
+/// Something pinned to lines of a file, so a batch of them can be settled
+/// without knowing what each one is.
+pub trait Pinned {
+    fn parts(&mut self) -> (&str, &mut Pin, &mut u32, &mut u32);
+}
+
+/// Resolve every stamped item against the lens and fold the result into its
+/// lines. Unstamped items keep reading their lines against the view. Returns
+/// whether anything durable changed.
+pub fn settle<T: Pinned>(backend: &dyn Backend, lens: &Lens, items: &mut [T]) -> bool {
+    let stamps: Vec<(String, Stamp)> = items
+        .iter_mut()
+        .filter_map(|item| {
+            let (path, pin, _, _) = item.parts();
+            Some((path.to_string(), pin.stamp.clone()?))
+        })
+        .collect();
+    let resolved = resolve_all(backend, lens, &stamps);
+    let mut changed = false;
+    for item in items.iter_mut() {
+        let (path, pin, start, end) = item.parts();
+        let Some(stamp) = pin.stamp.clone() else {
+            continue;
+        };
+        if let Some((_, r)) = resolved.iter().find(|((p, s), _)| p == path && *s == stamp) {
+            changed |= pin.apply(r, start, end);
+        }
+    }
+    changed
+}
+
+/// A tour or doc quote's stamp, kept beside the Markdown so the document
+/// itself stays exactly what the agent wrote. `spec` is the quote's fence
+/// text, which is also how a render finds it; `path` is relative to the
+/// repository the quote lives in.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct QuoteStamp {
+    pub spec: String,
+    pub path: String,
+    pub start: u32,
+    pub end: u32,
+    #[serde(default, flatten)]
+    pub pin: Pin,
+}
+
+impl Pinned for QuoteStamp {
+    fn parts(&mut self) -> (&str, &mut Pin, &mut u32, &mut u32) {
+        (&self.path, &mut self.pin, &mut self.start, &mut self.end)
+    }
+}
+
+/// Where a quote's lines are now.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum Quoted {
+    /// The spec to lift, with its lines moved to where they sit now.
+    At(String),
+    /// Its lines changed since the quote was written.
+    Outdated,
+    /// It belongs to a change the narrowed view isn't showing.
+    Elsewhere,
+}
+
+impl QuoteStamp {
+    pub fn quoted(&self) -> Quoted {
+        if self.pin.outdated {
+            return Quoted::Outdated;
+        }
+        if self.pin.elsewhere {
+            return Quoted::Elsewhere;
+        }
+        let (path, _, _) = crate::parse_pathspec(&self.spec);
+        Quoted::At(if self.start == self.end {
+            format!("{path}:{}", self.start)
+        } else {
+            format!("{path}:{}-{}", self.start, self.end)
+        })
+    }
+}
+
+/// Every `recto` quote spec in a Markdown document, in order.
+pub fn quote_specs(source: &str) -> Vec<String> {
+    let mut skip = |_: &str| Vec::new();
+    crate::markdown::with_quotes(source, &mut skip)
+        .quotes
+        .into_iter()
+        .map(|(_, spec)| spec.trim().to_string())
+        .collect()
+}
+
+/// Stamp quotes against a range lens. `located` pairs each spec with its
+/// repository-relative path and lines; specs that name no lines, or whose
+/// lines the backend can't stamp, are left out and render as they always
+/// did.
+pub fn stamp_quotes(
+    backend: &dyn Backend,
+    located: &[(String, String, u32, u32)],
+) -> Vec<QuoteStamp> {
+    let lens = Lens::range(backend);
+    let mut resolver = Resolver::new(backend);
+    located
+        .iter()
+        .filter_map(|(spec, path, start, end)| {
+            let stamp = resolver.stamp(&lens, path, *start, *end)?;
+            Some(QuoteStamp {
+                spec: spec.clone(),
+                path: path.clone(),
+                start: *start,
+                end: *end,
+                pin: Pin::stamped(Some(stamp)),
+            })
+        })
+        .collect()
+}
+
+/// The specs of one repository's quotes in `source`, located in it.
+pub fn locate_quotes(source: &str) -> Vec<(String, String, u32, u32)> {
+    quote_specs(source)
+        .into_iter()
+        .filter_map(|spec| {
+            let (path, start, end) = crate::parse_pathspec(&spec);
+            let start = start?;
+            let end = end.unwrap_or(start).max(start);
+            Some((spec.clone(), path.to_string(), start, end))
+        })
+        .collect()
+}
+
+/// The repository a group quote lives in: the first of `repos` (directory
+/// names under the group) its path starts with, and the path inside it.
+pub fn split_group_path<'p>(repos: &[String], path: &'p str) -> Option<(String, &'p str)> {
+    repos.iter().find_map(|repo| {
+        path.strip_prefix(repo.as_str())
+            .and_then(|rest| rest.strip_prefix('/'))
+            .map(|rest| (repo.clone(), rest))
+    })
+}
+
+/// Stamp a group document's quotes, each against its own repository.
+pub fn stamp_group_quotes(
+    group: &std::path::Path,
+    repos: &[String],
+    source: &str,
+) -> Vec<QuoteStamp> {
+    let mut by_repo: HashMap<String, Vec<(String, String, u32, u32)>> = HashMap::new();
+    for (spec, path, start, end) in locate_quotes(source) {
+        if let Some((repo, rest)) = split_group_path(repos, &path) {
+            by_repo
+                .entry(repo)
+                .or_default()
+                .push((spec, rest.to_string(), start, end));
+        }
+    }
+    let mut out = Vec::new();
+    for (repo, located) in by_repo {
+        if let Some(backend) = crate::backend::detect_backend_from(&group.join(&repo)) {
+            out.extend(stamp_quotes(backend.as_ref(), &located));
+        }
+    }
+    out
+}
+
+/// Settle a group's quote stamps, each against its own repository, and say
+/// where each spec's lines are now.
+pub fn settle_group_quotes(
+    group: &std::path::Path,
+    repos: &[String],
+    quotes: &[QuoteStamp],
+) -> HashMap<String, Quoted> {
+    let mut by_repo: HashMap<String, Vec<QuoteStamp>> = HashMap::new();
+    for q in quotes {
+        if let Some((repo, _)) = split_group_path(repos, crate::parse_pathspec(&q.spec).0) {
+            by_repo.entry(repo).or_default().push(q.clone());
+        }
+    }
+    let mut out = HashMap::new();
+    for (repo, mut quotes) in by_repo {
+        if let Some(backend) = crate::backend::detect_backend_from(&group.join(&repo)) {
+            settle(
+                backend.as_ref(),
+                &Lens::range(backend.as_ref()),
+                &mut quotes,
+            );
+            out.extend(quotes.iter().map(|q| (q.spec.clone(), q.quoted())));
+        }
+    }
+    out
+}
+
 /// Carry lines `start..=end` (1-based) of `from` across to `to`. Every line
 /// of the span has to survive unchanged; one that was edited or removed means
 /// the span no longer says what it said, so there is no honest place for it.

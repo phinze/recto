@@ -535,7 +535,12 @@ fn quote_line(row: &Line<'static>, number: u32, width: usize) -> Line<'static> {
 /// and file separators drop out. Spans are addressed in new-side numbers
 /// already, so what is left is exactly the source those numbers name.
 fn quote_rows(app: &App, spec: &str) -> Option<Vec<Line<'static>>> {
-    let (path, start, end) = parse_pathspec(spec);
+    let moved = match app.quoted(spec) {
+        Some(crate::anchor::Quoted::At(now)) => now,
+        Some(crate::anchor::Quoted::Outdated | crate::anchor::Quoted::Elsewhere) => return None,
+        None => spec.to_string(),
+    };
+    let (path, start, end) = parse_pathspec(&moved);
     let start = start?;
     let end = end.unwrap_or(start).max(start);
     let file_idx = app.changes.iter().position(|c| c.path == path)?;
@@ -570,7 +575,14 @@ fn tour_document(source: &str, app: &App) -> Document {
             // nothing, with no hint that anything was missing.
             None => rows.push(Line::from(vec![
                 Span::styled("  ", dim),
-                Span::styled("not in this diff", dim),
+                Span::styled(
+                    if matches!(app.quoted(spec), Some(crate::anchor::Quoted::Outdated)) {
+                        "outdated: these lines changed after the tour was written"
+                    } else {
+                        "not in this diff"
+                    },
+                    dim,
+                ),
             ])),
         }
         rows

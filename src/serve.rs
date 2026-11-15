@@ -16,7 +16,7 @@
 //! is itself 0600, so file permissions are the authentication; anything that
 //! wants to put this on a network (rig serve, over the tailnet) fronts it.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::io::{BufRead, BufReader, Write};
 use std::os::unix::net::{UnixListener, UnixStream};
@@ -592,10 +592,20 @@ fn group_docs(
             return;
         }
     };
+    let quoted = crate::anchor::settle_group_quotes(
+        &group,
+        &crate::cli::group_repos(&group),
+        store.quotes(),
+    );
+    let ctx = GroupQuotes {
+        group: &group,
+        rendered,
+        quoted: &quoted,
+    };
     match store.brief().filter(|t| !t.trim().is_empty()) {
         Some(brief) => {
             let mut html = String::new();
-            render_group_doc(&group, "brief", "", brief, rendered, budget, &mut html);
+            render_group_doc(&ctx, "brief", "", brief, budget, &mut html);
             brief_with(gathered, &html, out);
         }
         None if !gathered.is_empty() => brief_with(gathered, "", out),
@@ -607,9 +617,7 @@ fn group_docs(
         }
         let mut html = String::new();
         let class = if doc.name == "tour" { "tour" } else { "doc" };
-        render_group_doc(
-            &group, class, &doc.name, &doc.body, rendered, budget, &mut html,
-        );
+        render_group_doc(&ctx, class, &doc.name, &doc.body, budget, &mut html);
         docs.push((doc.name, html));
     }
 }
@@ -699,15 +707,27 @@ fn brief_asks(source: &str) -> Vec<(String, String)> {
     out
 }
 
+/// What a group document's quotes resolve against: the group, its repos'
+/// summaries, and where each stamped quote's lines are now.
+struct GroupQuotes<'a> {
+    group: &'a Path,
+    rendered: &'a [(String, Summary)],
+    quoted: &'a HashMap<String, crate::anchor::Quoted>,
+}
+
 fn render_group_doc(
-    group: &Path,
+    ctx: &GroupQuotes,
     class: &str,
     name: &str,
     tour: &str,
-    rendered: &[(String, Summary)],
     budget: &mut usize,
     out: &mut String,
 ) {
+    let GroupQuotes {
+        group,
+        rendered,
+        quoted,
+    } = *ctx;
     let repos: Vec<(usize, String)> = rendered
         .iter()
         .enumerate()
@@ -754,8 +774,18 @@ fn render_group_doc(
         budget,
         out,
         &mut |spec, budget, html| {
+            // A stamped quote lifts the lines it was written about, wherever
+            // they sit now; its spec moves with them.
+            let moved = match quoted.get(spec.trim()) {
+                Some(crate::anchor::Quoted::Outdated) => {
+                    outdated_quote(spec, html);
+                    return;
+                }
+                Some(crate::anchor::Quoted::At(now)) => now.as_str(),
+                Some(crate::anchor::Quoted::Elsewhere) | None => spec,
+            };
             let hit = repos.iter().find_map(|(i, rel)| {
-                let rest = spec.strip_prefix(rel.as_str())?.strip_prefix('/')?;
+                let rest = moved.strip_prefix(rel.as_str())?.strip_prefix('/')?;
                 Some((*i, rest))
             });
             match hit {
@@ -951,13 +981,31 @@ fn render_workspace(
     out.push_str("</header>");
     // A review in progress on the attached PR: its drafts show where they'll
     // land, so the person can steer them with comments like any other text.
-    let review = pull_request.as_ref().and_then(|pr| {
-        store.as_ref()?.review(&link::PullRequestRef {
-            repository: pr.repository.clone(),
-            number: pr.number,
-            head_oid: pr.head_oid.clone(),
+    let lens = crate::anchor::Lens::range(backend.as_ref());
+    let quoted: HashMap<String, crate::anchor::Quoted> = store
+        .as_ref()
+        .map(|s| {
+            let mut quotes = s.quotes().to_vec();
+            crate::anchor::settle(backend.as_ref(), &lens, &mut quotes);
+            quotes
+                .iter()
+                .map(|q| (q.spec.clone(), q.quoted()))
+                .collect()
         })
-    });
+        .unwrap_or_default();
+    let review = pull_request
+        .as_ref()
+        .and_then(|pr| {
+            store.as_ref()?.review(&link::PullRequestRef {
+                repository: pr.repository.clone(),
+                number: pr.number,
+                head_oid: pr.head_oid.clone(),
+            })
+        })
+        .map(|mut r| {
+            crate::anchor::settle(backend.as_ref(), &lens, &mut r.comments);
+            r
+        });
     if let Some(r) = review
         .as_ref()
         .filter(|r| r.verdict.is_some() || r.body.is_some() || !r.comments.is_empty())
@@ -979,7 +1027,13 @@ fn render_workspace(
     }
     // The saved focus, for the page to highlight and, when it changes, scroll
     // to. A span in a file that left the diff has nowhere to point.
-    if let Some(focus) = store.as_ref().and_then(|s| s.focus())
+    let focus = store.as_ref().and_then(|s| s.focus()).cloned().map(|f| {
+        let mut one = [f];
+        crate::anchor::settle(backend.as_ref(), &lens, &mut one);
+        let [f] = one;
+        f
+    });
+    if let Some(focus) = focus.filter(|f| f.pin.shown())
         && let Some(file) = files.iter().find(|f| f.path == focus.path)
     {
         let _ = write!(
@@ -999,7 +1053,15 @@ fn render_workspace(
             tour,
             &mut budget,
             out,
-            &mut |spec, budget, html| quote_html(index, spec, spec, &files, budget, html),
+            &mut |spec, budget, html| match quoted.get(spec.trim()) {
+                Some(crate::anchor::Quoted::Outdated) => outdated_quote(spec, html),
+                Some(crate::anchor::Quoted::At(now)) => {
+                    quote_html(index, now, spec, &files, budget, html)
+                }
+                Some(crate::anchor::Quoted::Elsewhere) | None => {
+                    quote_html(index, spec, spec, &files, budget, html)
+                }
+            },
         );
     }
     if let Some(c) = narrowed {
@@ -1491,7 +1553,10 @@ fn render_files(
                     // A review draft sits under the last line it's about,
                     // where GitHub will show it.
                     if let Some(n) = line.new {
-                        for d in drafts.iter().filter(|d| d.path == file.path && d.end == n) {
+                        for d in drafts
+                            .iter()
+                            .filter(|d| d.pin.shown() && d.path == file.path && d.end == n)
+                        {
                             out.push_str("<tr class=draft><td colspan=3>");
                             draft_card(d, out);
                             out.push_str("</td></tr>");
@@ -1519,13 +1584,18 @@ fn draft_card(d: &link::DraftReviewComment, out: &mut String) {
     };
     let _ = write!(
         out,
-        "<div class=draft-card data-draft=\"{}\" data-path=\"{}\" data-start={} data-end={}><div class=draft-head>Draft #{} <span class=dim>{}:{span} · last edit {who}</span></div><div class=draft-body>{}</div></div>",
+        "<div class=draft-card data-draft=\"{}\" data-path=\"{}\" data-start={} data-end={}><div class=draft-head>Draft #{} <span class=dim>{}:{span} · last edit {who}</span>{}</div><div class=draft-body>{}</div></div>",
         d.id,
         esc(&d.path),
         d.start,
         d.end,
         d.id,
         esc(&d.path),
+        if d.pin.outdated {
+            " <span class=outdated title=\"the lines it was written on changed since\">outdated</span>"
+        } else {
+            ""
+        },
         small_markdown(&d.body)
     );
 }
@@ -1554,9 +1624,10 @@ fn review_card(review: &state::RestoredReview, files: &[FileDiff], out: &mut Str
         .comments
         .iter()
         .filter(|d| {
-            !files
-                .iter()
-                .any(|f| f.path == d.path && review::shows_span(f, d.start, d.end))
+            !d.pin.shown()
+                || !files
+                    .iter()
+                    .any(|f| f.path == d.path && review::shows_span(f, d.start, d.end))
         })
         .collect();
     if !lost.is_empty() {
@@ -1974,6 +2045,16 @@ fn ask_html(id: &str, text: &str, rig: Option<&str>) -> String {
     out
 }
 
+/// A quote whose lines changed after it was written: the caption, and a
+/// plain statement in place of code that no longer says what it said.
+fn outdated_quote(caption: &str, out: &mut String) {
+    let _ = write!(
+        out,
+        "<figure class=quote><figcaption>{} <span class=outdated>outdated</span></figcaption><p class=dim>these lines changed after this was written</p></figure>",
+        esc(caption)
+    );
+}
+
 fn quote_html(
     index: usize,
     spec: &str,
@@ -2252,11 +2333,14 @@ mod tests {
         ];
         let mut out = String::new();
         render_group_doc(
-            group,
+            &GroupQuotes {
+                group,
+                rendered: &rendered,
+                quoted: &HashMap::new(),
+            },
             "tour",
             "tour",
             "# Across\n\n```recto beta/src/a.rs:2\n```\n\n```recto gamma/x.rs:1\n```\n",
-            &rendered,
             &mut 0,
             &mut out,
         );

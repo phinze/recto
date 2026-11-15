@@ -147,10 +147,31 @@ impl App {
         }
     }
 
+    /// Where a stamped quote's lines are now, or `None` for a quote with no
+    /// stamp, which reads its spec against the diff as written.
+    pub(crate) fn quoted(&self, spec: &str) -> Option<crate::anchor::Quoted> {
+        let stamp = self.quote_stamps.iter().find(|q| q.spec == spec.trim())?;
+        Some(stamp.quoted())
+    }
+
     /// Follow a quote into the full diff, remembering which document the
     /// reader left and where, so Esc or `u` can put them back.
     pub(crate) fn open_quote(&mut self, spec: &str) -> link::Response {
-        let (path, start, end) = parse_pathspec(spec);
+        let moved = match self.quoted(spec) {
+            Some(crate::anchor::Quoted::Outdated) => {
+                return link::Response::err(format!(
+                    "the lines {spec} quoted changed after the tour was written"
+                ));
+            }
+            Some(crate::anchor::Quoted::Elsewhere) => {
+                return link::Response::err(format!(
+                    "{spec} quotes a change this narrowed view isn't showing"
+                ));
+            }
+            Some(crate::anchor::Quoted::At(now)) => now,
+            None => spec.to_string(),
+        };
+        let (path, start, end) = parse_pathspec(&moved);
         let Some(start) = start else {
             return link::Response::err(format!("quote names no line: {spec}"));
         };
@@ -268,6 +289,12 @@ impl App {
             .as_deref()
             .map(tour_quote_anchors)
             .unwrap_or_default();
+        let located = self
+            .tour
+            .as_deref()
+            .map(crate::anchor::locate_quotes)
+            .unwrap_or_default();
+        self.quote_stamps = crate::anchor::stamp_quotes(&*self.backend, &located);
         self.rebuild_file_rows();
         self.persist_soon();
         link::Response::ok()

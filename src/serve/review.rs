@@ -44,7 +44,11 @@ impl Slate {
                 .comments
                 .iter()
                 .map(|c| DraftReviewComment {
-                    snippet: snippet(&self.files, &c.path, c.start, c.end),
+                    snippet: c
+                        .pin
+                        .shown()
+                        .then(|| snippet(&self.files, &c.path, c.start, c.end))
+                        .flatten(),
                     ..c.clone()
                 })
                 .collect(),
@@ -122,6 +126,11 @@ fn apply(
         next_id: restored.as_ref().map_or(1, |r| r.next_id),
         files,
     };
+    crate::anchor::settle(
+        backend,
+        &crate::anchor::Lens::range(backend),
+        &mut slate.comments,
+    );
     match request {
         link::Request::ReviewDraft => Ok(link::Response::ok_review_draft(slate.draft())),
         link::Request::ReviewVerdict { verdict } => {

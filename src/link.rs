@@ -981,6 +981,12 @@ pub(crate) fn harden_dir(dir: &Path) {
 #[cfg(not(unix))]
 pub(crate) fn harden_dir(_dir: &Path) {}
 
+impl crate::anchor::Pinned for DraftReviewComment {
+    fn parts(&mut self) -> (&str, &mut crate::anchor::Pin, &mut u32, &mut u32) {
+        (&self.path, &mut self.pin, &mut self.start, &mut self.end)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -15,6 +15,7 @@ use anyhow::{Context, Result, anyhow};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::anchor::QuoteStamp;
 use crate::app::{AgentNote, Annotation, FocusAnchor, NoteDraft};
 use crate::link::{DraftReviewBody, DraftReviewComment, PullRequest, PullRequestRef, Verdict};
 
@@ -84,6 +85,11 @@ struct Document {
     /// drafts below are keyed to it and are unreachable without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pull_request: Option<PullRequest>,
+    /// Stamps for the quotes in this workspace's tour, or in a group's
+    /// documents, so a quote keeps lifting the lines it was written about
+    /// after they move.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    quotes: Vec<QuoteStamp>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -119,6 +125,7 @@ impl Document {
             focus: None,
             comments_visible: true,
             pull_request: None,
+            quotes: Vec::new(),
         }
     }
 }
@@ -221,6 +228,26 @@ impl Store {
 
     pub fn set_tour(&mut self, tour: Option<&str>) {
         self.document.tour = tour.map(str::to_string);
+    }
+
+    pub fn quotes(&self) -> &[QuoteStamp] {
+        &self.document.quotes
+    }
+
+    /// Replace the stamps of the quotes a document names, keeping the rest:
+    /// a group's documents share one set, and rewriting one shouldn't forget
+    /// another's. Stamps no document names any more are dropped.
+    pub fn stamp_quotes(&mut self, fresh: Vec<QuoteStamp>, named: &[String]) {
+        self.document.quotes.retain(|q| !named.contains(&q.spec));
+        self.document.quotes.extend(fresh);
+        let live: Vec<String> = self
+            .docs()
+            .iter()
+            .map(|d| d.body.as_str())
+            .chain(self.document.brief.as_deref())
+            .flat_map(crate::anchor::quote_specs)
+            .collect();
+        self.document.quotes.retain(|q| live.contains(&q.spec));
     }
 
     pub fn brief(&self) -> Option<&str> {
@@ -540,6 +567,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         focus: None,
         comments_visible: true,
         pull_request: None,
+        quotes: Vec::new(),
     }))
 }
 
