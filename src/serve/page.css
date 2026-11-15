@@ -193,6 +193,11 @@ article.brief h2 { font-size: 15px; text-transform: uppercase; letter-spacing: 0
 
 .ask { background: var(--mantle); border: 1px solid var(--surface1); border-radius: 8px; padding: 10px 14px; margin: 10px 0; max-width: 70ch; }
 .ask.answered { border-color: var(--surface0); opacity: 0.85; }
+/* An action that's the person's to take, not a question: it keeps the
+   briefing open the same way, and its one button marks it done. */
+.ask.do { border-left: 3px solid var(--peach); }
+.ask-kind { font: 600 11px var(--mono); letter-spacing: 0.06em; text-transform: uppercase; color: var(--peach); margin-bottom: 4px; }
+.ask.do .ask-choices button.picked { background: var(--peach); border-color: var(--peach); }
 .ask-q p { margin: 0 0 6px; }
 .ask-choices { display: flex; flex-wrap: wrap; gap: 6px; margin: 6px 0; }
 .ask-choices button { font: 13px var(--sans); color: var(--text); background: var(--surface0); border: 1px solid var(--surface1); border-radius: 14px; padding: 3px 12px; cursor: pointer; }

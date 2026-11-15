@@ -88,7 +88,23 @@ Each fenced `ask ID` block is a question Paul answers in place. Its `- `
 lines are offered as choices, and he can add words either way. His answer
 comes back like any other comment, anchored to the ask's ID. Give every new
 question a new ID: the window remembers answers by ID, so a fresh question
-under an ID he already answered shows up as handled. Keep the
+under an ID he already answered shows up as handled.
+
+When what needs him is an action rather than a decision (click Install on
+the Mac, try the dev window, review the next stacked PR), write a `do ID`
+block instead:
+
+    ```do mac-install
+    Click Install on the Mac when its notification comes up.
+    ```
+
+It shows as a to-do with a **done** button and room for a note, keeps the
+briefing open the way an unanswered ask does, and is gathered into the chief
+of staff's page the same way. His "done" comes back as a comment anchored to
+the block's ID, like an answer, so follow up then (check the Mac reports
+installed). Don't bury an action he has to take in prose under "Needs you":
+the briefing folds once every block in it is settled, and prose doesn't
+count. Keep the
 section order: what needs him first, then what his comments turned into,
 then a short "where we stand". Rewrite the whole briefing rather than
 append to it, whenever you finish something he asked for or reach a

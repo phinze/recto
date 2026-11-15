@@ -622,7 +622,8 @@
 
   function askAnchor(card) {
     const q = card.querySelector('.ask-q').textContent.trim().split('\n')[0];
-    return { kind: 'ask', section: card.dataset.ask, label: 'Ask ' + card.dataset.ask + ': ' + (q.length > 80 ? q.slice(0, 79) + '…' : q) };
+    const what = card.classList.contains('do') ? 'Do ' : 'Ask ';
+    return { kind: 'ask', section: card.dataset.ask, label: what + card.dataset.ask + ': ' + (q.length > 80 ? q.slice(0, 79) + '…' : q) };
   }
 
   // rig names another rig the comment is for (an answer to an ask gathered

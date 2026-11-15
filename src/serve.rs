@@ -694,8 +694,8 @@ fn gather_asks(peers: &[Peer]) -> String {
             esc(&peer.slug),
             esc(&peer.label)
         );
-        for (id, text) in asks {
-            out.push_str(&ask_html(&id, &text, Some(&peer.slug)));
+        for (kind, id, text) in asks {
+            out.push_str(&ask_html(kind, &id, &text, Some(&peer.slug)));
         }
         out.push_str("</div>");
     }
@@ -705,14 +705,48 @@ fn gather_asks(peers: &[Peer]) -> String {
     format!("<section class=gathered><h2>Across rigs</h2>{out}</section>")
 }
 
-/// The asks in a briefing, as `(id, text)`, numbered the way `render_doc`
-/// numbers an ask that names no id.
-fn brief_asks(source: &str) -> Vec<(String, String)> {
+/// What needs the person, as a briefing writes it: an `ask` is a question
+/// they answer, a `do` is an action of theirs they mark done. Both keep the
+/// briefing open until they're settled, and both are answered the same way.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Need {
+    Ask,
+    Do,
+}
+
+/// Read a fence's info string as an `ask` or `do` block: its kind and the id
+/// it names, if any.
+fn need_fence(info: &str) -> Option<(Need, Option<String>)> {
+    let info = info.trim();
+    let (kind, rest) = if let Some(rest) = info.strip_prefix("ask") {
+        (Need::Ask, rest)
+    } else if let Some(rest) = info.strip_prefix("do") {
+        (Need::Do, rest)
+    } else {
+        return None;
+    };
+    if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
+        return None;
+    }
+    Some((kind, rest.split_whitespace().next().map(str::to_string)))
+}
+
+/// The id a block names, or its place among the briefing's blocks.
+fn need_id(kind: Need, id: Option<String>, n: usize) -> String {
+    id.unwrap_or_else(|| match kind {
+        Need::Ask => format!("ask{n}"),
+        Need::Do => format!("do{n}"),
+    })
+}
+
+/// The asks and to-dos in a briefing, as `(kind, id, text)`, numbered the way
+/// `render_doc` numbers a block that names no id.
+fn brief_asks(source: &str) -> Vec<(Need, String, String)> {
     let mut out = Vec::new();
-    let mut asking: Option<(String, String)> = None;
+    let mut asking: Option<(Need, String, String)> = None;
     let mut n = 0;
     for event in Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION) {
-        if let Some((_, text)) = asking.as_mut() {
+        if let Some((_, _, text)) = asking.as_mut() {
             match event {
                 Event::End(TagEnd::CodeBlock) => out.extend(asking.take()),
                 Event::Text(t) => text.push_str(&t),
@@ -721,12 +755,10 @@ fn brief_asks(source: &str) -> Vec<(String, String)> {
             continue;
         }
         if let Event::Start(Tag::CodeBlock(pulldown_cmark::CodeBlockKind::Fenced(info))) = event
-            && let Some(rest) = info.trim().strip_prefix("ask")
-            && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+            && let Some((kind, id)) = need_fence(&info)
         {
             n += 1;
-            let id = rest.split_whitespace().next().map(str::to_string);
-            asking = Some((id.unwrap_or_else(|| format!("ask{n}")), String::new()));
+            asking = Some((kind, need_id(kind, id, n), String::new()));
         }
     }
     out
@@ -2293,7 +2325,7 @@ fn render_doc(
     out: &mut String,
     quote: &mut QuoteFn,
 ) {
-    let mut asking: Option<(String, String)> = None;
+    let mut asking: Option<(Need, String, String)> = None;
     let mut asks = 0;
     let parser = Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION);
     let mut events: Vec<Event> = Vec::new();
@@ -2305,11 +2337,12 @@ fn render_doc(
     let mut images: Vec<bool> = Vec::new();
     let mut diagram: Option<String> = None;
     for event in parser {
-        if let Some((_, text)) = asking.as_mut() {
+        if let Some((_, _, text)) = asking.as_mut() {
             match event {
                 Event::End(TagEnd::CodeBlock) => {
-                    let (id, text) = asking.take().unwrap_or_default();
-                    events.push(Event::Html(ask_html(&id, &text, None).into()));
+                    if let Some((kind, id, text)) = asking.take() {
+                        events.push(Event::Html(ask_html(kind, &id, &text, None).into()));
+                    }
                 }
                 Event::Text(t) => text.push_str(&t),
                 _ => {}
@@ -2357,12 +2390,10 @@ fn render_doc(
                     continue;
                 }
                 if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind
-                    && let Some(rest) = info.trim().strip_prefix("ask")
-                    && (rest.is_empty() || rest.starts_with(char::is_whitespace))
+                    && let Some((need, id)) = need_fence(info)
                 {
                     asks += 1;
-                    let id = rest.split_whitespace().next().map(str::to_string);
-                    asking = Some((id.unwrap_or_else(|| format!("ask{asks}")), String::new()));
+                    asking = Some((need, need_id(need, id, asks), String::new()));
                     continue;
                 }
                 events.push(event);
@@ -2492,24 +2523,37 @@ fn render_doc(
 /// Quote `spec`'s lines from `files`, the diff of the repo at `index`.
 /// `caption` is how the tour wrote the spec, which a group tour prefixes with
 /// the repo's directory.
-/// A question the person answers in place. Lines starting `- ` are choices;
-/// the rest is the question. The page sends the answer as a comment anchored
-/// to the ask's id, so answering is the same gesture as commenting.
-fn ask_html(id: &str, text: &str, rig: Option<&str>) -> String {
+/// A question the person answers in place, or an action of theirs they mark
+/// done. For a question, lines starting `- ` are choices and the rest is the
+/// question; an action's only choice is "done". The page sends the answer as
+/// a comment anchored to the block's id, so answering is the same gesture as
+/// commenting, and either kind keeps the briefing open until it's settled.
+fn ask_html(kind: Need, id: &str, text: &str, rig: Option<&str>) -> String {
     let mut question = Vec::new();
     let mut choices = Vec::new();
     for line in text.lines() {
         match line.trim_start().strip_prefix("- ") {
-            Some(choice) => choices.push(choice.trim()),
-            None => question.push(line),
+            Some(choice) if kind == Need::Ask => choices.push(choice.trim()),
+            _ => question.push(line),
         }
     }
+    if kind == Need::Do {
+        choices = vec!["done"];
+    }
     let question = question.join("\n");
-    let mut out = format!("<div class=ask data-ask=\"{}\"", esc(id));
+    let mut out = format!(
+        "<div class=\"ask{}\" data-ask=\"{}\"",
+        if kind == Need::Do { " do" } else { "" },
+        esc(id)
+    );
     if let Some(rig) = rig {
         let _ = write!(out, " data-rig=\"{}\"", esc(rig));
     }
-    out.push_str("><div class=ask-q>");
+    out.push('>');
+    if kind == Need::Do {
+        out.push_str("<div class=ask-kind>for you to do</div>");
+    }
+    out.push_str("<div class=ask-q>");
     for para in question
         .split("\n\n")
         .map(str::trim)
@@ -3112,6 +3156,48 @@ mod tests {
         assert!(out.contains("data-ask=\"ask2\""), "{out}");
     }
 
+    /// An action that's the person's to take is a `do` block: a card of its
+    /// own kind whose one choice is done, counted with the asks so the
+    /// briefing stays open and a coordinator gathers it. A dash line in it is
+    /// part of the action, not a choice.
+    #[test]
+    fn do_blocks_are_actions_marked_done() {
+        let mut out = String::new();
+        render_doc(
+            "brief",
+            "bg",
+            "Briefing",
+            "## Needs you\n\n```do mac-install\nClick Install on the Mac.\n- it may ask for Touch ID\n```\n\n```do\nTry the dev pill.\n```\n\n```dog\nnot a do\n```\n",
+            &mut 0,
+            &mut out,
+            &mut |_, _, _| {},
+        );
+        assert!(
+            out.contains("class=\"ask do\" data-ask=\"mac-install\""),
+            "{out}"
+        );
+        assert!(out.contains("for you to do"), "{out}");
+        assert!(out.contains("data-choice=\"done\""), "{out}");
+        assert!(
+            !out.contains("data-choice=\"it may ask"),
+            "dash lines are part of the action: {out}"
+        );
+        assert!(
+            out.contains("data-ask=\"do2\""),
+            "an unnamed do is numbered: {out}"
+        );
+        assert!(!out.contains("data-ask=\"dog"), "{out}");
+
+        let gathered =
+            brief_asks("```do mac-install\nClick Install.\n```\n\n```ask q\nShip?\n```\n");
+        let kinds: Vec<bool> = gathered.iter().map(|(k, _, _)| *k == Need::Do).collect();
+        assert_eq!(
+            kinds,
+            [true, false],
+            "a coordinator gathers to-dos with the asks"
+        );
+    }
+
     // A coordinator gathers another rig's asks by the ids its own page uses,
     // so an answer from either page marks the same ask.
     #[test]
@@ -3119,10 +3205,10 @@ mod tests {
         let asks = brief_asks(
             "```ask q1\nShip?\n- yes\n```\n\ntext\n\n```ask\nAnything else?\n```\n```rust\nfn x() {}\n```\n",
         );
-        let ids: Vec<&str> = asks.iter().map(|(id, _)| id.as_str()).collect();
+        let ids: Vec<&str> = asks.iter().map(|(_, id, _)| id.as_str()).collect();
         assert_eq!(ids, ["q1", "ask2"]);
-        assert_eq!(asks[0].1, "Ship?\n- yes\n");
-        let card = ask_html("q1", &asks[0].1, Some("other-rig"));
+        assert_eq!(asks[0].2, "Ship?\n- yes\n");
+        let card = ask_html(Need::Ask, "q1", &asks[0].2, Some("other-rig"));
         assert!(
             card.contains("data-ask=\"q1\" data-rig=\"other-rig\""),
             "{card}"
