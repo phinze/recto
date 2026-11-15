@@ -353,6 +353,7 @@
     syncExpandButtons();
     syncMarkers(false);
     decorate();
+    resolveStamps();
     if (fromStep && inside) {
       const bar = fresh.querySelector('.lensbar');
       const nav = content.querySelector('nav.tabs');
@@ -398,6 +399,7 @@
     // Asks get their answer boxes and drafts back before the reader's place
     // is measured again, since they change the page's height.
     decorate();
+    resolveStamps();
     if (framed) dropStalePick();
     if (pendingFocus) {
       const spec = pendingFocus;
@@ -814,6 +816,42 @@
   // diff line, a badge on a section, an ask showing its answer. Redrawn after
   // every refresh, since a refresh replaces the page.
   const stateWords = { held: 'held', failed: 'not delivered', sent: 'sent', start: 'on it', done: 'handled' };
+  // Comments Rig stamped when they were made carry the change their lines
+  // belong to; Recto says where those lines are now, so a comment held across
+  // an amend still marks what it was about. Asked again after every refresh.
+  const stampSpans = new Map(); // comment id -> {start, end}, or null when outdated
+  let resolving = 0;
+  async function resolveStamps() {
+    const stamped = comments.filter((c) => c.anchor.kind === 'diff' && c.anchor.stamp && c.anchor.repo);
+    const asked = [];
+    let url = 'resolve' + qs;
+    for (const c of stamped) {
+      const section = content.querySelector(`section.repo[data-repo="${CSS.escape(c.anchor.repo)}"]`);
+      if (!section) continue;
+      url = withParam(url, 's=' + encodeURIComponent(section.id.slice(5) + '|' + c.anchor.path + '|' + JSON.stringify(c.anchor.stamp)));
+      asked.push(c.id);
+    }
+    const mine = ++resolving;
+    if (!asked.length) {
+      if (stampSpans.size) { stampSpans.clear(); decorate(); }
+      return;
+    }
+    let answers;
+    try {
+      const res = await fetch(url, { cache: 'no-store' });
+      if (!res.ok) return;
+      answers = await res.json();
+    } catch { return; }
+    if (mine !== resolving) return;
+    stampSpans.clear();
+    asked.forEach((id, i) => {
+      const a = answers[i];
+      if (a && a.outdated) stampSpans.set(id, null);
+      else if (a && a.start) stampSpans.set(id, { start: a.start, end: a.end });
+    });
+    decorate();
+  }
+
   function decorate() {
     for (const el of content.querySelectorAll('.has-comment')) { el.classList.remove('has-comment'); delete el.dataset.cstate; }
     for (const el of content.querySelectorAll('.c-badge')) el.remove();
@@ -824,10 +862,13 @@
       if (a.kind === 'diff' && a.start) {
         const section = content.querySelector(`section.repo[data-repo="${CSS.escape(a.repo)}"]`);
         const file = section && [...section.querySelectorAll('details.file')].find((d) => d.dataset.path === a.path);
-        const end = a.end || a.start;
-        const rows = file ? [...file.querySelectorAll('tr')].filter((tr) => {
+        // A stamped comment marks the lines it was written on wherever they
+        // are now; one whose lines changed marks nothing.
+        const moved = stampSpans.get(c.id);
+        const span = moved === undefined ? { start: a.start, end: a.end || a.start } : moved;
+        const rows = file && span ? [...file.querySelectorAll('tr')].filter((tr) => {
           const n = tr.cells.length === 3 && parseInt(tr.cells[1].textContent, 10);
-          return n >= a.start && n <= end;
+          return n >= span.start && n <= span.end;
         }) : [];
         for (const row of rows) { row.classList.add('has-comment'); row.dataset.cstate = c.state; row.title = c.body; }
       } else if (a.kind === 'draft' || a.kind === 'review') {
@@ -1077,7 +1118,7 @@
     if (e.data && Array.isArray(e.data.comments)) {
       const was = JSON.stringify(comments);
       comments = e.data.comments;
-      if (JSON.stringify(comments) !== was) steady(decorate);
+      if (JSON.stringify(comments) !== was) { steady(decorate); resolveStamps(); }
     }
     if (e.data && e.data.peerComments) {
       const was = JSON.stringify(peerComments);

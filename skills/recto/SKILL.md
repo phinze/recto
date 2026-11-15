@@ -164,6 +164,12 @@ it stands:
     rig ack c3f1a start     # taken up
     rig ack c3f1a done      # handled
 
+A comment on diff lines in a jj repository also says which change those
+lines belong to (`(lines in change kxyzabcd)`). Its line numbers were the
+diff's when he selected them, so if you've edited since, find the lines by
+that change and the quoted text rather than by number. The window keeps
+marking them where they've moved.
+
 Acks carry no text. Don't answer each comment with a message. Put what he
 should read (what each comment turned into, questions back) in the briefing.
 `rig reply` doesn't answer comments.

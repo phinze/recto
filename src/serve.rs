@@ -116,6 +116,8 @@ struct Request {
     /// Render only this root's section: what a page asks for when the reader
     /// moves one repo's view, so the rest of the page isn't rendered again.
     only: Option<usize>,
+    /// Stamps to resolve, for `/resolve`: `ROOT_INDEX|PATH|STAMP_JSON` each.
+    stamps: Vec<String>,
     /// Other groups whose open asks this page gathers, for a coordinator
     /// that organizes the person's attention across them.
     peers: Vec<Peer>,
@@ -153,6 +155,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
     let mut starts = Vec::new();
     let mut views = Vec::new();
     let mut only = None;
+    let mut stamps = Vec::new();
     let mut peers = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -166,6 +169,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
                 }
             }
             "only" => only = percent_decode(v).parse().ok(),
+            "s" => stamps.push(percent_decode(v)),
             "view" => {
                 if let Some((i, spec)) = percent_decode(v).split_once(':')
                     && let Ok(i) = i.parse()
@@ -197,6 +201,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
         starts,
         views,
         only,
+        stamps,
         peers,
     })
 }
@@ -231,6 +236,10 @@ fn handle(mut stream: UnixStream) {
             );
         }
         "/events" => events(stream, &req),
+        "/resolve" => {
+            let body = resolve(&req);
+            respond(&mut stream, "200 OK", "application/json", body.as_bytes());
+        }
         "/healthz" => respond(&mut stream, "200 OK", "text/plain", b"ok\n"),
         PELE_PATH => {
             let head = format!(
@@ -243,6 +252,47 @@ fn handle(mut stream: UnixStream) {
         path if path.starts_with("/asset/") => asset(&mut stream, &path["/asset/".len()..]),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found\n"),
     }
+}
+
+/// Where stamped lines are now, for anchors the page holds but Recto doesn't
+/// render itself: comments sent from the window, which Rig keeps. Each
+/// answer is `{"start", "end"}` in the root's range, or `{"outdated": true}`,
+/// in the order asked; anything that can't be read answers `null`.
+fn resolve(req: &Request) -> String {
+    let answers: Vec<serde_json::Value> = req
+        .stamps
+        .iter()
+        .map(|entry| {
+            let mut parts = entry.splitn(3, '|');
+            let (Some(i), Some(path), Some(json)) = (parts.next(), parts.next(), parts.next())
+            else {
+                return serde_json::Value::Null;
+            };
+            let (Ok(i), Ok(stamp)) = (
+                i.parse::<usize>(),
+                serde_json::from_str::<crate::anchor::Stamp>(json),
+            ) else {
+                return serde_json::Value::Null;
+            };
+            let Some(backend) = req
+                .roots
+                .get(i)
+                .and_then(|r| canonical_repo(Path::new(r)))
+                .and_then(|r| detect_backend_from(&r))
+            else {
+                return serde_json::Value::Null;
+            };
+            let lens = crate::anchor::Lens::range(backend.as_ref());
+            match crate::anchor::Resolver::new(backend.as_ref()).resolve(&lens, path, &stamp) {
+                crate::anchor::Resolution::At { start, end, .. } => {
+                    serde_json::json!({ "start": start, "end": end })
+                }
+                crate::anchor::Resolution::Outdated => serde_json::json!({ "outdated": true }),
+                crate::anchor::Resolution::Elsewhere => serde_json::Value::Null,
+            }
+        })
+        .collect();
+    serde_json::Value::Array(answers).to_string()
 }
 
 /// A page never loads anything from off this server: the renderer turns
@@ -3037,6 +3087,48 @@ mod tests {
         assert!(out.contains("<span class=rev-id>unpushed</span>"), "{out}");
     }
 
+    /// A comment Rig stamped when it was made asks Recto where its lines are
+    /// now: after its change is amended to put lines above it, the answer
+    /// follows them, and once its own line is rewritten it's outdated.
+    #[test]
+    fn a_stamped_comment_finds_its_lines_after_an_amend() {
+        let (repo, c) = layered_repo();
+        let root = repo.0.to_string_lossy().to_string();
+        let backend = crate::backend::JjBackend::new(repo.0.clone());
+        let stamp = crate::anchor::Resolver::new(&backend)
+            .stamp(&crate::anchor::Lens::range(&backend), "c.txt", 1, 1)
+            .expect("stamp");
+        let ask = |stamp: &crate::anchor::Stamp| {
+            resolve(&Request {
+                path: "/resolve".into(),
+                roots: vec![root.clone()],
+                group: None,
+                label: None,
+                starts: Vec::new(),
+                views: Vec::new(),
+                only: None,
+                stamps: vec![
+                    format!("0|c.txt|{}", serde_json::to_string(stamp).unwrap()),
+                    "junk".into(),
+                ],
+                peers: Vec::new(),
+            })
+        };
+        assert_eq!(ask(&stamp), r#"[{"end":1,"start":1},null]"#);
+
+        repo.run("jj", &["edit", &c["c"]]);
+        std::fs::write(repo.0.join("c.txt"), "above\nc\n").unwrap();
+        repo.run("jj", &["new", "heads(all())"]);
+        assert_eq!(
+            ask(&stamp),
+            r#"[{"end":2,"start":2},null]"#,
+            "it follows its line down"
+        );
+
+        std::fs::write(repo.0.join("c.txt"), "above\nreworded\n").unwrap();
+        assert_eq!(ask(&stamp), r#"[{"outdated":true},null]"#);
+    }
+
     /// Moving one repo's view asks for that section alone, and a section
     /// already rendered for the repo's current state comes back from the
     /// cache, until a working-copy edit moves jj's operation on.
@@ -3052,6 +3144,7 @@ mod tests {
             starts: Vec::new(),
             views: vec![(1, c["c"].clone())],
             only,
+            stamps: Vec::new(),
             peers: Vec::new(),
         };
         let alone = fragment(&req(Some(1)));

@@ -103,6 +103,12 @@ pub(crate) enum ClientCommand {
     /// the layer that change heads, or nothing for the whole stack. The web
     /// window follows it the way it follows focus.
     Lens { spec: Option<String> },
+    /// Print the stamp for lines of the current diff as JSON: the change that
+    /// owns them, the commit it is, the lines in that commit's tree, and
+    /// their text. SPEC is `path:LINE` or `path:START-END`, new-side lines
+    /// relative to the repository root. Exits 1 when the lines can't be
+    /// stamped (a git repository, or lines that aren't there).
+    Stamp { spec: String },
     /// Control visibility of published threads, shared drafts, and private
     /// notes without affecting tour annotations.
     CommentVisibility {
@@ -308,6 +314,41 @@ fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
     }
 }
 
+/// Stamp lines of the current diff for a caller outside Recto, such as Rig
+/// keeping the comments sent from its window attached to their lines.
+fn print_stamp(spec: &str) -> i32 {
+    let (path, start, end) = parse_pathspec(spec);
+    let Some(start) = start else {
+        eprintln!("recto: stamp takes path:LINE or path:START-END");
+        return 2;
+    };
+    let end = end.unwrap_or(start).max(start);
+    let backend = match crate::backend::detect_backend() {
+        Ok(backend) => backend,
+        Err(e) => {
+            eprintln!("recto: {e:#}");
+            return 2;
+        }
+    };
+    let lens = crate::anchor::Lens::range(backend.as_ref());
+    match crate::anchor::Resolver::new(backend.as_ref()).stamp(&lens, path, start, end) {
+        Some(stamp) => match serde_json::to_string(&stamp) {
+            Ok(json) => {
+                println!("{json}");
+                0
+            }
+            Err(e) => {
+                eprintln!("recto: {e}");
+                2
+            }
+        },
+        None => {
+            eprintln!("recto: {spec} can't be stamped here");
+            1
+        }
+    }
+}
+
 /// Write a tour with no viewer running, holding it to the rule a viewer
 /// applies: a new tour against an attached PR is refused while the workspace
 /// isn't at that PR's head. Taking a tour down is always allowed.
@@ -371,6 +412,9 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
     }
     if let ClientCommand::State { command } = &command {
         return run_state_command(command);
+    }
+    if let ClientCommand::Stamp { spec } = &command {
+        return print_stamp(spec);
     }
     if let ClientCommand::Doc { name, body, group } = &command {
         let valid = !name.is_empty()
@@ -660,6 +704,7 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
     match command {
         ClientCommand::State { .. }
         | ClientCommand::Serve { .. }
+        | ClientCommand::Stamp { .. }
         | ClientCommand::Brief { .. }
         | ClientCommand::Doc { .. } => {
             Err(anyhow!("this command does not use the workspace socket"))
