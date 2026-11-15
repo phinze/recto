@@ -230,14 +230,24 @@ pub(crate) struct TempRepo(pub(crate) PathBuf);
 
 impl TempRepo {
     pub(crate) fn new(name: &str) -> Self {
+        // A clock alone doesn't make the directory unique: macOS reports
+        // time in microseconds, so tests sharing a name and starting together
+        // would land in one directory. The counter is unique per process.
+        static NEXT: AtomicUsize = AtomicUsize::new(0);
         let nonce = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         let root = std::env::temp_dir().join(format!(
-            "recto-backend-{name}-{}-{nonce}",
-            std::process::id()
+            "recto-backend-{name}-{}-{}-{nonce}",
+            std::process::id(),
+            NEXT.fetch_add(1, Ordering::Relaxed)
         ));
+        assert!(
+            !root.exists(),
+            "temp repository {} already exists",
+            root.display()
+        );
         std::fs::create_dir_all(&root).expect("create temp repository");
         Self(root)
     }
