@@ -415,6 +415,10 @@ fn forget_at(state_home: &Path, workspace_root: &Path) -> Result<()> {
             return Err(error).with_context(|| format!("could not remove {}", path.display()));
         }
     }
+    // Images the forgotten documents showed go with them, unless another
+    // workspace still shows the same one.
+    let _ = crate::assets::sweep_in(state_home);
+    let _ = fs::remove_dir(state_home.join("recto/assets"));
     if let Some(workspaces) = path.parent() {
         let _ = fs::remove_dir(workspaces);
         if let Some(recto) = workspaces.parent() {
@@ -434,7 +438,7 @@ pub fn state_path(workspace_root: &Path) -> Result<PathBuf> {
     ))
 }
 
-fn state_home() -> Result<PathBuf> {
+pub(crate) fn state_home() -> Result<PathBuf> {
     if let Some(value) = std::env::var_os("XDG_STATE_HOME") {
         let path = PathBuf::from(value);
         if path.is_absolute() {

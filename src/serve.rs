@@ -226,13 +226,44 @@ fn handle(mut stream: UnixStream) {
         }
         "/events" => events(stream, &req),
         "/healthz" => respond(&mut stream, "200 OK", "text/plain", b"ok\n"),
+        path if path.starts_with("/asset/") => asset(&mut stream, &path["/asset/".len()..]),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found\n"),
     }
 }
 
-fn respond(stream: &mut UnixStream, status: &str, ctype: &str, body: &[u8]) {
+/// A page never loads anything from off this server: the renderer turns
+/// remote images into links, and this says the same to the browser.
+const PAGE_POLICY: &str =
+    "img-src 'self'; media-src 'none'; object-src 'none'; frame-src 'none'; font-src 'self'";
+
+/// A stored image, by the name recto gave it. Content-addressed, so the
+/// browser may keep it forever. An SVG opened directly runs no script and
+/// fetches nothing; shown through `<img>` it couldn't anyway.
+fn asset(stream: &mut UnixStream, name: &str) {
+    let found = crate::assets::content_type(name).and_then(|ctype| {
+        let dir = crate::assets::store_dir().ok()?;
+        Some((ctype, std::fs::read(dir.join(name)).ok()?))
+    });
+    let Some((ctype, body)) = found else {
+        respond(stream, "404 Not Found", "text/plain", b"not found\n");
+        return;
+    };
     let head = format!(
-        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\nConnection: close\r\n\r\n",
+        "HTTP/1.1 200 OK\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: private, max-age=31536000, immutable\r\nX-Content-Type-Options: nosniff\r\nContent-Security-Policy: default-src 'none'; style-src 'unsafe-inline'; sandbox\r\nConnection: close\r\n\r\n",
+        body.len()
+    );
+    let _ = stream.write_all(head.as_bytes());
+    let _ = stream.write_all(&body);
+}
+
+fn respond(stream: &mut UnixStream, status: &str, ctype: &str, body: &[u8]) {
+    let policy = if ctype.starts_with("text/html") {
+        format!("Content-Security-Policy: {PAGE_POLICY}\r\n")
+    } else {
+        String::new()
+    };
+    let head = format!(
+        "HTTP/1.1 {status}\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nCache-Control: no-store\r\n{policy}Connection: close\r\n\r\n",
         body.len()
     );
     let _ = stream.write_all(head.as_bytes());
@@ -1522,6 +1553,13 @@ fn review_card(review: &state::RestoredReview, files: &[FileDiff], out: &mut Str
     out.push_str("</article>");
 }
 
+/// The page-relative URL for an image recto stored when its document was
+/// saved. Relative, so it resolves the same behind rig's proxy as standalone.
+fn stored_image(dest: &str) -> Option<String> {
+    let name = dest.strip_prefix(crate::assets::SCHEME)?;
+    crate::assets::content_type(name).map(|_| format!("asset/{name}"))
+}
+
 /// A short markdown body (a draft comment, a review summary) as HTML, with
 /// the same rules as a tour: raw HTML shows as text, links only go somewhere
 /// safe, and images never load.
@@ -1687,6 +1725,9 @@ fn render_doc(
     let mut outline: Vec<(String, String)> = Vec::new();
     let mut heading: Option<(String, String)> = None;
     let mut quoting: Option<String> = None;
+    // Whether each open image is a stored one, so its end closes the right
+    // element; alt text can itself hold an image.
+    let mut images: Vec<bool> = Vec::new();
     for event in parser {
         if let Some((_, text)) = asking.as_mut() {
             match event {
@@ -1758,9 +1799,33 @@ fn render_doc(
             // Tours are agent-written and may quote text from anywhere; show
             // any raw HTML as the text it is rather than letting it run.
             Event::Html(t) | Event::InlineHtml(t) => events.push(Event::Text(t)),
+            // An image recto stored when the document was saved loads from
+            // this server, and opens full size in a tab of its own.
+            Event::Start(Tag::Image {
+                link_type,
+                dest_url,
+                title,
+                id,
+            }) if stored_image(&dest_url).is_some() => {
+                let src = stored_image(&dest_url).unwrap_or_default();
+                events.push(Event::Html(
+                    format!("<a class=shot href=\"{src}\" target=_blank rel=noopener>").into(),
+                ));
+                events.push(Event::Start(Tag::Image {
+                    link_type,
+                    dest_url: src.into(),
+                    title,
+                    id,
+                }));
+                images.push(true);
+            }
+            Event::End(TagEnd::Image) if images.pop() == Some(true) => {
+                events.push(Event::End(TagEnd::Image));
+                events.push(Event::Html("</a>".into()));
+            }
             // A link keeps its text, but only an http(s), mailto or in-page
-            // target. An image never loads (that would fetch on open); it
-            // becomes a link to itself.
+            // target. Any other image never loads (that would fetch on open);
+            // it becomes a link to itself.
             Event::Start(Tag::Link {
                 link_type,
                 dest_url,
@@ -1785,6 +1850,7 @@ fn render_doc(
                     id,
                 }));
                 events.push(Event::Text("image: ".into()));
+                images.push(false);
             }
             Event::End(TagEnd::Image) => events.push(Event::End(TagEnd::Link)),
             other => events.push(other),
@@ -2255,6 +2321,35 @@ mod tests {
         assert!(out.contains("href=\"#t0-1\""), "{out}");
         assert!(!out.contains("<img"), "{out}");
         assert!(out.contains("image: pic"), "{out}");
+    }
+
+    #[test]
+    fn stored_images_load_from_this_server_and_nothing_else_does() {
+        let hash = "c".repeat(64);
+        let mut out = String::new();
+        render_tour(
+            "t0",
+            "Tour",
+            &format!(
+                "![shot](recto-asset:{hash}.png) ![forged](recto-asset:../x.png) ![outer ![inner](https://t/i.png)](recto-asset:{hash}.svg)"
+            ),
+            &mut 0,
+            &mut out,
+            &mut |_, _, _| {},
+        );
+        assert!(
+            out.contains(&format!(
+                "<a class=shot href=\"asset/{hash}.png\" target=_blank rel=noopener><img src=\"asset/{hash}.png\" alt=\"shot\" /></a>"
+            )),
+            "{out}"
+        );
+        assert!(!out.contains("src=\"recto-asset"), "{out}");
+        assert!(!out.contains("src=\"https"), "{out}");
+        assert_eq!(out.matches("<img").count(), 2, "{out}");
+        assert!(
+            out.contains("alt=\"outer image: inner\" /></a></p>"),
+            "{out}"
+        );
     }
 
     #[test]

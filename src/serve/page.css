@@ -194,6 +194,9 @@ tr.has-comment[data-cstate=failed] td.ln:first-child { box-shadow: inset 3px 0 0
 .c-badge[data-cstate=failed] { border-color: var(--red); color: var(--red); }
 
 article.doc { border-left-color: var(--peach); }
+a.shot { display: inline-block; max-width: 100%; }
+a.shot img { display: block; max-width: 100%; height: auto; border: 1px solid var(--surface0); border-radius: 4px; background: var(--mantle); }
+article:is(.tour, .doc, .brief) > p:has(> a.shot) { max-width: none; }
 
 .gathered { margin: 4px 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--surface0); }
 .gathered h2 { font: 600 13px var(--sans); text-transform: uppercase; letter-spacing: 0.06em; color: var(--subtext); margin: 4px 0 8px; }

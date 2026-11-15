@@ -102,6 +102,25 @@ cos's page too: rewrite the briefing to drop it. Link another rig with
 `[label](rig:SLUG)`, its basedir name; clicking it puts that rig on screen
 in Rex, and the window follows.
 
+### Images
+
+A briefing, doc or tour can show a picture: a screenshot of a UI you
+changed, logo options side by side, or a diagram you drew as SVG. Write an
+ordinary inline image with a path on this machine:
+
+    ![the empty state](shots/empty.png)
+
+Relative paths resolve from where you run `recto`, so the scratchpad is a
+fine place to keep them. Don't put them in a repo, where jj snapshots them
+into `@`. When the document is saved, recto copies each file into its own
+store and the window shows the copy, so a picture lasts as long as the
+document that shows it. To change one, write the file again and rewrite the
+document. PNG, JPEG, GIF, WebP, AVIF and SVG work, up to 20 MB each. A path
+that can't be stored refuses the whole write with exit 1 and names it.
+Remote image URLs stay links, because opening the page never fetches
+anything off the machine. Raw `<svg>` in the Markdown shows as text, so
+write the SVG to a file and reference it.
+
 ### Comments from the window
 
 Paul can select anything in the window (diff lines, a tour passage, part of

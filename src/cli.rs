@@ -251,15 +251,19 @@ fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
                 dir.display()
             )));
         }
+        let body = match crate::assets::ingest(body.trim(), &std::env::current_dir()?) {
+            Ok(body) => body,
+            Err(e) => return Ok(Err(format!("{e:#}"))),
+        };
         let mut store = state::Store::load(&dir, None)?;
-        let body = body.trim();
-        let body = (!body.is_empty()).then_some(body);
+        let body = (!body.is_empty()).then_some(body.as_str());
         if brief {
             store.set_brief(body);
         } else {
             store.set_doc(name, body);
         }
         store.save()?;
+        let _ = crate::assets::sweep();
         Ok(Ok(repos))
     })();
     match result {
@@ -322,6 +326,7 @@ fn save_tour_offline(body: &str) -> i32 {
         }
         store.set_tour((!body.is_empty()).then_some(body));
         store.save()?;
+        let _ = crate::assets::sweep();
         Ok(None)
     })();
     match result {
@@ -420,6 +425,23 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             eprintln!("recto: {e}");
             return 2;
         }
+    };
+    // A tour's images are copied in here, before it reaches either a viewer or
+    // the store, so both see the same rewritten body.
+    let request = match request {
+        link::Request::Tour { body } => {
+            match std::env::current_dir()
+                .map_err(anyhow::Error::from)
+                .and_then(|cwd| crate::assets::ingest(&body, &cwd))
+            {
+                Ok(body) => link::Request::Tour { body },
+                Err(e) => {
+                    eprintln!("recto: {e:#}");
+                    return 1;
+                }
+            }
+        }
+        other => other,
     };
     // Both of these move the range, and both do it asynchronously. Hiding that
     // in the client keeps the next companion command from racing the old diff.
