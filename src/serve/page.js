@@ -310,6 +310,7 @@
     // Asks get their answer boxes and drafts back before the reader's place
     // is measured again, since they change the page's height.
     decorate();
+    if (framed) dropStalePick();
     if (pendingFocus) {
       const spec = pendingFocus;
       pendingFocus = null;
@@ -542,20 +543,73 @@
   // and stays up through the tap instead of vanishing with the selection.
   let lastSel = null;
   let pressing = false;
+  // On a touch screen the pill docks at the bottom of the window. Beside the
+  // selection it lands under iOS's own copy/look-up menu, which has to be
+  // dismissed before the pill can be tapped.
+  const touch = window.matchMedia('(pointer: coarse), (max-width: 600px)');
+  function placePill(rect, words) {
+    pill.textContent = words;
+    pill.classList.toggle('dock', touch.matches);
+    if (!touch.matches) {
+      pill.style.top = Math.min(window.innerHeight - 40, rect.bottom + 6) + 'px';
+      pill.style.left = Math.max(8, Math.min(window.innerWidth - 100, rect.right - 40)) + 'px';
+    } else {
+      pill.style.top = pill.style.left = '';
+    }
+    pill.classList.add('shown');
+  }
   document.addEventListener('selectionchange', () => {
     if (!framed || pressing) return;
     const sel = document.getSelection();
     if (!sel || sel.isCollapsed || !sel.rangeCount || sel.toString().trim().length < 2) {
-      // Let a tap on the pill land before it goes away.
-      return setTimeout(() => { if (!pressing && document.getSelection()?.isCollapsed !== false) hidePill(); }, 400);
+      // Let a tap on the pill land before it goes away. Lines picked by
+      // their numbers aren't a selection, so they keep it.
+      return setTimeout(() => { if (!pressing && !picked && document.getSelection()?.isCollapsed !== false) hidePill(); }, 400);
     }
     const range = sel.getRangeAt(0);
     if (!content.contains(range.commonAncestorContainer) || range.commonAncestorContainer.closest?.('.ask')) return hidePill();
+    clearPicked();
     lastSel = { range: range.cloneRange(), text: sel.toString() };
-    const rect = range.getBoundingClientRect();
-    pill.style.top = Math.min(window.innerHeight - 40, rect.bottom + 6) + 'px';
-    pill.style.left = Math.max(8, Math.min(window.innerWidth - 100, rect.right - 40)) + 'px';
-    pill.classList.add('shown');
+    placePill(range.getBoundingClientRect(), touch.matches ? 'comment on selection' : 'comment');
+  });
+
+  // Diff lines picked by tapping their numbers: one tap picks a line, a tap
+  // on another line in the same file picks the run between them, and a tap
+  // on a lone picked line lets it go. Selecting code by dragging on a phone
+  // fights the browser's own handles and menus; a line number is a target.
+  let picked = null; // {table, a, b}: the first and last rows tapped
+  function pickedRows() {
+    if (!picked) return [];
+    const rows = [...picked.table.rows];
+    let i = rows.indexOf(picked.a), j = rows.indexOf(picked.b);
+    if (i < 0 || j < 0) return [];
+    if (i > j) [i, j] = [j, i];
+    return rows.slice(i, j + 1).filter((tr) => tr.cells.length === 3);
+  }
+  function clearPicked() {
+    for (const tr of content.querySelectorAll('tr.picked')) tr.classList.remove('picked');
+    picked = null;
+  }
+  content.addEventListener('click', (e) => {
+    const td = framed && e.target.closest('table.diff td.ln');
+    if (!td || td.parentElement.cells.length !== 3) return;
+    const tr = td.parentElement, table = tr.closest('table.diff');
+    if (picked && picked.table === table && picked.a === picked.b) {
+      if (picked.a === tr) { clearPicked(); hidePill(); return; }
+      picked.b = tr;
+    } else {
+      clearPicked();
+      picked = { table, a: tr, b: tr };
+    }
+    document.getSelection()?.removeAllRanges();
+    const rows = pickedRows();
+    for (const r of rows) r.classList.add('picked');
+    const range = document.createRange();
+    range.setStartBefore(rows[0]);
+    range.setEndAfter(rows[rows.length - 1]);
+    lastSel = { range, text: rows.map((r) => r.cells[2].textContent.replace(/^[+−\s]/, '')).join('\n') };
+    const n = rows.length;
+    placePill(rows[rows.length - 1].getBoundingClientRect(), n === 1 ? 'comment on this line' : 'comment on ' + n + ' lines');
   });
   // Opening on pointerup, still inside the tap, lets a phone raise its
   // keyboard for the composer.
@@ -573,17 +627,23 @@
     hidePill();
     composer.querySelector('textarea').focus();
   }
+  // A refresh replaces the rows a pick points at.
+  function dropStalePick() {
+    if (picked && !picked.table.isConnected) { clearPicked(); if (!composer.classList.contains('shown')) hidePill(); }
+  }
+
   function submit(now) {
     const ta = composer.querySelector('textarea');
     if (!pending || !ta.value.trim()) return ta.focus();
     send(pending.anchor, pending.quote, ta.value.trim(), now);
     closeComposer();
+    clearPicked();
     lastSel = null;
     document.getSelection()?.removeAllRanges();
   }
   composer.addEventListener('submit', (e) => { e.preventDefault(); submit(false); });
   composer.querySelector('.c-send').addEventListener('click', () => submit(true));
-  composer.querySelector('.c-cancel').addEventListener('click', closeComposer);
+  composer.querySelector('.c-cancel').addEventListener('click', () => { closeComposer(); clearPicked(); });
   composer.addEventListener('keydown', (e) => {
     if (e.key === 'Escape') { e.stopPropagation(); closeComposer(); }
     if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submit(e.shiftKey); }
