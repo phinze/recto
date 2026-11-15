@@ -4,6 +4,85 @@
   const content = document.getElementById('content');
   // Files the reader opened or closed by hand keep that state across refreshes.
   const toggled = new Map();
+
+  // Where the reader is, as an element and its distance from the top of the
+  // window, so a refresh that grows or shrinks something above it can put
+  // that element back where it was. A raw scrollY can't: it's a distance
+  // from the top of a page that just changed. Safari has no overflow-anchor,
+  // so this is done by hand.
+  function keyOf(el) {
+    for (; el && el !== content; el = el.parentElement) {
+      if (el.matches('nav.tabs, nav.tabs *, details > summary, details > summary *')) return null;
+      if (el.matches('.ask[data-ask]')) return '.ask' + askKey(el);
+      if (el.id) return '#' + el.id;
+    }
+    return null;
+  }
+  function findKey(key) {
+    if (key.startsWith('#')) return document.getElementById(key.slice(1));
+    return [...content.querySelectorAll('.ask[data-ask]')].find((c) => '.ask' + askKey(c) === key) || null;
+  }
+  function scrollAnchor() {
+    const x = Math.min(window.innerWidth / 2, 200);
+    for (const f of [0.25, 0.4, 0.55, 0.7]) {
+      const key = keyOf(document.elementFromPoint(x, window.innerHeight * f));
+      const el = key && findKey(key);
+      if (el) return { key, top: el.getBoundingClientRect().top };
+    }
+    return null;
+  }
+  // Nothing moves unless something has to: a scroll call of nothing can still
+  // stop a phone's momentum scroll dead.
+  function restoreAnchor(a, y) {
+    const el = a && findKey(a.key);
+    if (el) {
+      const d = el.getBoundingClientRect().top - a.top;
+      if (Math.abs(d) >= 1) window.scrollBy(0, d);
+    } else if (y !== undefined && Math.abs(window.scrollY - y) >= 1) {
+      window.scrollTo(0, y);
+    }
+  }
+  // Keep the reader's place across a change made in place, like an ask
+  // turning into its answer.
+  function steady(fn) {
+    const a = scrollAnchor();
+    fn();
+    restoreAnchor(a);
+  }
+
+  // Unsent answers to asks, kept per page in localStorage so neither a
+  // refresh nor a reload loses them. An ask is known by its id, the rig it
+  // came from, and its question, since ids like "plan" come back in later
+  // briefings asking something else.
+  const draftKey = 'recto-drafts:' + location.pathname + location.search;
+  let drafts = {};
+  try { drafts = JSON.parse(localStorage.getItem(draftKey) || '{}'); } catch {}
+  const WEEK = 7 * 864e5;
+  for (const [k, d] of Object.entries(drafts)) if (!d || Date.now() - d.at > WEEK) delete drafts[k];
+  function saveDrafts() {
+    try {
+      if (Object.keys(drafts).length) localStorage.setItem(draftKey, JSON.stringify(drafts));
+      else localStorage.removeItem(draftKey);
+    } catch {}
+  }
+  function hash(str) {
+    let h = 5381;
+    for (let i = 0; i < str.length; i++) h = (h * 33 + str.charCodeAt(i)) >>> 0;
+    return h.toString(36);
+  }
+  function askKey(card) {
+    const q = card.querySelector('.ask-q');
+    return (card.dataset.rig || '') + '/' + card.dataset.ask + '/' + hash(q ? q.textContent.trim() : '');
+  }
+  function saveDraft(card) {
+    const ta = card.querySelector('.ask-answer textarea');
+    const picked = card.querySelector('.ask-choices .picked');
+    const text = ta ? ta.value : '';
+    const choice = picked ? picked.dataset.choice : '';
+    if (text.trim() || choice) drafts[askKey(card)] = { text, choice, at: Date.now() };
+    else delete drafts[askKey(card)];
+    saveDrafts();
+  }
   // The tab the reader picked. Behind a proxy the query is invisible, so the
   // path is part of the key. Until a pick, the server's default stands, and it
   // can move (a tour landing in another repo, say).
@@ -193,16 +272,32 @@
     }
   }
 
+  // Typing in the page holds refreshes until the reader leaves the field.
+  // Replacing the page under a focused field would drop the keyboard, and on
+  // a phone no script can raise it again.
+  let held = false;
+  function typing() {
+    const el = document.activeElement;
+    return !!el && content.contains(el) && el.matches('textarea, input');
+  }
+  content.addEventListener('focusout', () => {
+    // Focus may be moving to another field; look once it has landed.
+    setTimeout(() => { if (held && !typing()) { held = false; refresh(); } }, 0);
+  });
+
   // Refreshes can overlap; only the newest one gets to replace the page.
   let generation = 0;
   async function refresh() {
+    if (typing()) { held = true; return; }
     const mine = ++generation;
     let res;
     try { res = await fetch(fragmentURL(), { cache: 'no-store' }); } catch { return; }
     if (!res.ok) return;
     const html = await res.text();
     if (mine !== generation) return;
+    if (typing()) { held = true; return; }
     const y = window.scrollY;
+    const anchor = scrollAnchor();
     content.innerHTML = html;
     for (const [id, open] of toggled) {
       const d = document.getElementById(id);
@@ -212,14 +307,16 @@
     applyTab();
     syncExpandButtons();
     const moved = syncMarkers(false);
+    // Asks get their answer boxes and drafts back before the reader's place
+    // is measured again, since they change the page's height.
+    decorate();
     if (pendingFocus) {
       const spec = pendingFocus;
       pendingFocus = null;
       focusSpan(spec, true);
     } else if (!moved) {
-      window.scrollTo(0, y);
+      restoreAnchor(anchor, y);
     }
-    decorate();
     live.classList.add('pulse');
     setTimeout(() => live.classList.remove('pulse'), 600);
   }
@@ -415,7 +512,30 @@
   }
 
   function hidePill() { pill.classList.remove('shown'); }
-  function closeComposer() { composer.classList.remove('shown'); pending = null; }
+  // An open composer is kept too, so a reload brings it back mid-sentence.
+  const composerKey = 'recto-composer:' + location.pathname + location.search;
+  function saveComposer() {
+    try {
+      const text = composer.querySelector('textarea').value;
+      if (pending && text.trim()) localStorage.setItem(composerKey, JSON.stringify({ ...pending, text, at: Date.now() }));
+      else localStorage.removeItem(composerKey);
+    } catch {}
+  }
+  function closeComposer() {
+    composer.classList.remove('shown');
+    pending = null;
+    composer.querySelector('textarea').value = '';
+    saveComposer();
+  }
+  function showComposer(p, text) {
+    pending = p;
+    composer.querySelector('.c-anchor').textContent = p.anchor.label;
+    const q = p.quote;
+    composer.querySelector('.c-quote').textContent = q.length > 280 ? q.slice(0, 279) + '…' : q;
+    composer.querySelector('textarea').value = text || '';
+    composer.classList.add('shown');
+  }
+  composer.querySelector('textarea').addEventListener('input', saveComposer);
 
   // The selection as it was last made. A phone clears the selection when the
   // pill is tapped, before the tap lands, so the pill works from this copy,
@@ -449,19 +569,14 @@
   function openComposer() {
     if (composer.classList.contains('shown') || !lastSel) return;
     const { range, text } = lastSel;
-    pending = { anchor: anchorFor(range), quote: text.trim().slice(0, 4000) };
-    composer.querySelector('.c-anchor').textContent = pending.anchor.label;
-    const q = pending.quote;
-    composer.querySelector('.c-quote').textContent = q.length > 280 ? q.slice(0, 279) + '…' : q;
+    showComposer({ anchor: anchorFor(range), quote: text.trim().slice(0, 4000) });
     hidePill();
-    composer.classList.add('shown');
     composer.querySelector('textarea').focus();
   }
   function submit(now) {
     const ta = composer.querySelector('textarea');
     if (!pending || !ta.value.trim()) return ta.focus();
     send(pending.anchor, pending.quote, ta.value.trim(), now);
-    ta.value = '';
     closeComposer();
     lastSel = null;
     document.getSelection()?.removeAllRanges();
@@ -480,6 +595,7 @@
     const choice = e.target.closest('.ask-choices button');
     if (choice) {
       for (const b of choice.parentElement.children) b.classList.toggle('picked', b === choice && !b.classList.contains('picked'));
+      saveDraft(choice.closest('.ask'));
       return;
     }
     const act = e.target.closest('.ask-answer button[data-act]');
@@ -507,6 +623,11 @@
       e.preventDefault();
       if (framed) window.parent.postMessage({ showRig: link.getAttribute('href').slice(4), label: link.textContent.trim() }, location.origin);
     }
+  });
+
+  content.addEventListener('input', (e) => {
+    const card = e.target.closest('.ask-answer textarea') && e.target.closest('.ask');
+    if (card) saveDraft(card);
   });
 
   // Where each comment stands, marked on the page: a dot in the gutter of a
@@ -562,6 +683,7 @@
       const c = answerOf(card);
       const slot = card.querySelector('.ask-answer');
       card.classList.toggle('answered', !!c);
+      if (c && drafts[askKey(card)]) { delete drafts[askKey(card)]; saveDrafts(); }
       if (c) {
         slot.innerHTML = '<div class=ask-given></div><span class=c-badge></span>';
         slot.querySelector('.ask-given').textContent = c.body;
@@ -573,6 +695,11 @@
           + (card.dataset.rig
             ? '<div class=c-actions><button type=button data-act=hold class=c-hold>answer</button></div>'
             : '<div class=c-actions><button type=button data-act=send>send now</button><button type=button data-act=hold class=c-hold>hold answer</button></div>');
+        const d = drafts[askKey(card)];
+        if (d) {
+          slot.querySelector('textarea').value = d.text || '';
+          for (const b of card.querySelectorAll('.ask-choices button')) b.classList.toggle('picked', !!d.choice && b.dataset.choice === d.choice);
+        }
       }
     }
     // Each rig's held answers go out as one message: by its button, or on
@@ -599,7 +726,14 @@
     if (framed) window.parent.postMessage({ asks: open, peers }, location.origin);
     const brief = content.querySelector('details.group-brief');
     if (brief) {
-      if (open !== briefSeen) { briefChoice = null; briefSeen = open; }
+      // Folding once everything's answered waits for a fresh page: folding
+      // now would yank whatever the reader is looking at up by the
+      // briefing's height, right after they answered.
+      if (open !== briefSeen) {
+        if (briefSeen < 0 || open > briefSeen) briefChoice = null;
+        else if (briefChoice === null) briefChoice = brief.open;
+        briefSeen = open;
+      }
       const want = briefChoice ?? open > 0;
       if (brief.open !== want) { settingBrief = true; brief.open = want; }
       brief.querySelector('.brief-strip').textContent = 'Briefing · '
@@ -631,8 +765,33 @@
     if (e.source !== window.parent) return;
     if (e.data && typeof e.data.focus === 'string') reveal(e.data.focus);
     if (e.data && e.data.refresh) refresh();
-    if (e.data && Array.isArray(e.data.comments)) { comments = e.data.comments; decorate(); }
-    if (e.data && e.data.peerComments) { peerComments = e.data.peerComments; decorate(); }
+    // The frame's "needs you" badge: open the briefing and bring it up.
+    if (e.data && e.data.brief) {
+      const brief = content.querySelector('details.group-brief');
+      if (brief) {
+        if (!brief.open) brief.open = true;
+        const ask = [...brief.querySelectorAll('.ask:not(.answered)')][0];
+        (ask || brief).scrollIntoView({ block: ask ? 'center' : 'start', behavior: 'smooth' });
+      }
+    }
+    // The frame repeats these every few seconds; only a change redraws.
+    if (e.data && Array.isArray(e.data.comments)) {
+      const was = JSON.stringify(comments);
+      comments = e.data.comments;
+      if (JSON.stringify(comments) !== was) steady(decorate);
+    }
+    if (e.data && e.data.peerComments) {
+      const was = JSON.stringify(peerComments);
+      peerComments = e.data.peerComments;
+      if (JSON.stringify(peerComments) !== was) steady(decorate);
+    }
   });
   decorate();
+  // A composer left open when the page went away comes back with its words.
+  if (framed) {
+    try {
+      const saved = JSON.parse(localStorage.getItem(composerKey) || 'null');
+      if (saved && saved.anchor && Date.now() - saved.at < WEEK) showComposer({ anchor: saved.anchor, quote: saved.quote || '' }, saved.text);
+    } catch {}
+  }
 })();

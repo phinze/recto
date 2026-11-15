@@ -229,3 +229,32 @@ figure.diagram {
 }
 figure.diagram.drawn:not(.failed) pre.diagram-src { display: none; }
 figure.diagram p.diagram-error { color: var(--red); font: 12px var(--mono); white-space: pre-wrap; max-width: none; }
+
+/* A finger, not a pointer. Fields are 16px because iOS zooms the whole
+   window into anything smaller on focus, and in a home-screen app that zoom
+   tends to stay, leaving the frame's header oversized and soft. Controls get
+   room to land a thumb on, and hover-only affordances get a press state. */
+@media (pointer: coarse), (max-width: 600px) {
+  button, summary { touch-action: manipulation; -webkit-tap-highlight-color: transparent; }
+  .ask-answer textarea, #composer textarea { font-size: 16px; }
+  nav.tabs button { font-size: 14px; padding: 11px 14px 12px; }
+  .tabbed details.file > summary { top: 45px; }
+  details.file > summary { padding: 10px 12px; }
+  table.diff tr { scroll-margin-top: 100px; }
+  .group-brief > summary.brief-strip { font-size: 14px; padding: 10px 0; }
+  .ask { padding: 12px 14px; }
+  .ask-choices { gap: 8px; }
+  .ask-choices button { font-size: 15px; min-height: 40px; padding: 8px 16px; border-radius: 20px; text-align: left; }
+  .c-actions { gap: 8px; margin-top: 8px; }
+  .c-actions button, .peer h3 .peer-send { font-size: 14px; min-height: 40px; padding: 0 16px; border-radius: 20px; }
+  .c-hint { display: none; }
+  .expand-all, .narrowed button { font-size: 13px; min-height: 32px; padding: 0 12px; border-radius: 16px; }
+  details.revs li button { padding: 9px 10px; }
+  #comment-pill { font-size: 15px; padding: 10px 18px; border-radius: 20px; }
+  #back { font-size: 14px; padding: 10px 16px; border-radius: 20px; bottom: calc(16px + env(safe-area-inset-bottom, 0px)); }
+  #composer { bottom: calc(12px + env(safe-area-inset-bottom, 0px)); width: calc(100vw - 20px); padding: 12px; }
+  #composer .c-anchor { font-size: 13px; }
+}
+@media (hover: none) {
+  .ask-choices button:active, .c-actions button:active, nav.tabs button:active { filter: brightness(1.25); }
+}
