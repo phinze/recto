@@ -85,6 +85,11 @@ struct Document {
     /// drafts below are keyed to it and are unreachable without it.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pull_request: Option<PullRequest>,
+    /// Every PR attached to this workspace, bottom of the stack first: a
+    /// stack of PRs puts one on each layer. `pull_request` stays the one in
+    /// front, which is all a reader from before stacks knows about.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pull_requests: Vec<PullRequest>,
     /// Stamps for the quotes in this workspace's tour, or in a group's
     /// documents, so a quote keeps lifting the lines it was written about
     /// after they move.
@@ -130,6 +135,7 @@ impl Document {
             focus: None,
             comments_visible: true,
             pull_request: None,
+            pull_requests: Vec::new(),
             quotes: Vec::new(),
             lens: None,
         }
@@ -336,8 +342,40 @@ impl Store {
         self.document.pull_request.as_ref()
     }
 
+    /// Make a PR the one in front, keeping it in the workspace's set with
+    /// any others attached, a newer snapshot replacing the older. `None`
+    /// steps back from the front PR without forgetting the set.
     pub fn set_pull_request(&mut self, pull_request: Option<&PullRequest>) {
         self.document.pull_request = pull_request.cloned();
+        if let Some(pr) = pull_request {
+            self.add_pull_request(pr);
+        }
+    }
+
+    /// Keep a PR in the workspace's set without putting it in front.
+    pub fn add_pull_request(&mut self, pr: &PullRequest) {
+        let list = &mut self.document.pull_requests;
+        match list
+            .iter()
+            .position(|p| p.repository == pr.repository && p.number == pr.number)
+        {
+            Some(i) => list[i] = pr.clone(),
+            None => list.push(pr.clone()),
+        }
+    }
+
+    /// Every attached PR, bottom of the stack first. State written before
+    /// stacks has only the one in front.
+    pub fn pull_requests(&self) -> Vec<&PullRequest> {
+        let mut all: Vec<&PullRequest> = self.document.pull_requests.iter().collect();
+        if let Some(front) = &self.document.pull_request
+            && !all
+                .iter()
+                .any(|p| p.repository == front.repository && p.number == front.number)
+        {
+            all.push(front);
+        }
+        all
     }
 
     /// The review drafted for this PR. A draft follows its PR across a new
@@ -593,6 +631,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         focus: None,
         comments_visible: true,
         pull_request: None,
+        pull_requests: Vec::new(),
         quotes: Vec::new(),
         lens: None,
     }))
@@ -867,6 +906,38 @@ mod tests {
                 Some((workspace.parent().unwrap(), "../other"))
             )
             .is_err()
+        );
+    }
+
+    #[test]
+    fn a_stack_of_prs_keeps_every_snapshot_with_one_in_front() {
+        let (state_home, workspace) = roots("pr-stack");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        let pr = |number: u64, title: &str| PullRequest {
+            number,
+            title: title.into(),
+            ..crate::testing::empty_pull_request("base")
+        };
+        store.add_pull_request(&pr(41, "bottom"));
+        store.set_pull_request(Some(&pr(42, "top")));
+        store.set_pull_request(Some(&pr(42, "top, retitled")));
+        store.save().unwrap();
+
+        let reopened = Store::load_at(&state_home, &workspace, None).unwrap();
+        let titles: Vec<&str> = reopened
+            .pull_requests()
+            .iter()
+            .map(|p| p.title.as_str())
+            .collect();
+        assert_eq!(
+            titles,
+            vec!["bottom", "top, retitled"],
+            "bottom first, a newer snapshot replacing the older"
+        );
+        assert_eq!(
+            reopened.pull_request().map(|p| p.number),
+            Some(42),
+            "the top one stays in front"
         );
     }
 

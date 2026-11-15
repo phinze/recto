@@ -92,27 +92,47 @@ fn is_false(value: &bool) -> bool {
 }
 
 /// What the diff pane is showing. A range lens reads files at the head of the
-/// range and shows every anchor that maps into it; a narrowed lens reads them
-/// at one commit and shows only that change's own anchors.
+/// range and shows every anchor that maps into it. A narrowed lens reads them
+/// at its head and shows only the anchors of its own commits: one change, or
+/// the commits of one layer.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Lens {
     pub head: String,
-    pub narrowed: bool,
+    /// The commits a narrowed lens shows; `None` for a range.
+    pub members: Option<Vec<String>>,
 }
 
 impl Lens {
     pub fn range(backend: &dyn Backend) -> Self {
         Self {
             head: backend.head_rev().to_string(),
-            narrowed: false,
+            members: None,
         }
     }
 
     pub fn narrowed(commit: String) -> Self {
         Self {
+            members: Some(vec![commit.clone()]),
             head: commit,
-            narrowed: true,
         }
+    }
+
+    /// One layer: read at its head, showing its commits' anchors.
+    pub fn layer(head: String, commits: Vec<String>) -> Self {
+        Self {
+            head,
+            members: Some(commits),
+        }
+    }
+
+    pub fn is_narrowed(&self) -> bool {
+        self.members.is_some()
+    }
+
+    fn shows(&self, commit: &str) -> bool {
+        self.members
+            .as_ref()
+            .is_none_or(|m| m.iter().any(|c| c == commit))
     }
 }
 
@@ -230,7 +250,7 @@ impl<'a> Resolver<'a> {
                 None => Resolution::Outdated,
             };
         };
-        if lens.narrowed && current != lens.head {
+        if !lens.shows(&current) {
             return Resolution::Elsewhere;
         }
         let Some(now) = self.text(&current, path) else {
@@ -254,7 +274,7 @@ impl<'a> Resolver<'a> {
             end: e,
             snippet: now[s as usize - 1..e as usize].to_vec(),
         };
-        let (start, end) = if lens.narrowed {
+        let (start, end) = if current == lens.head {
             (s, e)
         } else {
             let Some(head) = self.text(&lens.head, path) else {

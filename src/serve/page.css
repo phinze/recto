@@ -84,13 +84,17 @@ details.revs li:first-child .rev-sum { color: var(--subtext); font-style: italic
   min-width: 28px; min-height: 24px; cursor: pointer; touch-action: manipulation; }
 .lensbar .step:hover:not(:disabled) { background: var(--surface1); }
 .lensbar .step:disabled { opacity: 0.3; cursor: default; }
-details.revs li.layer > button.layer-head .rev-id { color: var(--peach); min-width: 12ch; font-weight: 600; }
+details.revs li.layer > button.layer-head .rev-id { color: var(--peach); min-width: 12ch; max-width: 60%; font-weight: 600;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 details.revs li.layer > button.layer-head .rev-sum { color: var(--subtext); font-family: var(--mono); font-size: 12px; }
 details.revs li.layer > ol { border-left: 0; margin: 0 0 0 10px; max-height: none; }
 details.revs li.layer > details.layer-fold { margin: 0 0 4px 10px; }
 details.revs li.layer > details.layer-fold > summary { cursor: pointer; color: var(--overlay0); padding: 2px 10px; }
 details.revs li.layer > details.layer-fold > ol { border-left: 0; max-height: none; }
 details.revs li.layer:first-child .rev-sum { font-style: normal; }
+.layer-pr { margin: 6px 0 8px; padding: 8px 12px; border-radius: 8px; background: var(--mantle); border-left: 3px solid var(--peach); font-size: 14px; }
+.layer-pr a { color: var(--peach); font: 600 13px var(--mono); text-decoration: none; margin-right: 4px; }
+.layer-pr .dim { margin-left: 6px; }
 /* The bar sticks under the tabs, and a file's own sticky bar under it. */
 .tabbed .lensbar { top: 37px; }
 section.repo:has(> .lensbar) details.file > summary { top: 40px; }

@@ -150,7 +150,7 @@ impl App {
                 }
                 None if pin.outdated => {}
                 None => {
-                    if let Some(lens) = lens.filter(|l| !l.narrowed)
+                    if let Some(lens) = lens.filter(|l| !l.is_narrowed())
                         && let Some(stamp) = resolver.stamp(lens, path, *start, *end)
                     {
                         pin.stamp = Some(stamp);
@@ -486,9 +486,14 @@ impl App {
             && self.pull_request.is_some()
             && !same_review
         {
-            return link::Response::err(
-                "another PR has shared review drafts; delete them before switching",
-            );
+            // Drafts are saved per PR, so in a stack of PRs moving to another
+            // one keeps this one's review for when it comes back. Without a
+            // store to keep them in, switching would lose them.
+            if self.persistence.is_none() || self.persist_now().is_err() {
+                return link::Response::err(
+                    "another PR has shared review drafts that can't be saved; delete them before switching",
+                );
+            }
         }
         if !same_review
             && matches!(self.mode, Mode::NoteInput(ref draft) if draft.kind != ComposerKind::AgentNote)

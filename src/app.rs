@@ -3127,7 +3127,7 @@ mod tests {
             LoadedDiff {
                 lens: crate::anchor::Lens {
                     head: "@".into(),
-                    narrowed: false,
+                    members: None,
                 },
                 resolutions: Vec::new(),
                 workspace_revision: "abc123".into(),

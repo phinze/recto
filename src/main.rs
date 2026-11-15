@@ -73,6 +73,23 @@ struct RigInfo {
     repo: Option<String>,
     #[serde(default)]
     review_pr: Option<String>,
+    /// Every PR a review rig holds for this repository, bottom of the stack
+    /// first. Absent from rigs that predate stacks, which name one in
+    /// `review_pr`.
+    #[serde(default)]
+    review_prs: Vec<String>,
+}
+
+impl RigInfo {
+    /// The PRs to attach, bottom first: the stack when rig names one, else
+    /// the single review PR.
+    fn review_locators(&self) -> Vec<&str> {
+        if self.review_prs.is_empty() {
+            self.review_pr.iter().map(String::as_str).collect()
+        } else {
+            self.review_prs.iter().map(String::as_str).collect()
+        }
+    }
 }
 
 /// Ask Rig for the current repository's public context. A missing binary or a
@@ -152,27 +169,43 @@ fn main() -> Result<()> {
     let legacy_rig = rig_info
         .as_ref()
         .and_then(|info| info.root.as_deref().zip(info.repo.as_deref()));
-    let persistence = match state::Store::load(backend.root(), legacy_rig) {
+    let mut persistence = match state::Store::load(backend.root(), legacy_rig) {
         Ok(store) => Some(store),
         Err(error) => {
             startup_notices.push(format!("could not restore review state: {error}"));
             None
         }
     };
-    // A review rig's freshly fetched PR wins: it is newer than whatever the
-    // last session saved. Everywhere else the saved snapshot is restored from
-    // disk, so an ordinary startup still makes no network call.
-    let pull_request = match rig_info.as_ref().and_then(|info| info.review_pr.as_ref()) {
-        Some(locator) => match github::fetch_pull_request(locator) {
-            Ok(pull_request) => Some(pull_request),
-            Err(error) => {
-                startup_notices.push(format!("could not restore rig review {locator}: {error}"));
-                None
-            }
-        },
-        None => persistence
+    // A review rig's freshly fetched PRs win: they are newer than whatever
+    // the last session saved. Everywhere else the saved snapshots are restored
+    // from disk, so an ordinary startup still makes no network call. In a
+    // stack of PRs every one is kept for the window's layers, and the top one
+    // goes in front, since the workspace sits at its head.
+    let locators = rig_info
+        .as_ref()
+        .map(RigInfo::review_locators)
+        .unwrap_or_default();
+    let pull_request = if locators.is_empty() {
+        persistence
             .as_ref()
-            .and_then(|store| store.pull_request().cloned()),
+            .and_then(|store| store.pull_request().cloned())
+    } else {
+        let mut top = None;
+        for locator in locators {
+            match github::fetch_pull_request(locator) {
+                Ok(pull_request) => {
+                    if let Some(store) = persistence.as_mut() {
+                        store.add_pull_request(&pull_request);
+                    }
+                    top = Some(pull_request);
+                }
+                Err(error) => {
+                    startup_notices
+                        .push(format!("could not restore rig review {locator}: {error}"));
+                }
+            }
+        }
+        top
     };
     // An explicit base remains an escape hatch. Otherwise a review rig starts
     // where the branch forked off its PR's base, which is the commit GitHub
@@ -458,6 +491,28 @@ mod tests {
         );
         assert_eq!(info.schema_version, 1);
         assert_eq!(info.root.as_deref(), Some(Path::new("/tmp/pr-42")));
+        assert_eq!(
+            info.review_locators(),
+            vec!["https://github.com/owner/repo/pull/42"],
+            "a rig from before stacks names one PR"
+        );
+
+        let stacked: RigInfo = serde_json::from_str(
+            r#"{
+                "schema_version": 1,
+                "review_pr": "https://github.com/owner/repo/pull/43",
+                "review_prs": [
+                    "https://github.com/owner/repo/pull/42",
+                    "https://github.com/owner/repo/pull/43"
+                ]
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(
+            stacked.review_locators().len(),
+            2,
+            "a stack attaches every PR, bottom first"
+        );
     }
 
     #[test]

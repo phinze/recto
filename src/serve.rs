@@ -1027,6 +1027,37 @@ fn render_workspace(
         ),
         crate::stack::View::Stack => Vec::new(),
     };
+    // Every attached PR, and the one the layer in view carries, with its
+    // review: drafts resolved against just that layer, the way the PR reads.
+    let prs: Vec<link::PullRequest> = store
+        .as_ref()
+        .map(|s| s.pull_requests().into_iter().cloned().collect())
+        .unwrap_or_default();
+    let layer_review = match &lens_view {
+        crate::stack::View::Layer(l) => layer_pr(&prs, l).map(|pr| {
+            let review = store.as_ref().and_then(|s| {
+                s.review(&link::PullRequestRef {
+                    repository: pr.repository.clone(),
+                    number: pr.number,
+                    head_oid: pr.head_oid.clone(),
+                })
+            });
+            let review = review.map(|mut r| {
+                let lens = crate::anchor::Lens::layer(
+                    l.head().id.clone(),
+                    l.commits.iter().map(|c| c.id.clone()).collect(),
+                );
+                crate::anchor::settle(backend.as_ref(), &lens, &mut r.comments);
+                r
+            });
+            (pr.clone(), review)
+        }),
+        _ => None,
+    };
+    let layer_drafts: Vec<link::DraftReviewComment> = layer_review
+        .as_ref()
+        .and_then(|(_, r)| r.as_ref().map(|r| r.comments.clone()))
+        .unwrap_or_default();
     let (added, removed) = files
         .iter()
         .fold((0, 0), |(a, r), f| (a + f.added, r + f.removed));
@@ -1133,9 +1164,12 @@ fn render_workspace(
             index,
             &commits,
             &lens_view,
-            head.as_deref(),
-            anchor.label.is_some(),
-            (added, removed),
+            &StackCtx {
+                prs: &prs,
+                head: head.as_deref(),
+                from_start: anchor.label.is_some(),
+                totals: (added, removed),
+            },
             out,
         );
     }
@@ -1178,6 +1212,23 @@ fn render_workspace(
             },
         );
     }
+    if let Some((pr, review)) = &layer_review {
+        let _ = write!(
+            out,
+            "<div class=layer-pr><a href=\"{}\">#{}</a> {} <span class=dim>{} ← {}</span></div>",
+            esc(&pr.url),
+            pr.number,
+            esc(&pr.title),
+            esc(&pr.base_ref),
+            esc(&pr.head_ref),
+        );
+        if let Some(r) = review
+            .as_ref()
+            .filter(|r| r.verdict.is_some() || r.body.is_some() || !r.comments.is_empty())
+        {
+            review_card(r, &shown, out);
+        }
+    }
     if !matches!(lens_view, crate::stack::View::Stack) {
         if shown.is_empty() {
             out.push_str(match lens_view {
@@ -1185,7 +1236,7 @@ fn render_workspace(
                 _ => "<p class=empty>This commit changes no files.</p>",
             });
         } else {
-            render_files(index, &shown, &[], &mut budget, out);
+            render_files(index, &shown, &layer_drafts, &mut budget, out);
         }
     } else if !files.is_empty() {
         render_files(index, &files, drafts, &mut budget, out);
@@ -1269,18 +1320,50 @@ pub(crate) fn anchor(
 /// either side, then the layers, each a PR or one meant to be, with their
 /// commits. A stack with one layer lists its commits as before. Landed
 /// layers fold, since their work is done.
+/// What the stack is drawn around besides its commits: the PRs attached to
+/// its layers, the working copy's commit, whether the range reaches back to
+/// the rig's start, and the range's own totals.
+struct StackCtx<'a> {
+    prs: &'a [link::PullRequest],
+    head: Option<&'a str>,
+    from_start: bool,
+    totals: (u32, u32),
+}
+
+/// The PR a layer carries: the attached PR whose head is one of the layer's
+/// commits, its head commit first.
+fn layer_pr<'a>(
+    prs: &'a [link::PullRequest],
+    layer: &crate::stack::Layer,
+) -> Option<&'a link::PullRequest> {
+    let is = |c: &Commit, pr: &link::PullRequest| c.id.eq_ignore_ascii_case(&pr.head_oid);
+    prs.iter().find(|pr| is(layer.head(), pr)).or_else(|| {
+        prs.iter()
+            .find(|pr| layer.commits.iter().any(|c| is(c, pr)))
+    })
+}
+
 fn render_stack(
     index: usize,
     commits: &[Commit],
     view: &crate::stack::View,
-    head: Option<&str>,
-    from_start: bool,
-    (added, removed): (u32, u32),
+    ctx: &StackCtx,
     out: &mut String,
 ) {
     use crate::stack::View;
+    let StackCtx {
+        prs,
+        head,
+        from_start,
+        totals: (added, removed),
+    } = *ctx;
     let layers = crate::stack::layers(commits);
     let layer_of = |c: &Commit| layers.iter().find(|l| l.contains(c));
+    // A layer carrying a PR goes by the PR; its bookmark is just plumbing.
+    let label = |l: &crate::stack::Layer| match layer_pr(prs, l) {
+        Some(pr) => format!("#{} {}", pr.number, pr.title),
+        None => l.label(),
+    };
 
     // The bar: where the view is, and a step older or newer through the
     // changes in reading order. Stepping off the newest comes back to the
@@ -1328,7 +1411,7 @@ fn render_stack(
         ),
         View::Layer(l) => format!(
             "<button type=button class=crumb data-view=\"{index}:\">stack</button> › <b>{}</b><span class=dim> · {} commit{}</span>",
-            esc(&l.label()),
+            esc(&label(l)),
             l.commits.len(),
             if l.commits.len() == 1 { "" } else { "s" }
         ),
@@ -1340,7 +1423,7 @@ fn render_stack(
                     .map(|l| format!(
                         "<button type=button class=crumb data-view=\"{index}:{}\">{}</button> › ",
                         esc(&l.view()),
-                        esc(&l.label())
+                        esc(&label(l))
                     ))
                     .unwrap_or_default(),
                 esc(c.short_change()),
@@ -1439,7 +1522,7 @@ fn render_stack(
                 "<li class=layer><button type=button class=\"layer-head{}\" data-view=\"{index}:{}\"><span class=rev-id>{}</span><span class=rev-sum>{} commit{}</span>{}{}</button>",
                 if active { " active" } else { "" },
                 esc(&layer.view()),
-                esc(&layer.label()),
+                esc(&label(layer)),
                 layer.commits.len(),
                 if layer.commits.len() == 1 { "" } else { "s" },
                 if layer.landed() {
@@ -2739,6 +2822,63 @@ mod tests {
             newest.contains("data-view=\"0:\" aria-label=\"newer change\""),
             "stepping past the newest change comes back to the whole stack: {newest}"
         );
+    }
+
+    /// In a stack of PRs each layer goes by the PR it carries, found by its
+    /// head commit, and a layer without one keeps its bookmark's name.
+    #[test]
+    fn a_layer_carrying_a_pr_goes_by_the_pr() {
+        let (repo, c) = layered_repo();
+        let backend = crate::backend::JjBackend::new(repo.0.clone());
+        let commits = backend.commits("root()", "@").expect("commits");
+        let head_of = |name: &str| {
+            commits
+                .iter()
+                .find(|commit| commit.change == c[name])
+                .unwrap()
+                .id
+                .clone()
+        };
+        let pr = |number: u64, title: &str, head: String| link::PullRequest {
+            number,
+            title: title.into(),
+            head_oid: head.to_uppercase(),
+            ..crate::testing::empty_pull_request("base")
+        };
+        let prs = vec![
+            pr(41, "the first layer", head_of("b")),
+            pr(42, "the second layer", head_of("d")),
+        ];
+        let layers = crate::stack::layers(&commits);
+        assert_eq!(layer_pr(&prs, &layers[1]).map(|p| p.number), Some(42));
+        assert_eq!(layer_pr(&prs, &layers[2]).map(|p| p.number), Some(41));
+        assert!(
+            layer_pr(&prs, &layers[0]).is_none(),
+            "unpushed work carries no PR"
+        );
+
+        let mut out = String::new();
+        render_stack(
+            0,
+            &commits,
+            &crate::stack::View::Stack,
+            &StackCtx {
+                prs: &prs,
+                head: None,
+                from_start: false,
+                totals: (0, 0),
+            },
+            &mut out,
+        );
+        assert!(
+            out.contains("<span class=rev-id>#42 the second layer</span>"),
+            "{out}"
+        );
+        assert!(
+            out.contains("<span class=rev-id>#41 the first layer</span>"),
+            "{out}"
+        );
+        assert!(out.contains("<span class=rev-id>unpushed</span>"), "{out}");
     }
 
     /// Moving one repo's view asks for that section alone, and a section
