@@ -396,10 +396,10 @@
   // can hand back a stream that looks open on a dead socket, so coming back
   // into view reopens it and catches up on whatever changed meanwhile.
   let dropped = false;
-  let current = null;
+  let stream = null;
   function listen() {
-    if (current) current.close();
-    const es = current = new EventSource('events' + qs);
+    if (stream) stream.close();
+    const es = stream = new EventSource('events' + qs);
     es.addEventListener('open', () => {
       live.classList.add('on');
       if (dropped) { dropped = false; refresh(); }
@@ -407,8 +407,8 @@
     es.addEventListener('error', () => {
       live.classList.remove('on');
       dropped = true;
-      if (es === current && es.readyState === EventSource.CLOSED) {
-        setTimeout(() => { if (es === current) listen(); }, 3000);
+      if (es === stream && es.readyState === EventSource.CLOSED) {
+        setTimeout(() => { if (es === stream) listen(); }, 3000);
       }
     });
     es.addEventListener('changed', refresh);
