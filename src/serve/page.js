@@ -592,6 +592,13 @@
       }
       const { added, removed } = rowLines(figure || file.querySelector('table.diff') || file, range);
       const anchor = { kind: 'diff', repo: r, path, label: (r ? r + '/' : '') + path };
+      // The lines are the shown view's: a narrowed view's are its commit's,
+      // so Rig stamps them there. Quotes in a tour read the whole stack.
+      if (!figure && section) {
+        const ri = section.id.slice(5);
+        const view = views.has(ri) ? views.get(ri) : (lenses.get(ri) || '');
+        if (view) anchor.section = view;
+      }
       if (added.length) {
         anchor.start = Math.min(...added);
         anchor.end = Math.max(...added);
@@ -828,7 +835,11 @@
     for (const c of stamped) {
       const section = content.querySelector(`section.repo[data-repo="${CSS.escape(c.anchor.repo)}"]`);
       if (!section) continue;
-      url = withParam(url, 's=' + encodeURIComponent(section.id.slice(5) + '|' + c.anchor.path + '|' + JSON.stringify(c.anchor.stamp)));
+      // Resolved in the view this repo shows, the reader's pick or else the
+      // agent's lens, since a narrowed view's lines are its commit's.
+      const ri = section.id.slice(5);
+      const view = views.has(ri) ? views.get(ri) : (lenses.get(ri) || '');
+      url = withParam(url, 's=' + encodeURIComponent(ri + '|' + view + '|' + c.anchor.path + '|' + JSON.stringify(c.anchor.stamp)));
       asked.push(c.id);
     }
     const mine = ++resolving;

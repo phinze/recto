@@ -207,12 +207,19 @@ impl App {
         if spec.is_empty() {
             self.cursor = Cursor::All;
         } else if let Some(head) = spec.strip_prefix("layer:") {
-            let Some(i) = find(head).filter(|i| self.layers().iter().any(|l| l.head == *i)) else {
+            let layers = self.stack_layers();
+            let Some(i) = find(head).filter(|i| layers.iter().any(|l| l.head == *i)) else {
                 return link::Response::err(format!(
                     "{spec} names no layer in this range (layer:CHANGE, where CHANGE heads a layer)"
                 ));
             };
-            self.cursor = Cursor::Layer(i);
+            // A stack of one layer is the whole range, which has no layer
+            // header of its own to stand on.
+            self.cursor = if layers.len() > 1 {
+                Cursor::Layer(i)
+            } else {
+                Cursor::All
+            };
         } else {
             let Some(i) = find(&spec) else {
                 return link::Response::err(format!(

@@ -142,12 +142,22 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Resu
             resolved = Scope::Rev(commit.clone());
             (&resolved, Lens::narrowed(commit))
         }
-        Scope::Span { bottom, top } => {
-            let (Some(b), Some(t)) = (backend.commit_id(bottom), backend.commit_id(top)) else {
-                anyhow::bail!("{bottom}..{top} no longer names a layer");
+        Scope::Span { from, top } => {
+            let Some(t) = backend.commit_id(top) else {
+                anyhow::bail!("{top} no longer heads a layer");
+            };
+            // The layer below is named by change, like the top; pin both to
+            // their commits for this load.
+            let from = match from {
+                Base::Revision(target) => Base::Revision(
+                    backend
+                        .commit_id(target)
+                        .ok_or_else(|| anyhow::anyhow!("{target} no longer heads a layer"))?,
+                ),
+                base => base.clone(),
             };
             resolved = Scope::Span {
-                bottom: b,
+                from,
                 top: t.clone(),
             };
             // A layer reads at its head; whether an anchor's lines show is
@@ -836,13 +846,21 @@ impl App {
         match self.cursor {
             Cursor::All => Scope::Range(self.base().clone()),
             Cursor::Rev(i) => Scope::Rev(self.revs[i].target().to_string()),
-            Cursor::Layer(i) => match self.layers().into_iter().find(|l| l.head == i) {
-                Some(l) => Scope::Span {
-                    bottom: self.revs[l.bottom].target().to_string(),
-                    top: self.revs[l.head].target().to_string(),
-                },
-                None => Scope::Range(self.base().clone()),
-            },
+            Cursor::Layer(i) => {
+                let layers = self.layers();
+                match layers.iter().position(|l| l.head == i) {
+                    Some(k) => Scope::Span {
+                        from: match layers.get(k + 1) {
+                            Some(below) => {
+                                Base::Revision(self.revs[below.head].target().to_string())
+                            }
+                            None => self.base().clone(),
+                        },
+                        top: self.revs[i].target().to_string(),
+                    },
+                    None => Scope::Range(self.base().clone()),
+                }
+            }
         }
     }
 
@@ -850,6 +868,16 @@ impl App {
     /// the revs in range, unbookmarked work on top as "unpushed". A range with
     /// one layer has none to show, so it reads as it always has.
     pub(crate) fn layers(&self) -> Vec<TuiLayer> {
+        let layers = self.stack_layers();
+        if layers.len() < 2 {
+            return Vec::new();
+        }
+        layers
+    }
+
+    /// The range's layers whether or not there's more than one to draw: a
+    /// stack of one layer is still a layer, which is the whole range.
+    pub(crate) fn stack_layers(&self) -> Vec<TuiLayer> {
         let in_range: Vec<usize> = (0..self.revs.len())
             .filter(|&i| self.revs[i].is_in_range)
             .collect();
@@ -872,9 +900,6 @@ impl App {
                 layer.bottom = i;
                 layer.revs += 1;
             }
-        }
-        if layers.len() < 2 {
-            return Vec::new();
         }
         layers
     }
@@ -1606,7 +1631,7 @@ mod tests {
         );
 
         app.cursor = Cursor::Layer(second.head);
-        let Scope::Span { bottom, top } = app.scope() else {
+        let Scope::Span { from, top } = app.scope() else {
             panic!("a layer's view is a span");
         };
         let loaded = load_diff(
@@ -1614,7 +1639,7 @@ mod tests {
             &Highlighter::new(),
             &DiffRequest {
                 generation: 1,
-                scope: Scope::Span { bottom, top },
+                scope: Scope::Span { from, top },
                 ignore_ws: false,
                 stamps: Vec::new(),
             },
@@ -1641,6 +1666,20 @@ mod tests {
             .ok,
             "a change that heads no layer isn't a layer"
         );
+    }
+
+    /// A stack of one layer is still a layer: naming it with `recto lens`
+    /// lands on the whole range, which is what it is, rather than refusing.
+    #[test]
+    fn a_lens_on_the_only_layer_is_the_whole_range() {
+        let (_repo, backend) = jj_stack("app-one-layer");
+        let mut app = App::load(backend, Highlighter::new(), None, None).unwrap();
+        assert!(app.layers().is_empty(), "one layer draws no headers");
+        let head = app.stack_layers()[0].head;
+        app.cursor = Cursor::Rev(head);
+        let spec = format!("layer:{}", &app.revs[head].change[..6]);
+        assert!(app.handle_request(link::Request::Lens { spec }).ok);
+        assert_eq!(app.cursor, Cursor::All);
     }
 
     fn test_request(generation: u64) -> DiffRequest {

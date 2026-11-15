@@ -48,10 +48,13 @@ impl Base {
 pub enum Scope {
     Range(Base),
     Rev(String),
-    /// One layer of a stack: from just below `bottom` to `top`, both named
-    /// like a `Rev`, the way a PR made of those commits reads.
+    /// One layer of a stack, the way a PR made of its commits reads: from
+    /// `from` (the head of the layer below, or the range's base for the
+    /// bottom layer) to `top`, named like a `Rev`. Diffing from the layer
+    /// below rather than from the layer's oldest commit keeps a layer whole
+    /// even where a revision list stops short of its bottom.
     Span {
-        bottom: String,
+        from: Base,
         top: String,
     },
 }
@@ -558,8 +561,8 @@ impl Backend for JjBackend {
                 args.push("-r");
                 args.push(id);
             }
-            Scope::Span { bottom, top } => {
-                rev = format!("{bottom}-");
+            Scope::Span { from, top } => {
+                rev = Self::revset(from);
                 args.extend(["--from", &rev, "--to", top]);
             }
         }
@@ -583,8 +586,8 @@ impl Backend for JjBackend {
                 args.push("-r");
                 args.push(id);
             }
-            Scope::Span { bottom, top } => {
-                rev = format!("{bottom}-");
+            Scope::Span { from, top } => {
+                rev = Self::revset(from);
                 args.extend(["--from", &rev, "--to", top]);
             }
         }
@@ -951,8 +954,8 @@ impl Backend for GitBackend {
                 c.push(sha);
                 c
             }
-            Scope::Span { bottom, top } => {
-                arg = format!("{bottom}^");
+            Scope::Span { from, top } => {
+                arg = self.range_base(from)?;
                 let mut c = vec!["diff", "--name-status"];
                 if ignore_ws {
                     c.push("-w");
@@ -985,8 +988,8 @@ impl Backend for GitBackend {
                 c.push(sha);
                 c
             }
-            Scope::Span { bottom, top } => {
-                arg = format!("{bottom}^");
+            Scope::Span { from, top } => {
+                arg = self.range_base(from)?;
                 let mut c = vec!["diff"];
                 if ignore_ws {
                     c.push("-w");

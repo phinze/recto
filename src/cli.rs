@@ -108,7 +108,13 @@ pub(crate) enum ClientCommand {
     /// their text. SPEC is `path:LINE` or `path:START-END`, new-side lines
     /// relative to the repository root. Exits 1 when the lines can't be
     /// stamped (a git repository, or lines that aren't there).
-    Stamp { spec: String },
+    Stamp {
+        spec: String,
+        /// The view the lines were read in: a change, or `layer:CHANGE`
+        /// for a layer's head. Without it, the whole stack's head.
+        #[arg(long)]
+        at: Option<String>,
+    },
     /// Control visibility of published threads, shared drafts, and private
     /// notes without affecting tour annotations.
     CommentVisibility {
@@ -316,7 +322,7 @@ fn save_group_doc(dir: &Path, body: &str, name: &str) -> i32 {
 
 /// Stamp lines of the current diff for a caller outside Recto, such as Rig
 /// keeping the comments sent from its window attached to their lines.
-fn print_stamp(spec: &str) -> i32 {
+fn print_stamp(spec: &str, at: Option<&str>) -> i32 {
     let (path, start, end) = parse_pathspec(spec);
     let Some(start) = start else {
         eprintln!("recto: stamp takes path:LINE or path:START-END");
@@ -330,7 +336,10 @@ fn print_stamp(spec: &str) -> i32 {
             return 2;
         }
     };
-    let lens = crate::anchor::Lens::range(backend.as_ref());
+    let Some(lens) = crate::serve::view_lens(backend.as_ref(), at.unwrap_or("")) else {
+        eprintln!("recto: {} names no change here", at.unwrap_or(""));
+        return 1;
+    };
     match crate::anchor::Resolver::new(backend.as_ref()).stamp(&lens, path, start, end) {
         Some(stamp) => match serde_json::to_string(&stamp) {
             Ok(json) => {
@@ -413,8 +422,8 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
     if let ClientCommand::State { command } = &command {
         return run_state_command(command);
     }
-    if let ClientCommand::Stamp { spec } = &command {
-        return print_stamp(spec);
+    if let ClientCommand::Stamp { spec, at } = &command {
+        return print_stamp(spec, at.as_deref());
     }
     if let ClientCommand::Doc { name, body, group } = &command {
         let valid = !name.is_empty()

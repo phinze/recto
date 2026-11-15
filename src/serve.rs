@@ -116,7 +116,8 @@ struct Request {
     /// Render only this root's section: what a page asks for when the reader
     /// moves one repo's view, so the rest of the page isn't rendered again.
     only: Option<usize>,
-    /// Stamps to resolve, for `/resolve`: `ROOT_INDEX|PATH|STAMP_JSON` each.
+    /// Stamps to resolve, for `/resolve`: `ROOT_INDEX|VIEW|PATH|STAMP_JSON`
+    /// each, VIEW being the view the page shows (empty for the whole stack).
     stamps: Vec<String>,
     /// Other groups whose open asks this page gathers, for a coordinator
     /// that organizes the person's attention across them.
@@ -255,16 +256,19 @@ fn handle(mut stream: UnixStream) {
 }
 
 /// Where stamped lines are now, for anchors the page holds but Recto doesn't
-/// render itself: comments sent from the window, which Rig keeps. Each
-/// answer is `{"start", "end"}` in the root's range, or `{"outdated": true}`,
-/// in the order asked; anything that can't be read answers `null`.
+/// render itself: comments sent from the window, which Rig keeps. Each is
+/// resolved in the view the page shows (a change or a layer reads its lines
+/// at that commit, not at the head of the stack). Each answer is `{"start",
+/// "end"}`, or `{"outdated": true}`, in the order asked; anything that can't
+/// be read answers `null`.
 fn resolve(req: &Request) -> String {
     let answers: Vec<serde_json::Value> = req
         .stamps
         .iter()
         .map(|entry| {
-            let mut parts = entry.splitn(3, '|');
-            let (Some(i), Some(path), Some(json)) = (parts.next(), parts.next(), parts.next())
+            let mut parts = entry.splitn(4, '|');
+            let (Some(i), Some(view), Some(path), Some(json)) =
+                (parts.next(), parts.next(), parts.next(), parts.next())
             else {
                 return serde_json::Value::Null;
             };
@@ -282,7 +286,9 @@ fn resolve(req: &Request) -> String {
             else {
                 return serde_json::Value::Null;
             };
-            let lens = crate::anchor::Lens::range(backend.as_ref());
+            let Some(lens) = view_lens(backend.as_ref(), view) else {
+                return serde_json::Value::Null;
+            };
             match crate::anchor::Resolver::new(backend.as_ref()).resolve(&lens, path, &stamp) {
                 crate::anchor::Resolution::At { start, end, .. } => {
                     serde_json::json!({ "start": start, "end": end })
@@ -293,6 +299,20 @@ fn resolve(req: &Request) -> String {
         })
         .collect();
     serde_json::Value::Array(answers).to_string()
+}
+
+/// The lens a view spec reads lines through: the whole stack's head for an
+/// empty spec, else the commit a change or a layer's head is now.
+pub(crate) fn view_lens(backend: &dyn Backend, view: &str) -> Option<crate::anchor::Lens> {
+    let view = view.trim();
+    if view.is_empty() {
+        return Some(crate::anchor::Lens::range(backend));
+    }
+    let target = view.strip_prefix("layer:").unwrap_or(view);
+    backend.commit_id(target).map(|head| crate::anchor::Lens {
+        head,
+        members: None,
+    })
 }
 
 /// A page never loads anything from off this server: the renderer turns
@@ -3108,7 +3128,7 @@ mod tests {
                 views: Vec::new(),
                 only: None,
                 stamps: vec![
-                    format!("0|c.txt|{}", serde_json::to_string(stamp).unwrap()),
+                    format!("0||c.txt|{}", serde_json::to_string(stamp).unwrap()),
                     "junk".into(),
                 ],
                 peers: Vec::new(),
