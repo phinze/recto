@@ -1025,27 +1025,51 @@ fn render_workspace(
         backend.as_ref(),
         store.as_ref().and_then(|s| s.stack_base_pr()),
     )?;
-    let raw = backend
-        .unified_diff(&Scope::Range(branch_base.clone()), false)
-        .context("diff failed")?;
-    let mut files = parse_diff(&raw);
-    let anchor = anchor(backend.as_ref(), &branch_base, start, files.is_empty());
-    let base = anchor.base.clone();
-    if base != branch_base {
-        let raw = backend
-            .unified_diff(&Scope::Range(base.clone()), false)
-            .context("diff failed")?;
-        files = parse_diff(&raw);
+    // Each of these is a few jj calls, and they don't wait on each other, so
+    // they run side by side: the branch's diff, its commits, and whether the
+    // rig's start moves the range. The range usually stays put, which makes
+    // the branch's commits the list the page shows; when the start moves it,
+    // the moved range's diff and commits follow, again side by side.
+    let b = backend.as_ref();
+    let range_commits = |base: &Base| {
+        b.base_commit(base)
+            .and_then(|from| b.commits(&from, b.head_rev()).ok())
+            .unwrap_or_default()
+    };
+    let (branch_raw, branch_commits, mut anchor) = thread::scope(|s| {
+        let diff = s.spawn(|| b.unified_diff(&Scope::Range(branch_base.clone()), false));
+        let commits = s.spawn(|| range_commits(&branch_base));
+        // Whether the branch's diff is empty only decides whether a note
+        // is worth showing, so it's settled once both are in.
+        let anchor = anchor(b, &branch_base, start, true);
+        (
+            diff.join()
+                .unwrap_or_else(|_| Err(anyhow!("diff panicked"))),
+            commits.join().unwrap_or_default(),
+            anchor,
+        )
+    });
+    let mut files = parse_diff(&branch_raw.context("diff failed")?);
+    if !files.is_empty() && anchor.base == branch_base {
+        anchor.note = None;
     }
+    let base = anchor.base.clone();
+    // The revision list spans the anchored range. It is where landed work
+    // stays visible, so it isn't worth drawing for fewer than two commits.
+    let commits = if base == branch_base {
+        branch_commits
+    } else {
+        let (raw, commits) = thread::scope(|s| {
+            let commits = s.spawn(|| range_commits(&base));
+            let raw = b.unified_diff(&Scope::Range(base.clone()), false);
+            (raw, commits.join().unwrap_or_default())
+        });
+        files = parse_diff(&raw.context("diff failed")?);
+        commits
+    };
     if let Some(note) = &anchor.note {
         notices.push(note.clone());
     }
-    // The revision list spans the anchored range. It is where landed work
-    // stays visible, so it isn't worth drawing for fewer than two commits.
-    let commits = backend
-        .base_commit(&base)
-        .and_then(|from| backend.commits(&from, backend.head_rev()).ok())
-        .unwrap_or_default();
     // The view names a change or a layer by change, so it follows its work
     // through a rewrite. The reader's own pick wins; without one, the page
     // shows the view the agent last moved it to.
@@ -1368,12 +1392,6 @@ pub(crate) fn anchor(
     }
 }
 
-/// The commits in the page's range, newest first. Picking one narrows the
-/// file list to that commit; the first row goes back to the whole range.
-/// The stack: a sticky bar naming the view with a step to the change on
-/// either side, then the layers, each a PR or one meant to be, with their
-/// commits. A stack with one layer lists its commits as before. Landed
-/// layers fold, since their work is done.
 /// What the stack is drawn around besides its commits: the PRs attached to
 /// its layers, the working copy's commit, whether the range reaches back to
 /// the rig's start, and the range's own totals.
@@ -1397,6 +1415,10 @@ fn layer_pr<'a>(
     })
 }
 
+/// The stack: a sticky bar naming the view with a step to the change on
+/// either side, then the layers, each a PR or one meant to be, with their
+/// commits. A stack with one layer lists its commits as before. Landed
+/// layers fold, since their work is done.
 fn render_stack(
     index: usize,
     commits: &[Commit],
@@ -1965,51 +1987,110 @@ fn render_files(
     } else {
         ""
     };
-    for file in files {
-        let key = file_key(&file.path);
-        let _ = write!(
-            out,
-            "<details class=file id=\"f{index}-{key}\" data-path=\"{}\"{open}><summary><span class=\"st st-{}\">{}</span><span class=path>{}</span><span class=stat><span class=add>+{}</span> <span class=del>−{}</span>{}</span></summary>",
-            esc(&file.path),
-            file.status,
-            file.status,
-            esc(&file.path),
-            file.added,
-            file.removed,
-            diffstat_bar(file.added, file.removed),
-        );
-        if file.binary {
-            out.push_str("<p class=dim>binary file</p>");
-        } else {
-            out.push_str(DIFF_TABLE);
-            let ext = ext_for_path(&file.path);
-            for hunk in &file.hunks {
-                let _ = write!(
-                    out,
-                    "<tr class=hunk><td colspan=3>{}</td></tr>",
-                    esc(&hunk.header)
-                );
-                for line in &hunk.lines {
-                    diff_row(index, &key, line, ext, budget, out);
-                    // A review draft sits under the last line it's about,
-                    // where GitHub will show it.
-                    if let Some(n) = line.new {
-                        for d in drafts
-                            .iter()
-                            .filter(|d| d.pin.shown() && d.path == file.path && d.end == n)
-                        {
-                            out.push_str("<tr class=draft><td colspan=3>");
-                            draft_card(d, pr, out);
-                            out.push_str("</td></tr>");
-                        }
+    // Highlighting is most of a page's render time, and files don't depend on
+    // each other, so they render side by side. The budget is shared out in
+    // file order first, a line apiece as rendering in order would spend it,
+    // so the page comes out the same as it would one file at a time.
+    let shares: Vec<usize> = files
+        .iter()
+        .map(|file| {
+            let wants = if file.binary {
+                0
+            } else {
+                file.hunks
+                    .iter()
+                    .flat_map(|h| &h.lines)
+                    .filter(|l| l.kind != Kind::Meta)
+                    .count()
+            };
+            let share = wants.min(*budget);
+            *budget -= share;
+            share
+        })
+        .collect();
+    let workers = thread::available_parallelism()
+        .map_or(4, |n| n.get())
+        .min(files.len().max(1));
+    let chunk = files.len().div_ceil(workers).max(1);
+    let rendered: Vec<String> = thread::scope(|s| {
+        let handles: Vec<_> = files
+            .chunks(chunk)
+            .zip(shares.chunks(chunk))
+            .map(|(files, shares)| {
+                s.spawn(move || {
+                    let mut out = String::new();
+                    for (file, share) in files.iter().zip(shares) {
+                        render_file(index, file, drafts, pr, open, *share, &mut out);
+                    }
+                    out
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .map(|h| h.join().unwrap_or_default())
+            .collect()
+    });
+    for part in rendered {
+        out.push_str(&part);
+    }
+    out.push_str("</div>");
+}
+
+/// One file's diff: its header, its hunks with their rows highlighted while
+/// `budget` lasts, and any review drafts under the lines they're about.
+fn render_file(
+    index: usize,
+    file: &FileDiff,
+    drafts: &[link::DraftReviewComment],
+    pr: Option<u64>,
+    open: &str,
+    mut budget: usize,
+    out: &mut String,
+) {
+    let budget = &mut budget;
+    let key = file_key(&file.path);
+    let _ = write!(
+        out,
+        "<details class=file id=\"f{index}-{key}\" data-path=\"{}\"{open}><summary><span class=\"st st-{}\">{}</span><span class=path>{}</span><span class=stat><span class=add>+{}</span> <span class=del>−{}</span>{}</span></summary>",
+        esc(&file.path),
+        file.status,
+        file.status,
+        esc(&file.path),
+        file.added,
+        file.removed,
+        diffstat_bar(file.added, file.removed),
+    );
+    if file.binary {
+        out.push_str("<p class=dim>binary file</p>");
+    } else {
+        out.push_str(DIFF_TABLE);
+        let ext = ext_for_path(&file.path);
+        for hunk in &file.hunks {
+            let _ = write!(
+                out,
+                "<tr class=hunk><td colspan=3>{}</td></tr>",
+                esc(&hunk.header)
+            );
+            for line in &hunk.lines {
+                diff_row(index, &key, line, ext, budget, out);
+                // A review draft sits under the last line it's about,
+                // where GitHub will show it.
+                if let Some(n) = line.new {
+                    for d in drafts
+                        .iter()
+                        .filter(|d| d.pin.shown() && d.path == file.path && d.end == n)
+                    {
+                        out.push_str("<tr class=draft><td colspan=3>");
+                        draft_card(d, pr, out);
+                        out.push_str("</td></tr>");
                     }
                 }
             }
-            out.push_str("</table>");
         }
-        out.push_str("</details>");
+        out.push_str("</table>");
     }
-    out.push_str("</div>");
+    out.push_str("</details>");
 }
 
 /// One inline review draft, as the reader will see it posted.
