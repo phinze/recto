@@ -990,6 +990,34 @@ pub(crate) fn harden_dir(dir: &Path) {
 #[cfg(not(unix))]
 pub(crate) fn harden_dir(_dir: &Path) {}
 
+/// The bottom of a stack of PRs: of the attached PRs in `front`'s
+/// repository, the one whose base branch isn't another's head. A range from
+/// its base takes in every layer, where the front PR's base would cut off the
+/// ones below it. With no single bottom, the front PR stands.
+pub fn stack_bottom<'a>(prs: &[&'a PullRequest], front: &'a PullRequest) -> &'a PullRequest {
+    let mut stack: Vec<&PullRequest> = prs
+        .iter()
+        .copied()
+        .filter(|p| p.repository == front.repository)
+        .collect();
+    if !stack.iter().any(|p| p.number == front.number) {
+        stack.push(front);
+    }
+    let bottoms: Vec<&PullRequest> = stack
+        .iter()
+        .copied()
+        .filter(|p| {
+            !stack
+                .iter()
+                .any(|q| q.number != p.number && q.head_ref == p.base_ref)
+        })
+        .collect();
+    match bottoms.as_slice() {
+        [one] => one,
+        _ => front,
+    }
+}
+
 impl crate::anchor::Pinned for DraftReviewComment {
     fn parts(&mut self) -> (&str, &mut crate::anchor::Pin, &mut u32, &mut u32) {
         (&self.path, &mut self.pin, &mut self.start, &mut self.end)
@@ -999,6 +1027,36 @@ impl crate::anchor::Pinned for DraftReviewComment {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A stack of PRs ranges from its bottom PR's base, found by base
+    /// branches rather than by the order PRs were attached; anything that
+    /// isn't one stack falls back to the front PR.
+    #[test]
+    fn the_bottom_of_a_stack_is_the_pr_no_other_one_is_based_on() {
+        let pr = |number: u64, base: &str, head: &str| PullRequest {
+            number,
+            base_ref: base.into(),
+            head_ref: head.into(),
+            ..crate::testing::empty_pull_request("base")
+        };
+        let (a, b, c) = (
+            pr(41, "main", "one"),
+            pr(42, "one", "two"),
+            pr(43, "two", "three"),
+        );
+        assert_eq!(stack_bottom(&[&c, &a, &b], &c).number, 41);
+        assert_eq!(
+            stack_bottom(&[], &c).number,
+            43,
+            "alone, the front PR is its own bottom"
+        );
+        let other = pr(99, "main", "elsewhere");
+        assert_eq!(
+            stack_bottom(&[&a, &other], &a).number,
+            41,
+            "two bottoms is no single stack: the front stands"
+        );
+    }
 
     /// Bind a listener, drain one request on a worker thread, and confirm the
     /// client `send` gets the worker's reply back — the full socket round trip.

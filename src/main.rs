@@ -213,9 +213,18 @@ fn main() -> Result<()> {
     // `App::load` loads synchronously, so an unfetched base OID here would
     // take the whole viewer down instead of showing one bad range. Fall back
     // to the default and say so in the startup notice.
+    // In a stack of PRs the range starts at the bottom PR's base, so every
+    // layer is in view while the top PR stays in front.
+    let stack_base = pull_request.as_ref().map(|front| {
+        let attached = persistence
+            .as_ref()
+            .map(|s| s.pull_requests())
+            .unwrap_or_default();
+        link::stack_bottom(&attached, front).clone()
+    });
     let initial_base = match cli.base {
         Some(revision) => Some(Base::Revision(revision)),
-        None => pull_request.as_ref().and_then(|pr| {
+        None => stack_base.as_ref().and_then(|pr| {
             let base = Base::branch_point(pr.base_oid.clone());
             if backend.resolves(&base) {
                 Some(base)

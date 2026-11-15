@@ -546,7 +546,16 @@ impl App {
             self.resolve_drafts_now();
         }
 
-        let base = Base::branch_point(pull_request.base_oid.clone());
+        // A stack of PRs is ranged from its bottom PR's base, so attaching
+        // the top one (as a refresh does, last) keeps every layer in view.
+        let attached: Vec<link::PullRequest> = self
+            .persistence
+            .as_ref()
+            .map(|s| s.pull_requests().into_iter().cloned().collect())
+            .unwrap_or_default();
+        let attached: Vec<&link::PullRequest> = attached.iter().collect();
+        let bottom = link::stack_bottom(&attached, &pull_request);
+        let base = Base::branch_point(bottom.base_oid.clone());
         let base_changed = self.backend.base_label(self.base()) != self.backend.base_label(&base);
         // A base OID GitHub knows is not necessarily one this workspace has
         // fetched. Retargeting onto it anyway would trade a readable diff for

@@ -364,6 +364,13 @@ impl Store {
         }
     }
 
+    /// The PR whose base a stack's range starts from: its bottom, or the
+    /// front PR when the attached PRs don't form one stack.
+    pub fn stack_base_pr(&self) -> Option<&PullRequest> {
+        let front = self.pull_request()?;
+        Some(crate::link::stack_bottom(&self.pull_requests(), front))
+    }
+
     /// Every attached PR, bottom of the stack first. State written before
     /// stacks has only the one in front.
     pub fn pull_requests(&self) -> Vec<&PullRequest> {

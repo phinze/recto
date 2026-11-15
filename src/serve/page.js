@@ -561,15 +561,22 @@
     const repo = section ? section.dataset.repo : '';
     // A review draft is the agent's words about some lines, so a comment on
     // it is about the draft, not the lines under it.
+    // In a stack of PRs each has its own review, so the anchor names the PR:
+    // its section is PR#DRAFT for a draft and the PR for a summary.
     const draft = node.closest('.draft-card');
     if (draft) {
       const d = draft.dataset;
       const span = d.start === d.end ? d.start : d.start + '-' + d.end;
-      return { kind: 'draft', repo, path: d.path, start: +d.start, end: +d.end, section: d.draft,
-        label: (repo ? repo + ' ' : '') + 'draft #' + d.draft + ' on ' + d.path + ':' + span };
+      const pr = d.pr ? ' (PR #' + d.pr + ')' : '';
+      return { kind: 'draft', repo, path: d.path, start: +d.start, end: +d.end,
+        section: (d.pr ? d.pr + '#' : '') + d.draft,
+        label: (repo ? repo + ' ' : '') + 'draft #' + d.draft + pr + ' on ' + d.path + ':' + span };
     }
-    if (node.closest('article.review')) {
-      return { kind: 'review', repo, label: (repo ? repo + ' ' : '') + 'review summary' };
+    const review = node.closest('article.review');
+    if (review) {
+      const pr = review.dataset.pr;
+      return { kind: 'review', repo, section: pr || undefined,
+        label: (repo ? repo + ' ' : '') + 'review summary' + (pr ? ' for PR #' + pr : '') };
     }
     const figure = node.closest('figure.quote');
     const file = node.closest('details.file');
@@ -824,9 +831,11 @@
         for (const row of rows) { row.classList.add('has-comment'); row.dataset.cstate = c.state; row.title = c.body; }
       } else if (a.kind === 'draft' || a.kind === 'review') {
         const scope = content.querySelector(`section.repo[data-repo="${CSS.escape(a.repo || '')}"]`) || content;
+        const [pr, id] = (a.section || '').includes('#') ? a.section.split('#') : [a.kind === 'review' ? a.section : '', a.section];
+        const onPR = pr ? `[data-pr="${CSS.escape(pr)}"]` : '';
         const head = a.kind === 'draft'
-          ? scope.querySelector(`.draft-card[data-draft="${CSS.escape(a.section || '')}"] .draft-head`)
-          : scope.querySelector('article.review .review-head');
+          ? scope.querySelector(`.draft-card${onPR}[data-draft="${CSS.escape(id || '')}"] .draft-head`)
+          : scope.querySelector(`article.review${onPR} .review-head`);
         if (head) {
           const b = document.createElement('span');
           b.className = 'c-badge';

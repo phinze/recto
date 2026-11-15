@@ -117,14 +117,6 @@ impl Lens {
         }
     }
 
-    /// One layer: read at its head, showing its commits' anchors.
-    pub fn layer(head: String, commits: Vec<String>) -> Self {
-        Self {
-            head,
-            members: Some(commits),
-        }
-    }
-
     pub fn is_narrowed(&self) -> bool {
         self.members.is_some()
     }

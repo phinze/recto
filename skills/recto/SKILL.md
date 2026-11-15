@@ -440,6 +440,14 @@ arrives like any other, anchored as `REPO draft #ID on PATH:LINES` or
 draft reads as done, ask in the briefing whether to post it; posting is
 still a separate step that waits on his answer.
 
+A workspace can hold a stack of PRs, one per layer: a review rig for a
+stacked PR attaches every PR of the stack, and `recto pr URL` adds one more.
+Each layer in the window goes by its PR, and opening a layer shows that PR's
+review. Comments there name the PR (`draft #3 (PR #41) on …`, `review summary
+for PR #41`). The review commands act on the PR in front, which is the one
+last attached, so `recto pr` the PR's URL before revising its drafts, then
+`recto pr` the top PR's URL again to put it back in front.
+
 These commands require an attached PR, and this workflow does not post
 anything publicly. Do not copy private `recto notes` into the review draft by
 assumption: notes are ephemeral direction, while shared drafts are the exact

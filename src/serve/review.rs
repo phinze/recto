@@ -464,7 +464,14 @@ mod tests {
             snippet: None,
         };
         let mut out = String::new();
-        render_files(0, &files, std::slice::from_ref(&draft), &mut 0, &mut out);
+        render_files(
+            0,
+            &files,
+            std::slice::from_ref(&draft),
+            None,
+            &mut 0,
+            &mut out,
+        );
         let card = out.find("data-draft=\"4\"").expect("rendered");
         let line3 = out.find(">3</td>").expect("line 3");
         assert!(line3 < card && card < out.find(">4</td>").unwrap(), "{out}");

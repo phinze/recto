@@ -987,7 +987,12 @@ fn render_workspace(
         }
     };
     let pull_request = store.as_ref().and_then(|s| s.pull_request().cloned());
-    let branch_base = view_base(backend.as_ref(), pull_request.as_ref())?;
+    // A stack of PRs is ranged from its bottom PR's base, so every layer is
+    // on the page; the front PR's own base would cut off the ones below it.
+    let branch_base = view_base(
+        backend.as_ref(),
+        store.as_ref().and_then(|s| s.stack_base_pr()),
+    )?;
     let raw = backend
         .unified_diff(&Scope::Range(branch_base.clone()), false)
         .context("diff failed")?;
@@ -1042,11 +1047,15 @@ fn render_workspace(
                     head_oid: pr.head_oid.clone(),
                 })
             });
+            // Read at the layer's head without narrowing to its own commits:
+            // a draft on unchanged lines inside a hunk is stamped to an older
+            // change, and still belongs on this layer's diff. Whether its
+            // lines are on screen is the diff's to say.
             let review = review.map(|mut r| {
-                let lens = crate::anchor::Lens::layer(
-                    l.head().id.clone(),
-                    l.commits.iter().map(|c| c.id.clone()).collect(),
-                );
+                let lens = crate::anchor::Lens {
+                    head: l.head().id.clone(),
+                    members: None,
+                };
                 crate::anchor::settle(backend.as_ref(), &lens, &mut r.comments);
                 r
             });
@@ -1142,11 +1151,16 @@ fn render_workspace(
             crate::anchor::settle(backend.as_ref(), &lens, &mut r.comments);
             r
         });
+    // One review per view, so feedback on it can't land on another: a
+    // layer carrying its own PR shows that PR's review in its place.
+    let front_pr = pull_request.as_ref().map(|p| p.number);
+    let layer_pr_number = layer_review.as_ref().map(|(p, _)| p.number);
     if let Some(r) = review
         .as_ref()
         .filter(|r| r.verdict.is_some() || r.body.is_some() || !r.comments.is_empty())
+        .filter(|_| layer_pr_number.is_none_or(|n| Some(n) == front_pr))
     {
-        review_card(r, &files, out);
+        review_card(r, &files, front_pr, out);
     }
     let drafts: &[link::DraftReviewComment] = review.as_ref().map_or(&[], |r| &r.comments);
     // Where the agent last moved the view, for the page to follow when it
@@ -1225,8 +1239,9 @@ fn render_workspace(
         if let Some(r) = review
             .as_ref()
             .filter(|r| r.verdict.is_some() || r.body.is_some() || !r.comments.is_empty())
+            .filter(|_| Some(pr.number) != front_pr)
         {
-            review_card(r, &shown, out);
+            review_card(r, &shown, Some(pr.number), out);
         }
     }
     if !matches!(lens_view, crate::stack::View::Stack) {
@@ -1236,10 +1251,17 @@ fn render_workspace(
                 _ => "<p class=empty>This commit changes no files.</p>",
             });
         } else {
-            render_files(index, &shown, &layer_drafts, &mut budget, out);
+            render_files(
+                index,
+                &shown,
+                &layer_drafts,
+                layer_pr_number,
+                &mut budget,
+                out,
+            );
         }
     } else if !files.is_empty() {
-        render_files(index, &files, drafts, &mut budget, out);
+        render_files(index, &files, drafts, front_pr, &mut budget, out);
     }
     Ok(Summary {
         root: Some(root),
@@ -1612,7 +1634,7 @@ pub(crate) fn save_focus_offline(path: &str, start: Option<u32>, end: Option<u32
         }
         // The same range the web view shows, anchored at the rig's start
         // when rig says where that is.
-        let branch = view_base(backend.as_ref(), store.pull_request())?;
+        let branch = view_base(backend.as_ref(), store.stack_base_pr())?;
         let mut files = parse_diff(&backend.unified_diff(&Scope::Range(branch.clone()), false)?);
         let start_commit = rig_start(backend.root());
         let anchored = anchor(
@@ -1688,7 +1710,7 @@ pub(crate) fn save_lens_offline(spec: &str) -> i32 {
         let mut store = state::Store::load(backend.root(), None)?;
         let spec = spec.trim();
         if !spec.is_empty() {
-            let base = view_base(backend.as_ref(), store.pull_request())?;
+            let base = view_base(backend.as_ref(), store.stack_base_pr())?;
             let anchored = anchor(
                 backend.as_ref(),
                 &base,
@@ -1896,6 +1918,7 @@ fn render_files(
     index: usize,
     files: &[FileDiff],
     drafts: &[link::DraftReviewComment],
+    pr: Option<u64>,
     budget: &mut usize,
     out: &mut String,
 ) {
@@ -1944,7 +1967,7 @@ fn render_files(
                             .filter(|d| d.pin.shown() && d.path == file.path && d.end == n)
                         {
                             out.push_str("<tr class=draft><td colspan=3>");
-                            draft_card(d, out);
+                            draft_card(d, pr, out);
                             out.push_str("</td></tr>");
                         }
                     }
@@ -1958,7 +1981,7 @@ fn render_files(
 }
 
 /// One inline review draft, as the reader will see it posted.
-fn draft_card(d: &link::DraftReviewComment, out: &mut String) {
+fn draft_card(d: &link::DraftReviewComment, pr: Option<u64>, out: &mut String) {
     let span = if d.start == d.end {
         d.start.to_string()
     } else {
@@ -1970,7 +1993,8 @@ fn draft_card(d: &link::DraftReviewComment, out: &mut String) {
     };
     let _ = write!(
         out,
-        "<div class=draft-card data-draft=\"{}\" data-path=\"{}\" data-start={} data-end={}><div class=draft-head>Draft #{} <span class=dim>{}:{span} · last edit {who}</span>{}</div><div class=draft-body>{}</div></div>",
+        "<div class=draft-card{} data-draft=\"{}\" data-path=\"{}\" data-start={} data-end={}><div class=draft-head>Draft #{} <span class=dim>{}:{span} · last edit {who}</span>{}</div><div class=draft-body>{}</div></div>",
+        pr.map(|n| format!(" data-pr={n}")).unwrap_or_default(),
         d.id,
         esc(&d.path),
         d.start,
@@ -1988,12 +2012,19 @@ fn draft_card(d: &link::DraftReviewComment, out: &mut String) {
 
 /// The review taking shape, at the top of its repo: verdict, summary, and
 /// any draft whose lines have left the diff, so nothing silently vanishes.
-fn review_card(review: &state::RestoredReview, files: &[FileDiff], out: &mut String) {
+fn review_card(
+    review: &state::RestoredReview,
+    files: &[FileDiff],
+    pr: Option<u64>,
+    out: &mut String,
+) {
     let verdict = review.verdict.map_or("no verdict yet", |v| v.label());
     let n = review.comments.len();
     let _ = write!(
         out,
-        "<article class=review><div class=review-head>Review draft · <b>{verdict}</b> · {n} inline comment{}</div>",
+        "<article class=review{}><div class=review-head>Review draft{} · <b>{verdict}</b> · {n} inline comment{}</div>",
+        pr.map(|n| format!(" data-pr={n}")).unwrap_or_default(),
+        pr.map(|n| format!(" for #{n}")).unwrap_or_default(),
         if n == 1 { "" } else { "s" }
     );
     match review.body.as_ref().filter(|b| !b.body.trim().is_empty()) {
@@ -2019,7 +2050,7 @@ fn review_card(review: &state::RestoredReview, files: &[FileDiff], out: &mut Str
     if !lost.is_empty() {
         out.push_str("<div class=draft-lost><p class=dim>Not on this diff any more:</p>");
         for d in lost {
-            draft_card(d, out);
+            draft_card(d, pr, out);
         }
         out.push_str("</div>");
     }
