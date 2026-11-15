@@ -392,9 +392,14 @@
   // EventSource retries a dropped connection by itself, but gives up for good
   // on an error response, which is what a proxy sends while recto restarts.
   // So a closed stream is reopened here, and the page catches up when it is.
+  // A phone suspends the page while the person is in another app, and WebKit
+  // can hand back a stream that looks open on a dead socket, so coming back
+  // into view reopens it and catches up on whatever changed meanwhile.
   let dropped = false;
+  let current = null;
   function listen() {
-    const es = new EventSource('events' + qs);
+    if (current) current.close();
+    const es = current = new EventSource('events' + qs);
     es.addEventListener('open', () => {
       live.classList.add('on');
       if (dropped) { dropped = false; refresh(); }
@@ -402,11 +407,16 @@
     es.addEventListener('error', () => {
       live.classList.remove('on');
       dropped = true;
-      if (es.readyState === EventSource.CLOSED) setTimeout(listen, 3000);
+      if (es === current && es.readyState === EventSource.CLOSED) {
+        setTimeout(() => { if (es === current) listen(); }, 3000);
+      }
     });
     es.addEventListener('changed', refresh);
   }
   listen();
+  document.addEventListener('visibilitychange', () => {
+    if (document.visibilityState === 'visible') { dropped = true; listen(); }
+  });
 
 
   // Comments. Select anything on the page, say something about it, and the
