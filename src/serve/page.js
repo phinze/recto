@@ -924,6 +924,9 @@
     if (e.source !== window.parent) return;
     if (e.data && typeof e.data.focus === 'string') reveal(e.data.focus);
     if (e.data && e.data.refresh) refresh();
+    if (e.data && e.data.insets && typeof e.data.insets.bottom === 'number') {
+      document.documentElement.style.setProperty('--safe-b', e.data.insets.bottom + 'px');
+    }
     // The frame's "needs you" badge: open the briefing and bring it up.
     if (e.data && e.data.brief) {
       const brief = content.querySelector('details.group-brief');
