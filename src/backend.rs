@@ -48,6 +48,12 @@ impl Base {
 pub enum Scope {
     Range(Base),
     Rev(String),
+    /// One layer of a stack: from just below `bottom` to `top`, both named
+    /// like a `Rev`, the way a PR made of those commits reads.
+    Span {
+        bottom: String,
+        top: String,
+    },
 }
 
 /// A revision in the current range. `id` is the commit (jj commit id, git
@@ -552,6 +558,10 @@ impl Backend for JjBackend {
                 args.push("-r");
                 args.push(id);
             }
+            Scope::Span { bottom, top } => {
+                rev = format!("{bottom}-");
+                args.extend(["--from", &rev, "--to", top]);
+            }
         }
         let out = self.run(&args)?;
         Ok(out.lines().filter_map(parse_summary_line).collect())
@@ -572,6 +582,10 @@ impl Backend for JjBackend {
             Scope::Rev(id) => {
                 args.push("-r");
                 args.push(id);
+            }
+            Scope::Span { bottom, top } => {
+                rev = format!("{bottom}-");
+                args.extend(["--from", &rev, "--to", top]);
             }
         }
         self.run(&args)
@@ -937,6 +951,15 @@ impl Backend for GitBackend {
                 c.push(sha);
                 c
             }
+            Scope::Span { bottom, top } => {
+                arg = format!("{bottom}^");
+                let mut c = vec!["diff", "--name-status"];
+                if ignore_ws {
+                    c.push("-w");
+                }
+                c.extend([arg.as_str(), top.as_str()]);
+                c
+            }
         };
         let out = self.run(&cmd)?;
         Ok(out.lines().filter_map(parse_git_name_status).collect())
@@ -960,6 +983,15 @@ impl Backend for GitBackend {
                     c.push("-w");
                 }
                 c.push(sha);
+                c
+            }
+            Scope::Span { bottom, top } => {
+                arg = format!("{bottom}^");
+                let mut c = vec!["diff"];
+                if ignore_ws {
+                    c.push("-w");
+                }
+                c.extend([arg.as_str(), top.as_str()]);
                 c
             }
         };

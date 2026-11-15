@@ -142,20 +142,38 @@ fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Resu
             resolved = Scope::Rev(commit.clone());
             (&resolved, Lens::narrowed(commit))
         }
+        Scope::Span { bottom, top } => {
+            let (Some(b), Some(t)) = (backend.commit_id(bottom), backend.commit_id(top)) else {
+                anyhow::bail!("{bottom}..{top} no longer names a layer");
+            };
+            resolved = Scope::Span {
+                bottom: b,
+                top: t.clone(),
+            };
+            // A layer reads at its head; whether an anchor's lines show is
+            // the layer's diff to say, as in the window.
+            (
+                &resolved,
+                Lens {
+                    head: t,
+                    members: None,
+                },
+            )
+        }
         scope => (scope, Lens::range(backend)),
     };
     let changes = backend.list_changes(scope, req.ignore_ws)?;
     let diff = backend.unified_diff(scope, req.ignore_ws)?;
     let revs = match scope {
         Scope::Range(base) => Some(backend.list_revs(base)?),
-        Scope::Rev(_) => None,
+        Scope::Rev(_) | Scope::Span { .. } => None,
     };
     // Post-image source per scope: Range's post-image is `@` (jj) or
     // working tree (git), which disk approximates well and cheaply. Rev's
     // post-image is that rev's tree, so we have to ask the backend.
     let fetch: Box<FetchContent> = match scope {
         Scope::Range(_) => Box::new(|path: &str| std::fs::read_to_string(path).ok()),
-        Scope::Rev(id) => {
+        Scope::Rev(id) | Scope::Span { top: id, .. } => {
             let id = id.clone();
             Box::new(move |path: &str| backend.file_content(&id, path).ok())
         }
@@ -233,6 +251,18 @@ pub(crate) enum PaneVis {
 pub(crate) enum Cursor {
     All,
     Rev(usize),
+    /// The layer whose head is `revs[i]`: a PR, or one meant to be.
+    Layer(usize),
+}
+
+/// One layer of the range's stack in the rev panel: its head and bottom as
+/// indices into `revs`, and its name.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct TuiLayer {
+    pub(crate) head: usize,
+    pub(crate) bottom: usize,
+    pub(crate) name: String,
+    pub(crate) revs: usize,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -471,6 +501,9 @@ pub(crate) struct App {
     pub(crate) files_area: Rect,
     pub(crate) diff_content_area: Rect,
     pub(crate) commits_area: Rect,
+    /// What each row of the rev panel stands for, as last drawn: a cursor
+    /// stop, or `None` for a graph connector between revs.
+    pub(crate) commit_rows: Vec<Option<Cursor>>,
     /// Columns the tab strip occupied in the latest draw, so a click can be
     /// routed to a page. Empty when the strip has nothing to choose between.
     pub(crate) tabs_area: Rect,
@@ -688,6 +721,7 @@ impl App {
             files_area: Rect::default(),
             diff_content_area: Rect::default(),
             commits_area: Rect::default(),
+            commit_rows: Vec::new(),
             tabs_area: Rect::default(),
             // Plausible stand-in for the one frame between opening the modal
             // and drawing it; the real width lands before any key arrives.
@@ -802,7 +836,65 @@ impl App {
         match self.cursor {
             Cursor::All => Scope::Range(self.base().clone()),
             Cursor::Rev(i) => Scope::Rev(self.revs[i].target().to_string()),
+            Cursor::Layer(i) => match self.layers().into_iter().find(|l| l.head == i) {
+                Some(l) => Scope::Span {
+                    bottom: self.revs[l.bottom].target().to_string(),
+                    top: self.revs[l.head].target().to_string(),
+                },
+                None => Scope::Range(self.base().clone()),
+            },
         }
+    }
+
+    /// The range's stack as the rev panel shows it: a layer per bookmark among
+    /// the revs in range, unbookmarked work on top as "unpushed". A range with
+    /// one layer has none to show, so it reads as it always has.
+    pub(crate) fn layers(&self) -> Vec<TuiLayer> {
+        let in_range: Vec<usize> = (0..self.revs.len())
+            .filter(|&i| self.revs[i].is_in_range)
+            .collect();
+        let mut layers: Vec<TuiLayer> = Vec::new();
+        for (n, &i) in in_range.iter().enumerate() {
+            let rev = &self.revs[i];
+            if n == 0 || !rev.refs.is_empty() {
+                layers.push(TuiLayer {
+                    head: i,
+                    bottom: i,
+                    name: rev
+                        .refs
+                        .first()
+                        .cloned()
+                        .unwrap_or_else(|| "unpushed".into()),
+                    revs: 0,
+                });
+            }
+            if let Some(layer) = layers.last_mut() {
+                layer.bottom = i;
+                layer.revs += 1;
+            }
+        }
+        if layers.len() < 2 {
+            return Vec::new();
+        }
+        layers
+    }
+
+    /// Every place the rev cursor can stop, in panel order: the whole range,
+    /// then each rev, a layer's header just before its head.
+    pub(crate) fn cursor_stops(&self) -> Vec<Cursor> {
+        let heads: Vec<usize> = self.layers().iter().map(|l| l.head).collect();
+        let mut stops = vec![Cursor::All];
+        for i in 0..self.revs.len() {
+            if heads.contains(&i) {
+                stops.push(Cursor::Layer(i));
+            }
+            stops.push(Cursor::Rev(i));
+        }
+        stops
+    }
+
+    fn cursor_place(&self, stops: &[Cursor]) -> usize {
+        stops.iter().position(|c| *c == self.cursor).unwrap_or(0)
     }
 
     /// How a base reads in the header. A base picked out of the rev panel is
@@ -839,6 +931,15 @@ impl App {
                     .map(|r| r.short_id.clone())
                     .unwrap_or_else(|| id.chars().take(8).collect());
                 format!("rev: {short}")
+            }
+            Scope::Span { top, .. } => {
+                let name = self
+                    .layers()
+                    .into_iter()
+                    .find(|l| self.revs[l.head].target() == top)
+                    .map(|l| l.name)
+                    .unwrap_or_else(|| top.chars().take(8).collect());
+                format!("layer: {name}")
             }
         }
     }
@@ -919,11 +1020,9 @@ impl App {
         if self.revs.is_empty() {
             return;
         }
-        self.cursor = match self.cursor {
-            Cursor::All => Cursor::Rev(0),
-            Cursor::Rev(i) if i + 1 >= self.revs.len() => Cursor::All,
-            Cursor::Rev(i) => Cursor::Rev(i + 1),
-        };
+        let stops = self.cursor_stops();
+        let at = self.cursor_place(&stops);
+        self.cursor = stops[(at + 1) % stops.len()];
         self.request_current_scope();
     }
 
@@ -931,26 +1030,16 @@ impl App {
         if self.revs.is_empty() {
             return;
         }
-        self.cursor = match self.cursor {
-            Cursor::All => Cursor::Rev(self.revs.len() - 1),
-            Cursor::Rev(0) => Cursor::All,
-            Cursor::Rev(i) => Cursor::Rev(i - 1),
-        };
+        let stops = self.cursor_stops();
+        let at = self.cursor_place(&stops);
+        self.cursor = stops[(at + stops.len() - 1) % stops.len()];
         self.request_current_scope();
     }
 
     pub(crate) fn commits_select_next(&mut self) {
-        let current_idx = match self.cursor {
-            Cursor::All => 0,
-            Cursor::Rev(i) => i + 1,
-        };
-        let max = self.revs.len();
-        let next_idx = (current_idx + 1).min(max);
-        let new_cursor = if next_idx == 0 {
-            Cursor::All
-        } else {
-            Cursor::Rev(next_idx - 1)
-        };
+        let stops = self.cursor_stops();
+        let at = self.cursor_place(&stops);
+        let new_cursor = stops[(at + 1).min(stops.len() - 1)];
         if new_cursor != self.cursor {
             self.cursor = new_cursor;
             self.request_current_scope();
@@ -958,16 +1047,9 @@ impl App {
     }
 
     pub(crate) fn commits_select_prev(&mut self) {
-        let current_idx = match self.cursor {
-            Cursor::All => 0,
-            Cursor::Rev(i) => i + 1,
-        };
-        let prev_idx = current_idx.saturating_sub(1);
-        let new_cursor = if prev_idx == 0 {
-            Cursor::All
-        } else {
-            Cursor::Rev(prev_idx - 1)
-        };
+        let stops = self.cursor_stops();
+        let at = self.cursor_place(&stops);
+        let new_cursor = stops[at.saturating_sub(1)];
         if new_cursor != self.cursor {
             self.cursor = new_cursor;
             self.request_current_scope();
@@ -1073,6 +1155,12 @@ impl App {
                 .position(|rev| rev.target() == id)
                 .map(Cursor::Rev)
                 .unwrap_or(Cursor::All),
+            Scope::Span { top, .. } => self
+                .revs
+                .iter()
+                .position(|rev| rev.target() == top)
+                .map(Cursor::Layer)
+                .unwrap_or(Cursor::All),
         };
     }
 
@@ -1121,7 +1209,7 @@ impl App {
         self.loaded_scope = scope;
         if let Some(revs) = loaded.revs {
             self.revs = revs;
-            if let Cursor::Rev(i) = self.cursor
+            if let Cursor::Rev(i) | Cursor::Layer(i) = self.cursor
                 && i >= self.revs.len()
             {
                 self.cursor = if self.revs.is_empty() {
@@ -1470,6 +1558,89 @@ mod tests {
         );
         assert!(app.review_draft_comments[0].pin.outdated);
         assert!(!app.review_draft_anchored(&app.review_draft_comments[0]));
+    }
+
+    /// The rev panel shows a stack's layers as stops of their own: a header
+    /// above each layer's head, between the whole range and its revs, whose
+    /// view is that layer alone, and `recto lens layer:CHANGE` lands there.
+    #[test]
+    fn the_rev_panel_stops_at_each_layer_and_shows_it_alone() {
+        let repo = TempRepo::new("app-layers");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        for (name, bookmark) in [
+            ("a", None),
+            ("b", Some("first")),
+            ("c", None),
+            ("d", Some("second")),
+            ("e", None),
+        ] {
+            std::fs::write(repo.0.join(format!("{name}.txt")), format!("{name}\n")).unwrap();
+            repo.run("jj", &["describe", "-m", name]);
+            if let Some(b) = bookmark {
+                repo.run("jj", &["bookmark", "create", b, "-r", "@"]);
+            }
+            repo.run("jj", &["new"]);
+        }
+        let backend: Arc<dyn Backend> = Arc::new(crate::backend::JjBackend::new(repo.0.clone()));
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
+
+        let layers = app.layers();
+        let names: Vec<&str> = layers.iter().map(|l| l.name.as_str()).collect();
+        assert_eq!(
+            names,
+            ["unpushed", "second", "first"],
+            "{:?}",
+            app.revs.iter().map(|r| &r.summary).collect::<Vec<_>>()
+        );
+        let second = layers[1].clone();
+        assert_eq!(second.revs, 2);
+        let stops = app.cursor_stops();
+        let at = stops
+            .iter()
+            .position(|c| *c == Cursor::Layer(second.head))
+            .expect("a stop");
+        assert_eq!(
+            stops[at + 1],
+            Cursor::Rev(second.head),
+            "the header sits just above its head"
+        );
+
+        app.cursor = Cursor::Layer(second.head);
+        let Scope::Span { bottom, top } = app.scope() else {
+            panic!("a layer's view is a span");
+        };
+        let loaded = load_diff(
+            &*backend,
+            &Highlighter::new(),
+            &DiffRequest {
+                generation: 1,
+                scope: Scope::Span { bottom, top },
+                ignore_ws: false,
+                stamps: Vec::new(),
+            },
+        )
+        .unwrap();
+        let mut paths: Vec<&str> = loaded.changes.iter().map(|c| c.path.as_str()).collect();
+        paths.sort();
+        assert_eq!(paths, ["c.txt", "d.txt"], "only the layer's own files");
+
+        app.cursor = Cursor::All;
+        let head = app.revs[second.head].change[..6].to_string();
+        assert!(
+            app.handle_request(link::Request::Lens {
+                spec: format!("layer:{head}")
+            })
+            .ok
+        );
+        assert_eq!(app.cursor, Cursor::Layer(second.head));
+        let c = app.revs[second.bottom].change[..6].to_string();
+        assert!(
+            !app.handle_request(link::Request::Lens {
+                spec: format!("layer:{c}")
+            })
+            .ok,
+            "a change that heads no layer isn't a layer"
+        );
     }
 
     fn test_request(generation: u64) -> DiffRequest {

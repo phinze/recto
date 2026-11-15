@@ -474,11 +474,7 @@ pub(crate) fn handle_event(
                             app.jump_to_selected();
                         }
                         Focus::Commits if app.show_commits => {
-                            let current_idx = match app.cursor {
-                                Cursor::All => 0,
-                                Cursor::Rev(i) => i + 1,
-                            };
-                            if current_idx == 0 {
+                            if app.cursor == Cursor::All {
                                 app.focus = Focus::Diff;
                             } else {
                                 app.commits_select_prev();
@@ -851,16 +847,13 @@ pub(crate) fn handle_mouse(app: &mut App, m: event::MouseEvent) {
                 let inner_y = app.commits_area.y.saturating_add(1);
                 if m.row >= inner_y {
                     let row = (m.row - inner_y) as usize + app.commits_state.offset();
-                    if row <= app.revs.len() {
-                        let new_cursor = if row == 0 {
-                            Cursor::All
-                        } else {
-                            Cursor::Rev(row - 1)
-                        };
-                        if app.cursor != new_cursor {
-                            app.cursor = new_cursor;
-                            app.request_current_scope();
-                        }
+                    // Rows are whatever the panel drew: a rev, a layer's
+                    // header, or a graph connector that picks nothing.
+                    if let Some(Some(new_cursor)) = app.commit_rows.get(row).copied()
+                        && app.cursor != new_cursor
+                    {
+                        app.cursor = new_cursor;
+                        app.request_current_scope();
                     }
                 }
             } else {

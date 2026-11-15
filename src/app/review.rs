@@ -32,6 +32,7 @@ impl App {
         let scope = match self.loaded_scope {
             crate::backend::Scope::Range(_) => "range",
             crate::backend::Scope::Rev(_) => "rev",
+            crate::backend::Scope::Span { .. } => "layer",
         };
         let workspace_root = self.backend.root().to_string_lossy().into_owned();
         let workspace_revision = self
@@ -92,6 +93,10 @@ impl App {
         match &self.loaded_scope {
             Scope::Range(_) => Some(Lens::range(&*self.backend)),
             Scope::Rev(target) => self.backend.commit_id(target).map(Lens::narrowed),
+            Scope::Span { top, .. } => self.backend.commit_id(top).map(|head| Lens {
+                head,
+                members: None,
+            }),
         }
     }
 
@@ -178,46 +183,48 @@ impl App {
         }
     }
 
-    /// Move the view where the agent points: the whole range, or one change.
-    /// The terminal has no layer view yet, so a layer only moves the window,
-    /// which follows the saved lens. Either way the lens is saved for it.
+    /// Move the view where the agent points: the whole range, one layer, or
+    /// one change, named by a change id or a unique prefix of one. The lens is
+    /// saved either way, for the window to follow.
     pub(crate) fn set_lens(&mut self, spec: String) -> link::Response {
         let spec = spec.trim().to_string();
-        let mut note = None;
-        if spec.is_empty() {
-            self.cursor = Cursor::All;
-            self.request_current_scope();
-        } else if spec.starts_with("layer:") {
-            note = Some("the terminal has no layer view yet; the window shows it");
-        } else {
-            let exact = self
+        let find = |name: &str| -> Option<usize> {
+            if let Some(i) = self
                 .revs
                 .iter()
-                .position(|r| r.target() == spec || r.id == spec);
-            let prefixed: Vec<usize> = self
-                .revs
-                .iter()
-                .enumerate()
-                .filter(|(_, r)| r.is_in_range && r.change.starts_with(&spec))
-                .map(|(i, _)| i)
+                .position(|r| r.target() == name || r.id == name)
+            {
+                return Some(i);
+            }
+            let prefixed: Vec<usize> = (0..self.revs.len())
+                .filter(|&i| self.revs[i].is_in_range && self.revs[i].change.starts_with(name))
                 .collect();
-            let Some(i) = exact.or(match prefixed.as_slice() {
+            match prefixed.as_slice() {
                 [one] => Some(*one),
                 _ => None,
-            }) else {
+            }
+        };
+        if spec.is_empty() {
+            self.cursor = Cursor::All;
+        } else if let Some(head) = spec.strip_prefix("layer:") {
+            let Some(i) = find(head).filter(|i| self.layers().iter().any(|l| l.head == *i)) else {
+                return link::Response::err(format!(
+                    "{spec} names no layer in this range (layer:CHANGE, where CHANGE heads a layer)"
+                ));
+            };
+            self.cursor = Cursor::Layer(i);
+        } else {
+            let Some(i) = find(&spec) else {
                 return link::Response::err(format!(
                     "{spec} names no single change in this range (a change id or unique prefix, or layer:CHANGE)"
                 ));
             };
             self.cursor = Cursor::Rev(i);
-            self.request_current_scope();
         }
+        self.request_current_scope();
         self.lens = (!spec.is_empty()).then_some(spec);
         self.persist_soon();
-        match note {
-            Some(note) => link::Response::ok_note(note),
-            None => link::Response::ok(),
-        }
+        link::Response::ok()
     }
 
     /// Resolve the draft comments' stamps against the loaded view on the

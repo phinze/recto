@@ -263,6 +263,10 @@ impl TempRepo {
                 // A command that wants an editor fails rather than hanging the test.
                 "--config",
                 "ui.editor='false'",
+                // The host's commit signing goes through its ssh agent, which a
+                // test has no business waiting on.
+                "--config",
+                "signing.behavior='drop'",
             ]);
         }
         let output = command
@@ -292,6 +296,10 @@ impl TempRepo {
                 // A command that wants an editor fails rather than hanging the test.
                 "--config",
                 "ui.editor='false'",
+                // The host's commit signing goes through its ssh agent, which a
+                // test has no business waiting on.
+                "--config",
+                "signing.behavior='drop'",
             ]);
         }
         let output = command

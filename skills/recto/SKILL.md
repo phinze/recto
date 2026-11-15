@@ -358,8 +358,9 @@ use `recto lens`: the window follows it when it changes, the way it follows
 focus, until he picks a view of his own. Use it when the conversation is about
 one change or one layer of a stack ("look at the second PR"), and send him back
 to the whole stack with a bare `recto lens` when you're done. A spec that names
-nothing in the stack is refused. The terminal Recto moves to a change but has
-no layer view yet.
+nothing in the stack is refused. The terminal Recto follows too: its rev
+panel shows a header row for each layer, a stop of its own that shows the
+layer alone.
 
 The rule for which to write: in a multi-repo rig whose change spans repos,
 write one group tour. In a single-repo rig, or when the story really is one

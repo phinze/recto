@@ -231,6 +231,15 @@ fn status_line(app: &App) -> Paragraph<'static> {
                     format!("rev {} {}", r.short_id, r.summary)
                 }
             }
+            Cursor::Layer(i) => match app.layers().into_iter().find(|l| l.head == i) {
+                Some(l) => format!(
+                    "layer {} · {} rev{}",
+                    l.name,
+                    l.revs,
+                    if l.revs == 1 { "" } else { "s" }
+                ),
+                None => "layer".into(),
+            },
         };
         push_status(
             &mut spans,

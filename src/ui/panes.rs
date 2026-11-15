@@ -136,10 +136,7 @@ pub(crate) fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App
     app.commits_area = area;
     // Marker for the rev the user is *currently viewing*, distinct from the
     // tentative picker selection (rendered via highlight_style).
-    let cursor_idx: usize = match app.cursor {
-        Cursor::All => 0,
-        Cursor::Rev(i) => i + 1,
-    };
+    let layers = app.layers();
     let commits_focused = app.focus == Focus::Commits && matches!(app.mode, Mode::Normal);
     // While picking, the list's own selection follows the pick rather than the
     // view cursor. That's what scrolls the candidate into view, which is the
@@ -150,7 +147,13 @@ pub(crate) fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App
     let mut items: Vec<ListItem> = Vec::with_capacity(app.revs.len() + 1);
     let in_range = app.revs.iter().filter(|r| r.is_in_range).count();
 
-    let all_marker = if cursor_idx == 0 { "▸ " } else { "  " };
+    // What each drawn row stands for, so a click picks what it landed on.
+    let mut rows: Vec<Option<Cursor>> = vec![Some(Cursor::All)];
+    let all_marker = if app.cursor == Cursor::All {
+        "▸ "
+    } else {
+        "  "
+    };
     items.push(ListItem::new(Line::from(vec![
         Span::styled(
             all_marker,
@@ -180,6 +183,7 @@ pub(crate) fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App
     // Display row for each rev, since graph tails put rows between them and
     // the list's selection is a row index, not a rev index.
     let mut rev_rows: Vec<usize> = Vec::with_capacity(app.revs.len());
+    let mut layer_rows: Vec<(usize, usize)> = Vec::new();
 
     for (i, rev) in app.revs.iter().enumerate() {
         // The connector goes *above* the rev the lines meet at, between it and
@@ -190,8 +194,44 @@ pub(crate) fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App
                 Span::styled("  ", Style::default()),
                 Span::styled(join.clone(), Style::default().fg(theme::OVERLAY0)),
             ])));
+            rows.push(None);
+        }
+        // A layer's header sits just above its head: a stop of its own that
+        // shows the layer alone, the way a PR made of it reads.
+        if let Some(layer) = layers.iter().find(|l| l.head == i) {
+            layer_rows.push((i, items.len()));
+            let marker = if app.cursor == Cursor::Layer(i) {
+                "▸ "
+            } else {
+                "  "
+            };
+            items.push(ListItem::new(Line::from(vec![
+                Span::styled(
+                    marker,
+                    Style::default()
+                        .fg(theme::MAUVE)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(rev.graph.clone(), Style::default().fg(theme::OVERLAY0)),
+                Span::styled(
+                    format!("─ {}", layer.name),
+                    Style::default()
+                        .fg(theme::PEACH)
+                        .add_modifier(Modifier::BOLD),
+                ),
+                Span::styled(
+                    format!(
+                        "  {} rev{}",
+                        layer.revs,
+                        if layer.revs == 1 { "" } else { "s" }
+                    ),
+                    Style::default().fg(theme::OVERLAY0),
+                ),
+            ])));
+            rows.push(Some(Cursor::Layer(i)));
         }
         rev_rows.push(items.len());
+        rows.push(Some(Cursor::Rev(i)));
         let is_pick = picking == Some(i);
         // Two distinct glyphs in the leftmost column rather than a trailing
         // "← set base here": the left edge is the one part of a row that
@@ -200,7 +240,7 @@ pub(crate) fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App
         // marker while picking so you don't lose what the diff pane is on.
         let marker = if is_pick {
             "» "
-        } else if cursor_idx == i + 1 {
+        } else if app.cursor == Cursor::Rev(i) {
             "▸ "
         } else {
             "  "
@@ -318,8 +358,10 @@ pub(crate) fn draw_commits(frame: &mut ratatui::Frame, area: Rect, app: &mut App
         None => match app.cursor {
             Cursor::All => Some(0),
             Cursor::Rev(i) => rev_rows.get(i).copied(),
+            Cursor::Layer(i) => layer_rows.iter().find(|(h, _)| *h == i).map(|(_, r)| *r),
         },
     };
+    app.commit_rows = rows;
     app.commits_state.select(selected);
     frame.render_stateful_widget(list, area, &mut app.commits_state);
 }
