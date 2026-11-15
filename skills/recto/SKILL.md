@@ -86,7 +86,9 @@ it here and keep it current:
 
 Each fenced `ask ID` block is a question Paul answers in place. Its `- `
 lines are offered as choices, and he can add words either way. His answer
-comes back like any other comment, anchored to the ask's ID. Keep the
+comes back like any other comment, anchored to the ask's ID. Give every new
+question a new ID: the window remembers answers by ID, so a fresh question
+under an ID he already answered shows up as handled. Keep the
 section order: what needs him first, then what his comments turned into,
 then a short "where we stand". Rewrite the whole briefing rather than
 append to it, whenever you finish something he asked for or reach a
