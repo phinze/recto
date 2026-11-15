@@ -123,8 +123,20 @@ fn spawn_worker_with(load: impl Fn(&DiffRequest) -> Result<LoadedDiff> + Send + 
 }
 
 fn load_diff(backend: &dyn Backend, hl: &Highlighter, req: &DiffRequest) -> Result<LoadedDiff> {
-    let scope = &req.scope;
     let workspace_revision = backend.workspace_revision()?;
+    // A narrowed view names a change, and the change may have been rewritten
+    // since the view was picked, so ask for whichever commit it is now.
+    let resolved;
+    let scope = match &req.scope {
+        Scope::Rev(target) => {
+            let commit = backend
+                .commit_id(target)
+                .ok_or_else(|| anyhow::anyhow!("{target} no longer names a single revision"))?;
+            resolved = Scope::Rev(commit);
+            &resolved
+        }
+        scope => scope,
+    };
     let changes = backend.list_changes(scope, req.ignore_ws)?;
     let diff = backend.unified_diff(scope, req.ignore_ws)?;
     let revs = match scope {
@@ -745,7 +757,7 @@ impl App {
     fn scope(&self) -> Scope {
         match self.cursor {
             Cursor::All => Scope::Range(self.base().clone()),
-            Cursor::Rev(i) => Scope::Rev(self.revs[i].id.clone()),
+            Cursor::Rev(i) => Scope::Rev(self.revs[i].target().to_string()),
         }
     }
 
@@ -755,7 +767,7 @@ impl App {
     /// else defers to the backend's own name for it.
     pub(crate) fn base_text(&self, base: &Base) -> String {
         if let Base::Revision(r) = base
-            && let Some(rev) = self.revs.iter().find(|rev| &rev.id == r)
+            && let Some(rev) = self.revs.iter().find(|rev| rev.target() == r)
         {
             return rev.short_id.clone();
         }
@@ -779,7 +791,7 @@ impl App {
                 let short = self
                     .revs
                     .iter()
-                    .find(|r| &r.id == id)
+                    .find(|r| r.target() == id)
                     .map(|r| r.short_id.clone())
                     .unwrap_or_else(|| id.chars().take(8).collect());
                 format!("rev: {short}")
@@ -835,7 +847,7 @@ impl App {
         if rev.is_base {
             return;
         }
-        self.select_base(Base::Revision(rev.id.clone()));
+        self.select_base(Base::Revision(rev.target().to_string()));
     }
 
     fn select_base(&mut self, base: Base) {
@@ -1013,7 +1025,7 @@ impl App {
             Scope::Rev(id) => self
                 .revs
                 .iter()
-                .position(|rev| &rev.id == id)
+                .position(|rev| rev.target() == id)
                 .map(Cursor::Rev)
                 .unwrap_or(Cursor::All),
         };

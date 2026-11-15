@@ -881,7 +881,9 @@ fn render_workspace(
         .base_commit(&base)
         .and_then(|from| backend.commits(&from, backend.head_rev()).ok())
         .unwrap_or_default();
-    let narrowed = view.and_then(|v| commits.iter().find(|c| c.id == v));
+    // A view names a change, so it follows the change through a rewrite. A
+    // commit id still matches, for views picked before views were changes.
+    let narrowed = view.and_then(|v| commits.iter().find(|c| c.target() == v || c.id == v));
     let shown = match narrowed {
         Some(c) => parse_diff(
             &backend
@@ -1004,7 +1006,7 @@ fn render_workspace(
         let _ = write!(
             out,
             "<div class=narrowed>Showing <code>{}</code> {} alone. <button type=button data-view=\"{index}:\">show all changes</button></div>",
-            esc(&c.change),
+            esc(c.short_change()),
             esc(&c.summary)
         );
         if shown.is_empty() {
@@ -1134,14 +1136,14 @@ fn render_revisions(
         let _ = write!(
             out,
             "<li><button type=button data-view=\"{index}:{}\"{}{}><span class=rev-id>{}</span><span class=rev-sum>{}</span>{}<span class=rev-when>{}</span>{}</button></li>",
-            esc(&c.id),
+            esc(c.target()),
             if narrowed == Some(c.id.as_str()) {
                 " class=active"
             } else {
                 ""
             },
             if c.mine { "" } else { " data-foreign" },
-            esc(&c.change),
+            esc(c.short_change()),
             match (c.summary.is_empty(), head == Some(c.id.as_str())) {
                 (true, true) => "<i>working copy</i>".into(),
                 (true, false) => "<i>no description</i>".into(),

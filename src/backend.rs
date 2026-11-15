@@ -40,20 +40,26 @@ impl Base {
 
 /// What slice of history we're looking at. `Range` is the default "PR view"
 /// (everything between a base and `@`); `Rev` narrows to a single revision's
-/// own diff against its parent.
+/// own diff against its parent. `Rev` holds a [`Rev::target`], usually a jj
+/// change id, which loading resolves to the change's current commit so the
+/// view follows the change through rewrites.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Scope {
     Range(Base),
     Rev(String),
 }
 
-/// A revision in the current range. `id` is the immutable handle we pass back
-/// to the backend (jj commit id, git sha); `short_id` is the truncated display.
-/// A jj change id can name multiple divergent commits, so it is display data,
-/// not a safe revision target.
+/// A revision in the current range. `id` is the commit (jj commit id, git
+/// sha), which a rewrite replaces; `change` is the identity that survives one
+/// (jj's change id, or the sha again for git). `short_id` is the truncated
+/// change for display.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Rev {
     pub id: String,
+    pub change: String,
+    /// Another visible commit shares this change id, so the id alone can't
+    /// name this one.
+    pub divergent: bool,
     pub short_id: String,
     pub summary: String,
     pub is_base: bool,
@@ -178,12 +184,26 @@ pub trait Backend: Send + Sync {
     }
 }
 
+impl Rev {
+    /// How to name this revision so the name outlives a rewrite: its change,
+    /// unless that change is divergent and only the commit is unambiguous.
+    pub fn target(&self) -> &str {
+        if self.divergent {
+            &self.id
+        } else {
+            &self.change
+        }
+    }
+}
+
 /// One commit in a range, as a revision list shows it.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
     pub id: String,
-    /// jj's short change id, or git's short sha.
+    /// jj's change id, or git's sha.
     pub change: String,
+    /// Another visible commit shares this change id.
+    pub divergent: bool,
     pub summary: String,
     /// Already on trunk.
     pub landed: bool,
@@ -196,16 +216,34 @@ pub struct Commit {
     pub when: String,
 }
 
-/// Rows of `id, change, empty, landed, email, added, removed, when, summary`
+impl Commit {
+    /// The change, short enough to read at a glance.
+    pub fn short_change(&self) -> &str {
+        self.change.get(..8).unwrap_or(&self.change)
+    }
+
+    /// How to name this commit so the name outlives a rewrite, as
+    /// [`Rev::target`] does.
+    pub fn target(&self) -> &str {
+        if self.divergent {
+            &self.id
+        } else {
+            &self.change
+        }
+    }
+}
+
+/// Rows of `id, change, divergent, empty, landed, email, added, removed, when, summary`
 /// separated by 0x1f. A working copy with nothing in it and no description is
 /// where the next change will go, not a commit worth listing.
 fn parse_commits(out: &str, me: &str) -> Vec<Commit> {
     out.lines()
         .filter_map(|line| {
-            let f: Vec<&str> = line.splitn(9, '\x1f').collect();
+            let f: Vec<&str> = line.splitn(10, '\x1f').collect();
             let [
                 id,
                 change,
+                divergent,
                 empty,
                 landed,
                 email,
@@ -224,6 +262,7 @@ fn parse_commits(out: &str, me: &str) -> Vec<Commit> {
             Some(Commit {
                 id: id.to_string(),
                 change: change.to_string(),
+                divergent: divergent == "d",
                 summary: summary.to_string(),
                 landed: landed == "l",
                 mine: !me.is_empty() && email.trim().eq_ignore_ascii_case(me),
@@ -561,7 +600,7 @@ impl Backend for JjBackend {
         // is drawn from those in `crate::graph`, which is why this asks for
         // data rather than glyphs.
         let revset = format!("::@ | ::{base_revset} | ::trunk()");
-        let template = r#"commit_id ++ "\t" ++ change_id.short(8) ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(" ") ++ "\n""#;
+        let template = r#"commit_id ++ "\t" ++ change_id ++ "\t" ++ if(divergent, "d") ++ "\t" ++ description.first_line() ++ "\t" ++ current_working_copy ++ "\t" ++ bookmarks.join(",") ++ "\t" ++ parents.map(|p| p.commit_id()).join(" ") ++ "\n""#;
         let out = self.run(&[
             "log",
             "-r",
@@ -645,7 +684,7 @@ impl Backend for JjBackend {
             &format!("({from})..({to})"),
             "--no-graph",
             "-T",
-            "commit_id ++ \"\\x1f\" ++ change_id.short(8) ++ \"\\x1f\" ++ if(empty, \"e\") ++ \"\\x1f\" ++ if(self.contained_in(\"::trunk()\"), \"l\") ++ \"\\x1f\" ++ author.email() ++ \"\\x1f\" ++ self.diff().stat().total_added() ++ \"\\x1f\" ++ self.diff().stat().total_removed() ++ \"\\x1f\" ++ committer.timestamp().ago() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"",
+            "commit_id ++ \"\\x1f\" ++ change_id ++ \"\\x1f\" ++ if(divergent, \"d\") ++ \"\\x1f\" ++ if(empty, \"e\") ++ \"\\x1f\" ++ if(self.contained_in(\"::trunk()\"), \"l\") ++ \"\\x1f\" ++ author.email() ++ \"\\x1f\" ++ self.diff().stat().total_added() ++ \"\\x1f\" ++ self.diff().stat().total_removed() ++ \"\\x1f\" ++ committer.timestamp().ago() ++ \"\\x1f\" ++ description.first_line() ++ \"\\n\"",
         ])?;
         Ok(parse_commits(&out, &me))
     }
@@ -964,7 +1003,7 @@ impl Backend for GitBackend {
         for record in out.split('\x1e').filter(|r| !r.trim().is_empty()) {
             let (head, stats) = record.split_once('\n').unwrap_or((record, ""));
             let f: Vec<&str> = head.splitn(5, '\x1f').collect();
-            let [id, short, email, when, summary] = f[..] else {
+            let [id, _short, email, when, summary] = f[..] else {
                 continue;
             };
             let (mut added, mut removed, mut files) = (0u32, 0u32, 0);
@@ -976,7 +1015,8 @@ impl Backend for GitBackend {
             }
             let fields = [
                 id,
-                short,
+                id,
+                "",
                 if files == 0 { "e" } else { "" },
                 if unlanded.contains(id) { "" } else { "l" },
                 email,
@@ -994,9 +1034,11 @@ impl Backend for GitBackend {
 }
 
 fn parse_jj_rev_line(line: &str) -> Option<Rev> {
-    let mut fields = line.splitn(6, '\t');
+    let mut fields = line.splitn(7, '\t');
     let id = fields.next()?.trim().to_string();
-    let short_id = fields.next()?.trim().to_string();
+    let change = fields.next()?.trim().to_string();
+    let divergent = fields.next().is_some_and(|s| s.trim() == "d");
+    let short_id = change.get(..8).unwrap_or(&change).to_string();
     let summary = fields.next().unwrap_or("").trim().to_string();
     let is_wc = fields.next().is_some_and(|s| s.trim() == "true");
     let refs = parse_refs(fields.next().unwrap_or(""), ',');
@@ -1016,6 +1058,8 @@ fn parse_jj_rev_line(line: &str) -> Option<Rev> {
     };
     Some(Rev {
         id,
+        change,
+        divergent,
         short_id,
         summary,
         is_base: false,
@@ -1106,7 +1150,9 @@ fn parse_git_rev_line(line: &str) -> Option<Rev> {
         return None;
     }
     Some(Rev {
+        change: id.clone(),
         id,
+        divergent: false,
         short_id,
         summary,
         is_base: false,
@@ -1296,10 +1342,59 @@ mod tests {
             .find(|rev| rev.summary == "rewritten layer")
             .expect("find rewritten layer");
 
+        let target = backend
+            .commit_id(rev.target())
+            .expect("a divergent row still names one commit");
+        assert_eq!(target, rev.id);
         let changes = backend
-            .list_changes(&Scope::Rev(rev.id), false)
+            .list_changes(&Scope::Rev(target), false)
             .expect("select one revision despite its divergent change id");
         assert!(changes.iter().any(|change| change.path == "layer.txt"));
+    }
+
+    #[test]
+    fn jj_a_revision_is_named_by_a_change_that_outlives_a_rewrite() {
+        let repo = TempRepo::new("jj-change-target");
+        repo.run("jj", &["git", "init", "--colocate", "."]);
+        std::fs::write(repo.0.join("a.txt"), "first\n").unwrap();
+        repo.run("jj", &["describe", "-m", "first"]);
+        repo.run("jj", &["new"]);
+        std::fs::write(repo.0.join("b.txt"), "second\n").unwrap();
+        repo.run("jj", &["describe", "-m", "second"]);
+
+        let backend = JjBackend::new(repo.0.clone());
+        let base = Base::Revision("root()".into());
+        let first = backend
+            .list_revs(&base)
+            .expect("load revision rows")
+            .into_iter()
+            .find(|rev| rev.summary == "first")
+            .expect("find first");
+        assert!(!first.divergent);
+        assert_eq!(first.target(), first.change);
+        assert_eq!(first.change.len(), 32, "the full change id, not a prefix");
+        assert_eq!(first.short_id, first.change[..8]);
+
+        repo.run(
+            "jj",
+            &["describe", "-r", &first.change, "-m", "first, reworded"],
+        );
+        let now = backend
+            .commit_id(first.target())
+            .expect("the change still resolves after its rewrite");
+        assert_ne!(now, first.id, "the rewrite made a new commit");
+        let changes = backend
+            .list_changes(&Scope::Rev(now), false)
+            .expect("load the rewritten change");
+        assert!(changes.iter().any(|change| change.path == "a.txt"));
+
+        let commits = backend.commits("root()", "@").expect("list commits");
+        let reworded = commits
+            .iter()
+            .find(|c| c.summary == "first, reworded")
+            .expect("find the reworded commit");
+        assert_eq!(reworded.target(), first.change);
+        assert_eq!(reworded.short_change(), first.short_id);
     }
 
     #[test]
