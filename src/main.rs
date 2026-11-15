@@ -1,3 +1,4 @@
+mod anchor;
 mod app;
 mod assets;
 mod backend;

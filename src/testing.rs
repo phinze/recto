@@ -5,7 +5,8 @@
 //! test lived there too. A test belongs beside the code it covers, so the
 //! fixtures had to come out where every module can reach them.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::sync::Mutex;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -221,5 +222,84 @@ pub(crate) fn conversation_comment() -> link::ConversationComment {
         body: "A conversation comment.".into(),
         created_at: "2026-08-14T12:00:00Z".into(),
         url: "https://github.com/owner/repo/pull/42#issuecomment-1".into(),
+    }
+}
+
+/// A throwaway repository under the temp dir, removed on drop.
+pub(crate) struct TempRepo(pub(crate) PathBuf);
+
+impl TempRepo {
+    pub(crate) fn new(name: &str) -> Self {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let root = std::env::temp_dir().join(format!(
+            "recto-backend-{name}-{}-{nonce}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&root).expect("create temp repository");
+        Self(root)
+    }
+
+    pub(crate) fn run(&self, program: &str, args: &[&str]) {
+        let mut command = Command::new(program);
+        if program == "jj" {
+            command.args([
+                "--config",
+                "user.name='Recto Test'",
+                "--config",
+                "user.email='recto@example.invalid'",
+                // A command that wants an editor fails rather than hanging the test.
+                "--config",
+                "ui.editor='false'",
+            ]);
+        }
+        let output = command
+            .args(args)
+            .current_dir(&self.0)
+            .output()
+            .expect("run repository command");
+        assert!(
+            output.status.success(),
+            "{program} {} failed: {}",
+            args.join(" "),
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+}
+
+impl TempRepo {
+    /// A command's trimmed stdout, for reading ids back out of the repo.
+    pub(crate) fn out(&self, program: &str, args: &[&str]) -> String {
+        let mut command = Command::new(program);
+        if program == "jj" {
+            command.args([
+                "--config",
+                "user.name='Recto Test'",
+                "--config",
+                "user.email='recto@example.invalid'",
+                // A command that wants an editor fails rather than hanging the test.
+                "--config",
+                "ui.editor='false'",
+            ]);
+        }
+        let output = command
+            .args(args)
+            .current_dir(&self.0)
+            .output()
+            .expect("run repository command");
+        assert!(
+            output.status.success(),
+            "{program} {} failed",
+            args.join(" ")
+        );
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+}
+
+impl Drop for TempRepo {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
     }
 }

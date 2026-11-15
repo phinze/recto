@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -181,6 +182,22 @@ pub trait Backend: Send + Sync {
     /// The commits in `from..to`, newest first, each with its diffstat.
     fn commits(&self, _from: &str, _to: &str) -> Result<Vec<Commit>> {
         Ok(Vec::new())
+    }
+    /// The change that last touched each line of `path` at `rev`, one entry
+    /// per line. `None` where the backend can't say, which leaves anchors
+    /// reading their lines against the current view.
+    fn annotate(&self, _rev: &str, _path: &str) -> Option<Vec<String>> {
+        None
+    }
+    /// The current commit of each change that still names exactly one.
+    /// Changes that are gone or divergent are simply absent.
+    fn change_commits(&self, _changes: &[String]) -> HashMap<String, String> {
+        HashMap::new()
+    }
+    /// The newest of several changes on one line of history: the one the
+    /// others are ancestors of. `None` when no single one is.
+    fn newest_change(&self, _changes: &[String]) -> Option<String> {
+        None
     }
 }
 
@@ -655,6 +672,74 @@ impl Backend for JjBackend {
 
     fn commit_id(&self, rev: &str) -> Option<String> {
         Some(self.resolve_commit_id(rev)).filter(|id| !id.is_empty())
+    }
+
+    fn annotate(&self, rev: &str, path: &str) -> Option<Vec<String>> {
+        let out = self
+            .run(&[
+                "file",
+                "annotate",
+                "-r",
+                rev,
+                "-T",
+                "commit.change_id() ++ \"\\n\"",
+                path,
+            ])
+            .ok()?;
+        Some(out.lines().map(str::to_string).collect())
+    }
+
+    fn change_commits(&self, changes: &[String]) -> HashMap<String, String> {
+        let revset = changes
+            .iter()
+            .filter(|c| !c.is_empty() && c.chars().all(|ch| ch.is_ascii_alphanumeric()))
+            .map(|c| format!("present(change_id({c}))"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        if revset.is_empty() {
+            return HashMap::new();
+        }
+        let Ok(out) = self.run(&[
+            "log",
+            "-r",
+            &revset,
+            "--no-graph",
+            "-T",
+            "change_id ++ \" \" ++ commit_id ++ \" \" ++ if(divergent, \"d\") ++ \"\\n\"",
+        ]) else {
+            return HashMap::new();
+        };
+        out.lines()
+            .filter_map(|line| {
+                let mut f = line.split(' ');
+                let (change, commit) = (f.next()?, f.next()?);
+                (f.next() != Some("d")).then(|| (change.to_string(), commit.to_string()))
+            })
+            .collect()
+    }
+
+    fn newest_change(&self, changes: &[String]) -> Option<String> {
+        let revset = changes
+            .iter()
+            .filter(|c| c.chars().all(|ch| ch.is_ascii_alphanumeric()))
+            .map(|c| format!("present(change_id({c}))"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let out = self
+            .run(&[
+                "log",
+                "-r",
+                &format!("heads({revset})"),
+                "--no-graph",
+                "-T",
+                "change_id ++ \"\\n\"",
+            ])
+            .ok()?;
+        let heads: Vec<&str> = out.lines().filter(|l| !l.is_empty()).collect();
+        match heads.as_slice() {
+            [one] => Some(one.to_string()),
+            _ => None,
+        }
     }
 
     fn base_commit(&self, base: &Base) -> Option<String> {
@@ -1211,51 +1296,7 @@ fn parse_git_name_status(line: &str) -> Option<FileChange> {
 mod tests {
     use super::*;
 
-    struct TempRepo(PathBuf);
-
-    impl TempRepo {
-        fn new(name: &str) -> Self {
-            let nonce = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .map(|d| d.as_nanos())
-                .unwrap_or(0);
-            let root = std::env::temp_dir().join(format!(
-                "recto-backend-{name}-{}-{nonce}",
-                std::process::id()
-            ));
-            std::fs::create_dir_all(&root).expect("create temp repository");
-            Self(root)
-        }
-
-        fn run(&self, program: &str, args: &[&str]) {
-            let mut command = Command::new(program);
-            if program == "jj" {
-                command.args([
-                    "--config",
-                    "user.name='Recto Test'",
-                    "--config",
-                    "user.email='recto@example.invalid'",
-                ]);
-            }
-            let output = command
-                .args(args)
-                .current_dir(&self.0)
-                .output()
-                .expect("run repository command");
-            assert!(
-                output.status.success(),
-                "{program} {} failed: {}",
-                args.join(" "),
-                String::from_utf8_lossy(&output.stderr)
-            );
-        }
-    }
-
-    impl Drop for TempRepo {
-        fn drop(&mut self) {
-            let _ = std::fs::remove_dir_all(&self.0);
-        }
-    }
+    use crate::testing::TempRepo;
 
     #[test]
     fn refs_drop_head_and_its_arrow_form() {
