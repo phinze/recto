@@ -76,7 +76,7 @@ article:is(.tour, .doc) { margin: 14px 0 20px; padding: 6px 18px 14px; border-le
 /* Prose keeps a reading measure; quoted code takes the full width, where
    long lines wrap less. */
 article:is(.tour, .doc) > * { max-width: 70ch; }
-article:is(.tour, .doc) > figure.quote, article:is(.tour, .doc) > pre, article:is(.tour, .doc) > table { max-width: none; }
+article:is(.tour, .doc) > figure.quote, article:is(.tour, .doc) > figure.diagram, article:is(.tour, .doc) > pre, article:is(.tour, .doc) > table { max-width: none; }
 .tour-label { font: 600 11px var(--mono); letter-spacing: 0.08em; text-transform: uppercase; color: var(--mauve); margin-top: 8px; }
 article:is(.tour, .doc) h1, article:is(.tour, .doc) h2 { font-size: 17px; margin: 22px 0 6px; color: var(--text); scroll-margin-top: 48px; }
 article:is(.tour, .doc) h3 { font-size: 15px; margin: 16px 0 4px; }
@@ -217,3 +217,15 @@ tr.draft td { padding: 4px 10px 8px 10px; background: var(--base); }
 .draft-lost .draft-card { margin: 6px 0; }
 .review-body > :last-child, .draft-body > :last-child { margin-bottom: 0; }
 .peer h3 .peer-send { margin-left: 10px; font: 12px var(--sans); vertical-align: middle; }
+
+figure.diagram { margin: 12px 0; max-width: none; }
+figure.diagram {
+  --pele-bg: var(--base); --pele-fg: var(--text); --pele-muted: var(--subtext);
+  --pele-line: var(--subtext); --pele-surface: var(--surface0); --pele-surface-alt: var(--mantle);
+  --pele-border: var(--surface1); --pele-accent: var(--mauve); --pele-font: var(--sans);
+  --pele-series-1: var(--mauve); --pele-series-2: var(--blue); --pele-series-3: var(--green);
+  --pele-series-4: var(--peach); --pele-series-5: var(--teal); --pele-series-6: var(--yellow);
+  --pele-series-7: var(--red); --pele-series-8: var(--overlay0);
+}
+figure.diagram.drawn:not(.failed) pre.diagram-src { display: none; }
+figure.diagram p.diagram-error { color: var(--red); font: 12px var(--mono); white-space: pre-wrap; max-width: none; }

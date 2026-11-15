@@ -226,6 +226,14 @@ fn handle(mut stream: UnixStream) {
         }
         "/events" => events(stream, &req),
         "/healthz" => respond(&mut stream, "200 OK", "text/plain", b"ok\n"),
+        PELE_PATH => {
+            let head = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/javascript; charset=utf-8\r\nContent-Length: {}\r\nCache-Control: private, max-age=31536000, immutable\r\nConnection: close\r\n\r\n",
+                PELE.len()
+            );
+            let _ = stream.write_all(head.as_bytes());
+            let _ = stream.write_all(PELE.as_bytes());
+        }
         path if path.starts_with("/asset/") => asset(&mut stream, &path["/asset/".len()..]),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found\n"),
     }
@@ -1728,6 +1736,7 @@ fn render_doc(
     // Whether each open image is a stored one, so its end closes the right
     // element; alt text can itself hold an image.
     let mut images: Vec<bool> = Vec::new();
+    let mut diagram: Option<String> = None;
     for event in parser {
         if let Some((_, text)) = asking.as_mut() {
             match event {
@@ -1749,10 +1758,35 @@ fn render_doc(
             }
             continue;
         }
+        if let Some(text) = diagram.as_mut() {
+            match event {
+                Event::End(TagEnd::CodeBlock) => {
+                    let text = diagram.take().unwrap_or_default();
+                    events.push(Event::Html(
+                        format!(
+                            "<figure class=diagram><pre class=diagram-src>{}</pre></figure>",
+                            esc(&text)
+                        )
+                        .into(),
+                    ));
+                }
+                Event::Text(t) => text.push_str(&t),
+                _ => {}
+            }
+            continue;
+        }
         match event {
             Event::Start(Tag::CodeBlock(ref kind)) => {
                 if let Some(spec) = markdown::quote_spec(kind) {
                     quoting = Some(spec);
+                    continue;
+                }
+                // A mermaid fence goes to the page as its source, which the
+                // vendored Pele draws in place; without script it stays code.
+                if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind
+                    && info.split_whitespace().next() == Some("mermaid")
+                {
+                    diagram = Some(String::new());
                     continue;
                 }
                 if let pulldown_cmark::CodeBlockKind::Fenced(info) = kind
@@ -2117,6 +2151,11 @@ const DIFF_TABLE: &str = "<table class=diff><colgroup><col class=ln><col class=l
 
 const CSS: &str = include_str!("serve/page.css");
 const JS: &str = include_str!("serve/page.js");
+/// Pele draws mermaid fences in the page. It's vendored from npm (pele 1.13.0,
+/// MIT, `serve/vendor/pele.LICENSE`) and served from here, so a diagram never
+/// fetches anything; the version is in the path so the browser can keep it.
+const PELE: &str = include_str!("serve/vendor/pele.js");
+const PELE_PATH: &str = "/pele-1.13.0.js";
 
 #[cfg(test)]
 mod tests {
@@ -2321,6 +2360,24 @@ mod tests {
         assert!(out.contains("href=\"#t0-1\""), "{out}");
         assert!(!out.contains("<img"), "{out}");
         assert!(out.contains("image: pic"), "{out}");
+    }
+
+    #[test]
+    fn mermaid_fences_go_to_the_page_as_escaped_source() {
+        let mut out = String::new();
+        render_tour(
+            "t0",
+            "Tour",
+            "```mermaid\nflowchart LR\n  A[<b>x</b>] --> B\n```\n\n```mermaidish\nplain\n```\n",
+            &mut 0,
+            &mut out,
+            &mut |_, _, _| {},
+        );
+        assert!(
+            out.contains("<figure class=diagram><pre class=diagram-src>flowchart LR\n  A[&lt;b&gt;x&lt;/b&gt;] --&gt; B\n</pre></figure>"),
+            "{out}"
+        );
+        assert_eq!(out.matches("class=diagram>").count(), 1, "{out}");
     }
 
     #[test]

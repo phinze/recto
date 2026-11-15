@@ -121,6 +121,20 @@ Remote image URLs stay links, because opening the page never fetches
 anything off the machine. Raw `<svg>` in the Markdown shows as text, so
 write the SVG to a file and reference it.
 
+For a diagram, a fenced `mermaid` block usually beats drawing SVG by hand.
+The window draws it with Pele, a Mermaid renderer bundled into recto, so it
+needs no network:
+
+    ```mermaid
+    flowchart LR
+      A["agent writes ![alt](path)"] --> B[recto brief]
+    ```
+
+Any Mermaid diagram type works. Quote a label that holds brackets or
+parentheses, as above. A diagram that doesn't parse shows its source and the
+parse error in red, so look at the window after writing one. The terminal
+Recto shows the fence as code.
+
 ### Comments from the window
 
 Paul can select anything in the window (diff lines, a tour passage, part of

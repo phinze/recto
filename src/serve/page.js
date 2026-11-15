@@ -156,6 +156,43 @@
     }
   }
 
+  // Mermaid fences arrive as source; Pele, served by recto, draws them.
+  // It loads the first time a diagram appears and draws synchronously after
+  // that, so a refresh restores its scroll against the drawn height.
+  let pele = null;
+  function drawDiagrams() {
+    const pending = content.querySelectorAll('figure.diagram:not(.drawn)');
+    if (!pending.length) return;
+    if (!window.pele) {
+      if (!pele) {
+        pele = document.createElement('script');
+        pele.src = 'pele-1.13.0.js';
+        pele.onload = drawDiagrams;
+        document.head.appendChild(pele);
+      }
+      return;
+    }
+    for (const fig of pending) {
+      const src = fig.querySelector('pre.diagram-src');
+      const out = document.createElement('div');
+      out.className = 'diagram-out';
+      fig.appendChild(out);
+      fig.classList.add('drawn');
+      window.pele.mount(out, src.textContent, {
+        links: false,
+        images: false,
+        onRender: () => fig.classList.remove('failed'),
+        onError: (err) => {
+          fig.classList.add('failed');
+          const note = document.createElement('p');
+          note.className = 'diagram-error';
+          note.textContent = String(err && err.message || err);
+          out.replaceChildren(note);
+        },
+      });
+    }
+  }
+
   // Refreshes can overlap; only the newest one gets to replace the page.
   let generation = 0;
   async function refresh() {
@@ -171,6 +208,7 @@
       const d = document.getElementById(id);
       if (d) d.open = open;
     }
+    drawDiagrams();
     applyTab();
     syncExpandButtons();
     const moved = syncMarkers(false);
@@ -242,6 +280,7 @@
   });
   content.addEventListener('toggle', syncExpandButtons, true);
 
+  drawDiagrams();
   applyTab();
   syncExpandButtons();
   syncMarkers(true);
