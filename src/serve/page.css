@@ -56,7 +56,12 @@ details.revs li button { all: unset; box-sizing: border-box; cursor: pointer; wi
   padding: 3px 10px; border-left: 2px solid transparent; margin-left: -2px; color: var(--text); }
 details.revs li button:hover { background: var(--surface0); }
 details.revs li button.active { border-left-color: var(--mauve); background: var(--mantle); }
-details.revs li button.pending { opacity: 0.6; }
+details.revs li button.pending, .lensbar button.pending { opacity: 0.6; animation: pending 0.9s ease-in-out infinite alternate; }
+@keyframes pending { from { background: var(--surface0); } to { background: var(--surface1); } }
+/* A repo whose view is on its way: the bar says so and the rest dims, so a
+   tap visibly took even when the new view is a moment off. */
+section.repo.loading > :not(.lensbar):not(details.revs):not(.repo-head) { opacity: 0.4; transition: opacity 0.12s; pointer-events: none; }
+section.repo.loading .lensbar .crumbs::after { content: " · loading…"; color: var(--peach); }
 details.revs li button[data-foreign] { color: var(--overlay0); }
 details.revs li:first-child .rev-sum { color: var(--subtext); font-style: italic; }
 .rev-id { color: var(--blue); min-width: 8ch; }

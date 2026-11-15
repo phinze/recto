@@ -313,6 +313,67 @@
 
   // Refreshes can overlap; only the newest one gets to replace the page.
   let generation = 0;
+
+  function withParam(url, param) {
+    return url + (url.includes('?') ? '&' : '?') + param;
+  }
+
+  // One repo's view moved: fetch just its section, dimmed and marked as
+  // loading meanwhile, rather than the whole page. A step taken from the
+  // sticky bar deep in a diff lands at the top of the new one.
+  async function repoRefresh(ri, fromStep) {
+    const section = document.getElementById('repo-' + ri);
+    if (!section) return refresh();
+    section.classList.add('loading');
+    const mine = ++generation;
+    let html;
+    try {
+      const res = await fetch(withParam(fragmentURL(), 'only=' + ri), { cache: 'no-store' });
+      if (!res.ok) throw new Error(res.statusText);
+      html = await res.text();
+    } catch {
+      section.classList.remove('loading');
+      for (const b of section.querySelectorAll('button.pending')) b.classList.remove('pending');
+      return;
+    }
+    if (mine !== generation) return;
+    const holder = document.createElement('div');
+    holder.innerHTML = html;
+    const fresh = holder.querySelector('section.repo');
+    if (!fresh) return refresh();
+    const inside = section.getBoundingClientRect().top < 0;
+    if (section.classList.contains('active')) fresh.classList.add('active');
+    section.replaceWith(fresh);
+    for (const [id, open] of toggled) {
+      const d = document.getElementById(id);
+      if (d && fresh.contains(d)) d.open = open;
+    }
+    drawDiagrams();
+    applyTab();
+    syncExpandButtons();
+    syncMarkers(false);
+    decorate();
+    if (fromStep && inside) {
+      const bar = fresh.querySelector('.lensbar');
+      const nav = content.querySelector('nav.tabs');
+      if (bar) window.scrollTo(0, bar.getBoundingClientRect().top + window.scrollY - (nav ? nav.offsetHeight : 0) - 4);
+    }
+    prefetchNeighbours(fresh, ri);
+  }
+
+  // Warm the server's cache for the changes either side of the view, so a
+  // step through the stack lands without the wait.
+  function prefetchNeighbours(section, ri) {
+    for (const b of section.querySelectorAll('.lensbar .step[data-view]')) {
+      const [i, ...rest] = b.dataset.view.split(':');
+      let url = 'fragment' + qs;
+      for (const [k, spec] of views) {
+        if (k !== i) url = withParam(url, 'view=' + encodeURIComponent(k + ':' + spec));
+      }
+      url = withParam(url, 'view=' + encodeURIComponent(i + ':' + rest.join(':')));
+      fetch(withParam(url, 'only=' + ri), { cache: 'no-store', priority: 'low' }).catch(() => {});
+    }
+  }
   async function refresh() {
     if (typing()) { held = true; return; }
     const mine = ++generation;
@@ -389,7 +450,7 @@
       views.set(ri, rest.join(':'));
       saveViews();
       pick.classList.add('pending');
-      refresh();
+      repoRefresh(ri, pick.classList.contains('step'));
       return;
     }
     const all = e.target.closest('.expand-all');
@@ -420,6 +481,9 @@
   syncExpandButtons();
   syncMarkers(true);
   syncLenses(true);
+  for (const sec of content.querySelectorAll('section.repo')) {
+    if (sec.querySelector('.lensbar')) prefetchNeighbours(sec, sec.id.slice(5));
+  }
   if (views.size) refresh();
 
   // EventSource retries a dropped connection by itself, but gives up for good

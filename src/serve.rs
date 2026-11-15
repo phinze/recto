@@ -113,6 +113,9 @@ struct Request {
     /// A narrowed view per root index: one commit's own diff in place of the
     /// whole range.
     views: Vec<(usize, String)>,
+    /// Render only this root's section: what a page asks for when the reader
+    /// moves one repo's view, so the rest of the page isn't rendered again.
+    only: Option<usize>,
     /// Other groups whose open asks this page gathers, for a coordinator
     /// that organizes the person's attention across them.
     peers: Vec<Peer>,
@@ -149,6 +152,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
     let mut group = None;
     let mut starts = Vec::new();
     let mut views = Vec::new();
+    let mut only = None;
     let mut peers = Vec::new();
     for pair in query.split('&').filter(|p| !p.is_empty()) {
         let (k, v) = pair.split_once('=').unwrap_or((pair, ""));
@@ -161,6 +165,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
                     starts.push((root.to_string(), commit.to_string()));
                 }
             }
+            "only" => only = percent_decode(v).parse().ok(),
             "view" => {
                 if let Some((i, spec)) = percent_decode(v).split_once(':')
                     && let Ok(i) = i.parse()
@@ -191,6 +196,7 @@ fn read_request(stream: &UnixStream) -> Option<Request> {
         label,
         starts,
         views,
+        only,
         peers,
     })
 }
@@ -422,6 +428,25 @@ fn fragment(req: &Request) -> String {
     // One highlight budget per response, split between the repos and the
     // group tour, so a rig with many repos is no slower than one big diff.
     let share = HIGHLIGHT_BUDGET / (roots.len() + usize::from(req.group.is_some()));
+    // One repo's section alone, for a page moving that repo's view. Its
+    // budget matches the full page's, so the two render alike and share the
+    // section cache.
+    if let Some(i) = req.only {
+        let Some(root) = roots.get(i) else {
+            return String::new();
+        };
+        let start = req
+            .starts
+            .iter()
+            .find(|(r, _)| r == root)
+            .map(|(_, c)| c.as_str());
+        let view = req
+            .views
+            .iter()
+            .find(|(v, _)| *v == i)
+            .map(|(_, spec)| spec.as_str());
+        return workspace(i, root, start, view, share).0;
+    }
     let rendered: Vec<(String, Summary)> = thread::scope(|s| {
         let handles: Vec<_> = roots
             .iter()
@@ -819,7 +844,7 @@ fn repo_name(root: &Path) -> String {
 }
 
 /// What a tab needs to know about a workspace without reading its page.
-#[derive(Default)]
+#[derive(Clone, Default)]
 struct Summary {
     /// The repo's canonical root and parsed diff, so a group tour can quote
     /// across every repo on the page without diffing any of them twice.
@@ -832,7 +857,80 @@ struct Summary {
     error: bool,
 }
 
+/// Rendered sections, keyed by everything a section depends on: the repo's
+/// latest jj operation (which a working-copy edit advances, since asking
+/// for it snapshots), its saved state, and the request's own view, start and
+/// budget. Moving back and forth through a stack, or refreshing a page where
+/// only one repo changed, then costs one jj call per unchanged section.
+static SECTIONS: std::sync::Mutex<Option<HashMap<String, (String, Summary)>>> =
+    std::sync::Mutex::new(None);
+const SECTIONS_KEPT: usize = 64;
+
+/// The cache key for a section, or `None` where freshness can't be told
+/// cheaply (a git repository) and the section is always rendered.
+fn section_key(
+    index: usize,
+    root: &str,
+    start: Option<&str>,
+    view: Option<&str>,
+    budget: usize,
+) -> Option<String> {
+    let root = canonical_repo(Path::new(root))?;
+    if !root.join(".jj").is_dir() {
+        return None;
+    }
+    let out = std::process::Command::new("jj")
+        .args(["op", "log", "--limit", "1", "--no-graph", "-T", "self.id()"])
+        .current_dir(&root)
+        .output()
+        .ok()
+        .filter(|o| o.status.success())?;
+    let op = String::from_utf8(out.stdout).ok()?;
+    let state = state::state_path(&root)
+        .ok()
+        .and_then(|p| std::fs::metadata(p).ok())
+        .map(|m| format!("{:?}:{}", m.modified().ok(), m.len()))
+        .unwrap_or_default();
+    Some(format!(
+        "{index}\x1f{}\x1f{}\x1f{}\x1f{budget}\x1f{}\x1f{state}",
+        root.display(),
+        start.unwrap_or(""),
+        view.map_or("\x1e", |v| v),
+        op.trim()
+    ))
+}
+
 fn workspace(
+    index: usize,
+    root: &str,
+    start: Option<&str>,
+    view: Option<&str>,
+    budget: usize,
+) -> (String, Summary) {
+    let key = section_key(index, root, start, view, budget);
+    if let Some(key) = &key
+        && let Some(hit) = SECTIONS
+            .lock()
+            .ok()
+            .and_then(|c| c.as_ref().and_then(|c| c.get(key).cloned()))
+    {
+        return hit;
+    }
+    let rendered = render_section(index, root, start, view, budget);
+    if let Some(key) = key
+        && !rendered.1.error
+        && let Ok(mut cache) = SECTIONS.lock()
+    {
+        let cache = cache.get_or_insert_with(HashMap::new);
+        if cache.len() >= SECTIONS_KEPT {
+            cache.clear();
+        }
+        cache.insert(key, rendered.clone());
+    }
+    rendered
+}
+
+fn render_section(
     index: usize,
     root: &str,
     start: Option<&str>,
@@ -1392,7 +1490,7 @@ fn view_base(backend: &dyn Backend, pull_request: Option<&link::PullRequest>) ->
     pull_request
         .map(|pr| Base::branch_point(pr.base_oid.clone()))
         .filter(|b| backend.resolves(b))
-        .or_else(|| backend.default_bases().into_iter().next())
+        .or_else(|| backend.default_base())
         .ok_or_else(|| anyhow!("no diff base available"))
 }
 
@@ -1572,6 +1670,7 @@ enum Kind {
     Meta,
 }
 
+#[derive(Clone)]
 struct DiffLine {
     kind: Kind,
     old: Option<u32>,
@@ -1579,11 +1678,13 @@ struct DiffLine {
     text: String,
 }
 
+#[derive(Clone)]
 struct Hunk {
     header: String,
     lines: Vec<DiffLine>,
 }
 
+#[derive(Clone)]
 struct FileDiff {
     path: String,
     status: char,
@@ -2638,6 +2739,42 @@ mod tests {
             newest.contains("data-view=\"0:\" aria-label=\"newer change\""),
             "stepping past the newest change comes back to the whole stack: {newest}"
         );
+    }
+
+    /// Moving one repo's view asks for that section alone, and a section
+    /// already rendered for the repo's current state comes back from the
+    /// cache, until a working-copy edit moves jj's operation on.
+    #[test]
+    fn a_section_renders_alone_and_is_cached_until_the_repo_moves() {
+        let (repo, c) = layered_repo();
+        let root = repo.0.to_string_lossy().to_string();
+        let req = |only| Request {
+            path: "/fragment".into(),
+            roots: vec![root.clone(), root.clone()],
+            group: None,
+            label: None,
+            starts: Vec::new(),
+            views: vec![(1, c["c"].clone())],
+            only,
+            peers: Vec::new(),
+        };
+        let alone = fragment(&req(Some(1)));
+        assert!(
+            alone.starts_with("<section class=repo id=\"repo-1\""),
+            "{alone}"
+        );
+        assert_eq!(alone.matches("<section class=repo").count(), 1);
+        assert!(
+            alone.contains("<code>"),
+            "the section carries its own view: {alone}"
+        );
+        assert_eq!(fragment(&req(Some(7))), "", "no such repo, nothing to show");
+
+        let key = || section_key(1, &root, None, Some(&c["c"]), 100).expect("a jj repo has a key");
+        let before = key();
+        assert_eq!(before, key(), "the same state gives the same key");
+        std::fs::write(repo.0.join("f.txt"), "an edit\n").unwrap();
+        assert_ne!(before, key(), "a working-copy edit moves the key");
     }
 
     /// A bare URL anywhere in prose becomes a link, as on GitHub, without

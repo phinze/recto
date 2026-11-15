@@ -153,6 +153,11 @@ pub trait Backend: Send + Sync {
     fn unified_diff(&self, scope: &Scope, ignore_ws: bool) -> Result<String>;
     fn list_revs(&self, base: &Base) -> Result<Vec<Rev>>;
     fn default_bases(&self) -> Vec<Base>;
+    /// The base a view opens on, without working out the other choices the
+    /// picker offers, which can cost several backend calls.
+    fn default_base(&self) -> Option<Base> {
+        self.default_bases().into_iter().next()
+    }
     /// Raw bytes of `path` as it exists at `rev`. Used by the renderer to
     /// fetch the post-image of a hunk when the diff isn't against the working
     /// copy — i.e. `Scope::Rev`, where reading disk would land on whatever
@@ -653,6 +658,12 @@ impl Backend for JjBackend {
         }
 
         Ok(draw_graph(revs, &wc_id))
+    }
+
+    fn default_base(&self) -> Option<Base> {
+        Some(Base::MergeBase {
+            against: Box::new(Base::Revision("trunk()".into())),
+        })
     }
 
     fn default_bases(&self) -> Vec<Base> {
