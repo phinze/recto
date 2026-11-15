@@ -11,15 +11,20 @@
   // from the top of a page that just changed. Safari has no overflow-anchor,
   // so this is done by hand.
   function keyOf(el) {
+    if (!el || !content.contains(el)) return null;
     for (; el && el !== content; el = el.parentElement) {
       if (el.matches('nav.tabs, nav.tabs *, details > summary, details > summary *')) return null;
       if (el.matches('.ask[data-ask]')) return '.ask' + askKey(el);
-      if (el.id) return '#' + el.id;
+      // A tour's quoted rows repeat the diff's row ids, so a quote is known
+      // by what holds it rather than by a row that's also somewhere else.
+      if (el.id && !el.closest('figure.quote')) return '#' + el.id;
     }
     return null;
   }
   function findKey(key) {
-    if (key.startsWith('#')) return document.getElementById(key.slice(1));
+    if (key.startsWith('#')) {
+      return [...content.querySelectorAll(`[id="${CSS.escape(key.slice(1))}"]`)].find((e) => !e.closest('figure.quote')) || null;
+    }
     return [...content.querySelectorAll('.ask[data-ask]')].find((c) => '.ask' + askKey(c) === key) || null;
   }
   function scrollAnchor() {
@@ -880,13 +885,15 @@
   applyLines();
   toc.querySelector('.toc-lines').addEventListener('click', (e) => {
     e.stopPropagation();
-    steady(() => {
-      lines = lines === 'scroll' ? 'wrap' : 'scroll';
-      try { localStorage.setItem('recto-lines', lines); } catch {}
-      applyLines();
-    });
+    // The sheet covers the page, so the reader's place was taken as it
+    // opened; measuring now would only find the sheet.
+    lines = lines === 'scroll' ? 'wrap' : 'scroll';
+    try { localStorage.setItem('recto-lines', lines); } catch {}
+    applyLines();
+    restoreAnchor(tocAnchor);
   });
-  function openToc() { buildToc(); toc.classList.add('shown'); }
+  let tocAnchor = null;
+  function openToc() { tocAnchor = scrollAnchor(); buildToc(); toc.classList.add('shown'); }
   function closeToc() { toc.classList.remove('shown'); }
   tocBtn.addEventListener('click', openToc);
   toc.addEventListener('click', (e) => {
