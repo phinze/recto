@@ -62,9 +62,12 @@ there. Route their commands through `rig recto` as before.
 **Web first** while `rig config recto` says `web`: Paul reads Recto in the
 web window, review rigs included, and `rig recto` runs its commands with no
 viewer, opening or moving no panes. Write to the window as above. A review
-works the same way: `recto pr`, `recto review` and the draft commands work
-without a viewer, and the window shows the slate. Open the terminal Recto
-only when he asks, with `rig recto --pane <repo>`.
+works the same way: `recto pr`, `recto review`, `review-comment`,
+`review-body`, `review-verdict` and `review-focus` all work without a viewer,
+writing the saved state the window shows (see "In the web window" below).
+`ping` and `base` still need a terminal Recto, so skip `ping`: "no recto
+listening" from it is expected here. Open the terminal Recto only when he asks,
+with `rig recto --pane <repo>`.
 
 ### The briefing
 
@@ -475,6 +478,8 @@ The web window shows the draft too: the verdict and summary at the top of
 the repo, and each inline comment under the last line it's about. With no
 terminal Recto running, the review commands write the saved draft directly
 and answer the same way, and `recto pr URL` attaches the PR for the window.
+`recto review-focus ID` points the window at that draft's lines; the summary
+needs no focusing, since it heads the repo.
 Paul steers a draft by selecting text in it and commenting. That comment
 arrives like any other, anchored as `REPO draft ✎N (id ID) on PATH:LINES` or
 `REPO review summary`. Revise with `recto review-comment --id ID` or

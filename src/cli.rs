@@ -534,6 +534,7 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             }
             link::Request::Clear => return crate::serve::save_clear_offline(),
             link::Request::Lens { spec } => return crate::serve::save_lens_offline(spec),
+            link::Request::ReviewFocus { id } => return crate::serve::review_focus_offline(*id),
             _ => {}
         }
     }

@@ -24,6 +24,37 @@ pub(crate) fn respond_offline(request: &link::Request) -> Option<link::Response>
     Some(respond(request).unwrap_or_else(|e| link::Response::err(format!("{e:#}"))))
 }
 
+/// `recto review-focus` with no viewer. The web window follows focus, and a
+/// draft sits under the lines it's about, so focusing those lines puts the
+/// draft in front of the reader. The summary needs nothing: it heads the
+/// repo already. Returns the process exit code.
+pub(crate) fn focus_offline(id: Option<u64>) -> i32 {
+    let Some(id) = id else {
+        eprintln!(
+            "recto: no viewer running; the web window shows the summary at the top of the repo"
+        );
+        return 0;
+    };
+    let draft = match respond(&link::Request::ReviewDraft) {
+        Ok(resp) if resp.ok => resp.review_draft,
+        Ok(resp) => {
+            eprintln!("recto: {}", resp.error.unwrap_or_default());
+            return 1;
+        }
+        Err(e) => {
+            eprintln!("recto: {e:#}");
+            return 1;
+        }
+    };
+    match draft.and_then(|d| d.comments.into_iter().find(|c| c.id == id)) {
+        Some(c) => super::save_focus_offline(&c.path, Some(c.start), Some(c.end)),
+        None => {
+            eprintln!("recto: no draft {id} in this review");
+            1
+        }
+    }
+}
+
 struct Slate {
     store: state::Store,
     pr: PullRequestRef,

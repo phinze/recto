@@ -39,6 +39,7 @@ use crate::watch::{WatchTree, is_interesting, may_add_directories};
 use crate::{link, markdown, parse_pathspec, state};
 
 mod review;
+pub(crate) use review::focus_offline as review_focus_offline;
 pub(crate) use review::respond_offline as review_offline;
 
 /// Lines past this many in one response render without syntax highlighting,
