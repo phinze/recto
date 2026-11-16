@@ -1108,9 +1108,45 @@
   });
   document.addEventListener('keydown', (e) => { if (e.key === 'Escape' && toc.classList.contains('shown')) closeToc(); });
 
+  // Keys. The page answers its own (a tab by number, the next or previous
+  // tab), and passes any other plain key up, since a key pressed in an
+  // iframe never reaches its parent: the frame holds the comments, follow,
+  // the switcher and the `?` list of every key, and decides what its keys
+  // mean. Typing in a field, and chords the browser owns, are left alone.
+  function pickTab(key) {
+    const buttons = [...content.querySelectorAll('nav.tabs button[data-tab]')];
+    if (!buttons.length) return false;
+    const at = buttons.findIndex((b) => b.classList.contains('active'));
+    let pick = null;
+    if (/^[1-9]$/.test(key)) pick = buttons[+key - 1];
+    else if (key === ']') pick = buttons[(at + 1) % buttons.length];
+    else if (key === '[') pick = buttons[(at - 1 + buttons.length) % buttons.length];
+    if (!pick) return false;
+    activate(pick.dataset.tab, true);
+    return true;
+  }
+  function typing(el) {
+    return el && (el.isContentEditable || /^(INPUT|TEXTAREA|SELECT)$/.test(el.tagName));
+  }
+  document.addEventListener('keydown', (e) => {
+    if (e.defaultPrevented || typing(e.target)) return;
+    const chord = (e.metaKey || e.ctrlKey) && !e.altKey;
+    const up = chord && e.shiftKey && e.key === 'Enter' ? 'send'
+      : chord && !e.shiftKey && e.key.toLowerCase() === 'k' ? 'switch' : null;
+    if (up) {
+      if (framed) { e.preventDefault(); window.parent.postMessage({ key: up }, location.origin); }
+      return;
+    }
+    if (e.metaKey || e.ctrlKey || e.altKey) return;
+    if (pickTab(e.key)) { e.preventDefault(); return; }
+    if (framed && (e.key.length === 1 || e.key === 'Escape')) window.parent.postMessage({ key: e.key }, location.origin);
+  });
+
   // A parent frame can point this page at code: postMessage({focus: "L0-3-42"}).
   window.addEventListener('message', (e) => {
     if (e.source !== window.parent) return;
+    // A tab key pressed while the frame had the keyboard.
+    if (e.data && typeof e.data.key === 'string') pickTab(e.data.key);
     if (e.data && typeof e.data.focus === 'string') reveal(e.data.focus);
     if (e.data && e.data.refresh) refresh();
     if (e.data && e.data.insets && typeof e.data.insets.bottom === 'number') {
