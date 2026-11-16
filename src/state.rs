@@ -100,6 +100,12 @@ struct Document {
     /// when it changes, the way it follows focus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lens: Option<String>,
+    /// Fields this binary doesn't know, written by a newer Recto. Saving
+    /// writes them back, so an older binary still running (a long-lived
+    /// viewer, a machine whose sync hasn't landed) can't drop a newer one's
+    /// state by touching the document.
+    #[serde(flatten)]
+    unknown: serde_json::Map<String, serde_json::Value>,
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
@@ -138,6 +144,7 @@ impl Document {
             pull_requests: Vec::new(),
             quotes: Vec::new(),
             lens: None,
+            unknown: serde_json::Map::new(),
         }
     }
 }
@@ -641,6 +648,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         pull_requests: Vec::new(),
         quotes: Vec::new(),
         lens: None,
+        unknown: serde_json::Map::new(),
     }))
 }
 
@@ -826,6 +834,34 @@ mod tests {
         store.set_doc("pr-body", None);
         assert_eq!(names(&store), ["tour", "plan"]);
         assert_eq!(store.docs()[1].body, "revised");
+    }
+
+    /// An older binary re-saving a newer one's document keeps what it
+    /// doesn't understand, rather than throwing it away.
+    #[test]
+    fn fields_this_binary_does_not_know_survive_a_save() {
+        let (state_home, workspace) = roots("unknown");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        store.set_brief(Some("the briefing"));
+        store.save().unwrap();
+
+        let mut raw: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        raw["from_the_future"] = serde_json::json!({"kept": [1, 2, 3]});
+        fs::write(&store.path, serde_json::to_string(&raw).unwrap()).unwrap();
+
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        store.set_tour(Some("a tour"));
+        store.save().unwrap();
+
+        let saved: serde_json::Value =
+            serde_json::from_str(&fs::read_to_string(&store.path).unwrap()).unwrap();
+        assert_eq!(
+            saved["from_the_future"],
+            serde_json::json!({"kept": [1, 2, 3]})
+        );
+        assert_eq!(saved["brief"], "the briefing");
+        assert_eq!(saved["tour"], "a tour");
     }
 
     #[test]
