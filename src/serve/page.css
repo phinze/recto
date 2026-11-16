@@ -143,6 +143,11 @@ summary .stat { font-size: 12px; white-space: nowrap; display: flex; align-items
 .expand-all { font: 11px var(--mono); color: var(--subtext); background: var(--surface0); border: 0; border-radius: 10px;
   padding: 1px 8px; cursor: pointer; margin-left: auto; }
 .expand-all:hover { background: var(--surface1); }
+.start-here { font: 11px var(--mono); color: var(--subtext); background: none; border: 1px solid var(--surface1); border-radius: 10px;
+  padding: 0 7px; cursor: pointer; }
+.start-here:hover { background: var(--surface0); }
+.start-here.failed { border-color: var(--red); color: var(--red); }
+body:not(.framed) .start-here { display: none; }
 .st { font-weight: 700; }
 .st-A { color: var(--green); } .st-D { color: var(--red); } .st-R { color: var(--peach); } .st-M { color: var(--yellow); }
 

@@ -455,6 +455,25 @@
       repoRefresh(ri, pick.classList.contains('step'));
       return;
     }
+    const here = e.target.closest('.start-here');
+    if (here) {
+      if (!framed) return;
+      const repo = here.dataset.repo;
+      if (!confirm('Start ' + repo + "'s diff from where it forks off trunk now? What landed before leaves the page. The agent can move it back with rig baseline.")) return;
+      here.disabled = true;
+      here.textContent = 'moving…';
+      window.parent.postMessage({ baseline: repo }, location.origin);
+      // A frame loaded before rig knew this button never answers; a redraw
+      // replaces the button, so one still here after a while went unheard.
+      setTimeout(() => {
+        if (!here.isConnected || !here.disabled) return;
+        here.disabled = false;
+        here.textContent = 'start here';
+        here.title = "The window around this page didn't answer. Reload the window and try again.";
+        here.classList.add('failed');
+      }, 10000);
+      return;
+    }
     const all = e.target.closest('.expand-all');
     if (all) {
       const files = [...all.closest('section.repo').querySelectorAll('details.file')];
@@ -525,6 +544,8 @@
   // comment stands so the page can mark the spot. With no frame there's no
   // one to deliver to, so none of this shows.
   const framed = window.parent !== window;
+  // A button only the frame can act on, like start-here, hides without one.
+  if (framed) document.body.classList.add('framed');
   let comments = [];
   // Comments on other rigs whose asks this page gathers, by rig: the frame
   // fetches them for the rigs this page names, so an answered ask reads so.
@@ -1148,6 +1169,16 @@
     // A tab key pressed while the frame had the keyboard.
     if (e.data && typeof e.data.key === 'string') pickTab(e.data.key);
     if (e.data && typeof e.data.focus === 'string') reveal(e.data.focus);
+    // Rig refused to move a repo's start; say why on its button.
+    if (e.data && e.data.baselineError) {
+      for (const b of content.querySelectorAll('.start-here')) {
+        if (b.dataset.repo !== e.data.baselineError.repo) continue;
+        b.disabled = false;
+        b.textContent = 'start here';
+        b.title = e.data.baselineError.error;
+        b.classList.add('failed');
+      }
+    }
     if (e.data && e.data.refresh) refresh();
     if (e.data && e.data.insets && typeof e.data.insets.bottom === 'number') {
       document.documentElement.style.setProperty('--safe-b', e.data.insets.bottom + 'px');

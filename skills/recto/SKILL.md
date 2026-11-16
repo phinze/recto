@@ -348,6 +348,15 @@ everything since the commit the rig started from is your own work on trunk
 empty branch point. Tour quotes resolve against that whole range, so a tour
 written before the push still reads after it.
 
+Each repo's header names that start. A rig resumed with new scope still
+starts where it first began, so its window shows everything that has landed
+since, earlier work and other rigs' alike. `rig baseline` starts every repo
+again from where it forks off trunk now (`rig baseline REPO --at REV` for one
+repo, from a commit on trunk), and work the rig lands afterwards shows as it
+would from a fresh start. It prints the old start, so it's undoable. Paul can
+do the same from the window with **start here** in a repo's header. Ask
+before moving it on your own: it changes what he sees.
+
 The window shows each repo as a stack. Bookmarks split its commits into
 layers, each a PR or one meant to be; unbookmarked work on top is "unpushed",
 and landed layers fold. A sticky bar names the view (the whole stack, one

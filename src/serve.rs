@@ -1218,6 +1218,15 @@ fn render_workspace(
             .map(|r| short_oid(&r).to_string())
             .unwrap_or_else(|_| "@".into())),
     );
+    // Inside a rig, the reader can start this repo's diff again from where
+    // it forks off trunk now; the frame asks rig to move the start.
+    if let Some(dir) = start.and(root.file_name()).and_then(|d| d.to_str()) {
+        let _ = write!(
+            out,
+            "<button type=button class=start-here data-repo=\"{}\" title=\"Start this diff from where it forks off trunk now, leaving out what landed before\">start here</button>",
+            esc(dir)
+        );
+    }
     if files.is_empty() {
         out.push_str("<span>no changes</span>");
     } else {
@@ -1439,7 +1448,16 @@ pub(crate) fn anchor(
     let Some(b) = backend.base_commit(branch_base) else {
         return plain(None);
     };
-    if s == b || !backend.is_ancestor(&s, &b) {
+    // Starting at the branch point is the same range, but the header still
+    // says where it starts, so a baseline just moved shows that it took.
+    if s == b {
+        return Anchor {
+            base: branch_base.clone(),
+            label: Some(start_label(&s)),
+            note: None,
+        };
+    }
+    if !backend.is_ancestor(&s, &b) {
         return plain(None);
     }
     if !backend.is_ancestor(&s, backend.head_rev()) {
@@ -1454,7 +1472,7 @@ pub(crate) fn anchor(
     match backend.commits(&s, &b) {
         Ok(between) if between.iter().all(|c| c.mine || c.empty) => Anchor {
             base: Base::Revision(s.clone()),
-            label: Some(format!("rig start {}", short_oid(&s))),
+            label: Some(start_label(&s)),
             note: None,
         },
         Ok(_) => plain(Some(
@@ -1462,6 +1480,10 @@ pub(crate) fn anchor(
         )),
         Err(_) => plain(None),
     }
+}
+
+fn start_label(commit: &str) -> String {
+    format!("start {}", short_oid(commit))
 }
 
 /// What the stack is drawn around besides its commits: the PRs attached to
@@ -1624,7 +1646,7 @@ fn render_stack(
         "<li><button type=button data-view=\"{index}:\"{}><span class=rev-id></span><span class=rev-sum>whole stack {}</span>{}</button></li>",
         if narrowed { "" } else { " class=active" },
         if from_start {
-            "since the rig started"
+            "since the start"
         } else {
             "in this range"
         },
@@ -1725,10 +1747,17 @@ fn view_base(backend: &dyn Backend, pull_request: Option<&link::PullRequest>) ->
         .ok_or_else(|| anyhow!("no diff base available"))
 }
 
-/// Where a rig repo's work started, from the environment `rig env` sets up:
-/// `RIG_STARTS` pairs each repo's directory under `RIG_BASEDIR` with its
-/// starting commit. `rig serve` hands the web view the same commits.
+/// Where a rig repo's diff starts, the commit `rig serve` hands the web view.
+/// Asked of `rig info` first, since a baseline can move after this session's
+/// environment was set up; then `RIG_STARTS` from `rig env`, which pairs each
+/// repo's directory under `RIG_BASEDIR` with its start.
 fn rig_start(root: &Path) -> Option<String> {
+    std::env::var_os("RIG_BASEDIR")?;
+    if let Ok(Some(info)) = crate::info_from_rig(root)
+        && info.start.is_some()
+    {
+        return info.start;
+    }
     let basedir = Path::new(&std::env::var_os("RIG_BASEDIR")?)
         .canonicalize()
         .ok()?;

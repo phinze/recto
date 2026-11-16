@@ -78,6 +78,10 @@ struct RigInfo {
     /// `review_pr`.
     #[serde(default)]
     review_prs: Vec<String>,
+    /// The commit this repository's diff starts from: where the rig began,
+    /// or a baseline moved since. Absent from rigs that don't record one.
+    #[serde(default)]
+    start: Option<String>,
 }
 
 impl RigInfo {

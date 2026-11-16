@@ -1858,7 +1858,7 @@ mod tests {
         );
         let anchor = crate::serve::anchor(&backend, &branch, Some(&start), true);
         assert_eq!(anchor.base, Base::Revision(start.clone()));
-        assert!(anchor.label.unwrap().starts_with("rig start"));
+        assert!(anchor.label.unwrap().starts_with("start "));
         let files = backend
             .list_changes(&Scope::Range(anchor.base), false)
             .unwrap();
@@ -1903,6 +1903,8 @@ mod tests {
         let anchor = crate::serve::anchor(&backend, &branch, Some(&start), false);
         assert_eq!(anchor.base, branch);
         assert!(anchor.note.is_none());
+        // Starting at the branch point, the header still names the start.
+        assert!(anchor.label.unwrap().starts_with("start "));
     }
 
     #[test]
