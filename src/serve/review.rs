@@ -237,7 +237,7 @@ fn apply(
 pub(super) fn slate_order(files: &[FileDiff], comments: &mut [DraftReviewComment]) {
     comments.sort_by_cached_key(|c| {
         let file = files.iter().position(|f| f.path == c.path);
-        let anchored = c.pin.shown() && file.is_some_and(|i| shows_span(&files[i], c.start, c.end));
+        let anchored = c.pin.shown() && file.is_some_and(|i| shows_any(&files[i], c.start, c.end));
         (
             !anchored,
             file.unwrap_or(usize::MAX),
@@ -247,6 +247,17 @@ pub(super) fn slate_order(files: &[FileDiff], comments: &mut [DraftReviewComment
             c.id,
         )
     });
+}
+
+/// Whether any line of a new-side span shows in the diff. Looser than
+/// `shows_span`, and the test the viewer sorts by (`rows_for_span`), so a draft
+/// straddling two hunks still numbers the same on every surface.
+fn shows_any(file: &FileDiff, start: u32, end: u32) -> bool {
+    file.hunks
+        .iter()
+        .flat_map(|h| &h.lines)
+        .filter_map(|l| l.new)
+        .any(|n| start <= n && n <= end)
 }
 
 /// Whether a new-side span lands inside one of the file's hunks, which is
@@ -523,6 +534,10 @@ mod tests {
             [2, 1, 3],
             "by line, with the one off the diff last"
         );
+        // Partly on the diff still counts as on it, as in the viewer's sort.
+        let mut straddling = vec![draft(5, 3, 3), draft(4, 2, 12)];
+        slate_order(&files, &mut straddling);
+        assert_eq!(straddling.iter().map(|d| d.id).collect::<Vec<_>>(), [4, 5]);
         let mut out = String::new();
         render_files(0, &files, &drafts, None, &mut 0, &mut out);
         assert!(out.contains("data-draft=\"2\" data-n=1"), "{out}");
