@@ -1183,6 +1183,7 @@ fn render_workspace(
                     members: None,
                 };
                 crate::anchor::settle(backend.as_ref(), &lens, &mut r.comments);
+                review::slate_order(&shown, &mut r.comments);
                 r
             });
             (pr.clone(), review)
@@ -1275,6 +1276,7 @@ fn render_workspace(
         })
         .map(|mut r| {
             crate::anchor::settle(backend.as_ref(), &lens, &mut r.comments);
+            review::slate_order(&files, &mut r.comments);
             r
         });
     // One review per view, so feedback on it can't land on another: a
@@ -2152,7 +2154,7 @@ fn render_file(
                         .filter(|d| d.pin.shown() && d.path == file.path && d.end == n)
                     {
                         out.push_str("<tr class=draft><td colspan=3>");
-                        draft_card(d, pr, out);
+                        draft_card(d, slate_number(drafts, d), pr, out);
                         out.push_str("</td></tr>");
                     }
                 }
@@ -2163,8 +2165,18 @@ fn render_file(
     out.push_str("</details>");
 }
 
-/// One inline review draft, as the reader will see it posted.
-fn draft_card(d: &link::DraftReviewComment, pr: Option<u64>, out: &mut String) {
+/// A draft's ✎ number: its place in its review, which is kept in slate
+/// order, so it's the number the Review tab and `recto review` give it.
+fn slate_number(drafts: &[link::DraftReviewComment], d: &link::DraftReviewComment) -> usize {
+    drafts
+        .iter()
+        .position(|o| o.id == d.id)
+        .map_or(0, |i| i + 1)
+}
+
+/// One inline review draft, as the reader will see it posted. It goes by its
+/// ✎ number, with the id that review commands take alongside.
+fn draft_card(d: &link::DraftReviewComment, n: usize, pr: Option<u64>, out: &mut String) {
     let span = if d.start == d.end {
         d.start.to_string()
     } else {
@@ -2176,14 +2188,14 @@ fn draft_card(d: &link::DraftReviewComment, pr: Option<u64>, out: &mut String) {
     };
     let _ = write!(
         out,
-        "<div class=draft-card{} data-draft=\"{}\" data-path=\"{}\" data-start={} data-end={}><div class=draft-head>Draft #{} <span class=dim>{}:{span} · last edit {who}</span>{}</div><div class=draft-body>{}</div></div>",
+        "<div class=draft-card{} data-draft=\"{}\" data-n={n} data-path=\"{}\" data-start={} data-end={}><div class=draft-head>✎{n} <span class=dim>{}:{span} · id {} · last edit {who}</span>{}</div><div class=draft-body>{}</div></div>",
         pr.map(|n| format!(" data-pr={n}")).unwrap_or_default(),
         d.id,
         esc(&d.path),
         d.start,
         d.end,
-        d.id,
         esc(&d.path),
+        d.id,
         if d.pin.outdated {
             " <span class=outdated title=\"the lines it was written on changed since\">outdated</span>"
         } else {
@@ -2233,7 +2245,7 @@ fn review_card(
     if !lost.is_empty() {
         out.push_str("<div class=draft-lost><p class=dim>Not on this diff any more:</p>");
         for d in lost {
-            draft_card(d, pr, out);
+            draft_card(d, slate_number(&review.comments, d), pr, out);
         }
         out.push_str("</div>");
     }

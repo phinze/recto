@@ -572,7 +572,7 @@
       const pr = d.pr ? ' (PR #' + d.pr + ')' : '';
       return { kind: 'draft', repo, path: d.path, start: +d.start, end: +d.end,
         section: (d.pr ? d.pr + '#' : '') + d.draft,
-        label: (repo ? repo + ' ' : '') + 'draft #' + d.draft + pr + ' on ' + d.path + ':' + span };
+        label: (repo ? repo + ' ' : '') + 'draft ✎' + d.n + ' (id ' + d.draft + ')' + pr + ' on ' + d.path + ':' + span };
     }
     const review = node.closest('article.review');
     if (review) {

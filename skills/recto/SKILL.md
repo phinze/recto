@@ -421,7 +421,10 @@ item in view with `c` or in `$EDITOR` with `e`, cycle the verdict with `V`, and
 press `enter` to see a comment's code in the diff, with `u` to come back. They
 can also start an inline comment with `c` on a diff line. Comment badges
 (`✎1`, `✎2`, ...) are positions in that order everywhere, so they can shift
-as comments arrive; the stable `id` is your handle.
+as comments arrive; the stable `id` is your handle for commands. When you
+talk with Paul about a comment, use its ✎ number (or its topic), since that's
+what he sees in the terminal, the window and `recto review --markdown`. When
+he names a number, it's the ✎ number, not the id.
 
 Read the draft with `recto review`; this is a peek, so calling it repeatedly
 never consumes anything. Comments come back in posting order, each with its
@@ -457,7 +460,7 @@ the repo, and each inline comment under the last line it's about. With no
 terminal Recto running, the review commands write the saved draft directly
 and answer the same way, and `recto pr URL` attaches the PR for the window.
 Paul steers a draft by selecting text in it and commenting. That comment
-arrives like any other, anchored as `REPO draft #ID on PATH:LINES` or
+arrives like any other, anchored as `REPO draft ✎N (id ID) on PATH:LINES` or
 `REPO review summary`. Revise with `recto review-comment --id ID` or
 `recto review-body`, ack it, and say in the briefing what changed. When the
 draft reads as done, ask in the briefing whether to post it; posting is
@@ -466,7 +469,7 @@ still a separate step that waits on his answer.
 A workspace can hold a stack of PRs, one per layer: a review rig for a
 stacked PR attaches every PR of the stack, and `recto pr URL` adds one more.
 Each layer in the window goes by its PR, and opening a layer shows that PR's
-review. Comments there name the PR (`draft #3 (PR #41) on …`, `review summary
+review. Comments there name the PR (`draft ✎2 (id 3) (PR #41) on …`, `review summary
 for PR #41`). The review commands act on the PR in front, which is the one
 last attached, so `recto pr` the PR's URL before revising its drafts, then
 `recto pr` the top PR's URL again to put it back in front.

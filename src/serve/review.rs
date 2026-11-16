@@ -131,6 +131,7 @@ fn apply(
         &crate::anchor::Lens::range(backend),
         &mut slate.comments,
     );
+    slate_order(&slate.files, &mut slate.comments);
     match request {
         link::Request::ReviewDraft => Ok(link::Response::ok_review_draft(slate.draft())),
         link::Request::ReviewVerdict { verdict } => {
@@ -222,14 +223,30 @@ fn apply(
                     end,
                 )),
             });
-            // Posting order is file then line, the way the viewer keeps them.
-            slate.comments.sort_by(|a, b| {
-                (a.path.as_str(), a.start, a.id).cmp(&(b.path.as_str(), b.start, b.id))
-            });
+            slate_order(&slate.files, &mut slate.comments);
             slate.save()
         }
         _ => unreachable!("filtered in respond_offline"),
     }
+}
+
+/// Put review drafts in slate order, the order the Review tab and `recto
+/// review` number them in (✎1, ✎2, ...) and GitHub lays them out: drafts
+/// still on the diff first, by the diff's file order, then span, then id.
+/// Matches the viewer's own sort, so every surface gives a draft one number.
+pub(super) fn slate_order(files: &[FileDiff], comments: &mut [DraftReviewComment]) {
+    comments.sort_by_cached_key(|c| {
+        let file = files.iter().position(|f| f.path == c.path);
+        let anchored = c.pin.shown() && file.is_some_and(|i| shows_span(&files[i], c.start, c.end));
+        (
+            !anchored,
+            file.unwrap_or(usize::MAX),
+            c.path.clone(),
+            c.start,
+            c.end,
+            c.id,
+        )
+    });
 }
 
 /// Whether a new-side span lands inside one of the file's hunks, which is
@@ -479,5 +496,37 @@ mod tests {
             out.contains("Say &lt;why&gt;"),
             "raw html shows as text: {out}"
         );
+    }
+
+    // A draft goes by its ✎ number in the window, the same one the Review
+    // tab gives it, not by its id: ids are creation order, the slate isn't.
+    #[test]
+    fn drafts_are_numbered_in_slate_order() {
+        let files = parse_diff(
+            "diff --git a/a.txt b/a.txt\n--- a/a.txt\n+++ b/a.txt\n@@ -1,4 +1,4 @@\n 1\n-2\n+two\n 3\n 4\n",
+        );
+        let draft = |id, start, end| DraftReviewComment {
+            pin: Default::default(),
+            id,
+            path: "a.txt".into(),
+            start,
+            end,
+            body: format!("draft {id}"),
+            last_editor: DraftEditor::Agent,
+            revision: 1,
+            snippet: None,
+        };
+        let mut drafts = vec![draft(1, 4, 4), draft(2, 1, 1), draft(3, 9, 9)];
+        slate_order(&files, &mut drafts);
+        assert_eq!(
+            drafts.iter().map(|d| d.id).collect::<Vec<_>>(),
+            [2, 1, 3],
+            "by line, with the one off the diff last"
+        );
+        let mut out = String::new();
+        render_files(0, &files, &drafts, None, &mut 0, &mut out);
+        assert!(out.contains("data-draft=\"2\" data-n=1"), "{out}");
+        assert!(out.contains("data-draft=\"1\" data-n=2"), "{out}");
+        assert!(out.contains("✎2 <span class=dim>a.txt:4 · id 1"), "{out}");
     }
 }
