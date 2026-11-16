@@ -59,6 +59,13 @@ instead, and the window still follows.
 Review rigs open with a terminal Recto, since the review slate is the job
 there. Route their commands through `rig recto` as before.
 
+**Web first** while `rig config recto` says `web`: Paul reads Recto in the
+web window, review rigs included, and `rig recto` runs its commands with no
+viewer, opening or moving no panes. Write to the window as above. A review
+works the same way: `recto pr`, `recto review` and the draft commands work
+without a viewer, and the window shows the slate. Open the terminal Recto
+only when he asks, with `rig recto --pane <repo>`.
+
 ### The briefing
 
 The briefing is one page that organizes Paul's attention, pinned above
@@ -639,7 +646,7 @@ exception: its scope is the workspace, not the current diff.
   appear.
 - **exit 2** — no recto is listening for this workspace (or you're not
   in a repo). Inside a Rig, `rig recto <repo>` starts one, so this
-  shouldn't happen there. Outside one, don't keep trying; just describe the
+  shouldn't happen there, except web first, where that's expected. Outside one, don't keep trying; just describe the
   change in text.
 
 `recto tour`, `recto focus` and `recto clear` are the exceptions: they don't
