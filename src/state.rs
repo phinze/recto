@@ -100,6 +100,11 @@ struct Document {
     /// when it changes, the way it follows focus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lens: Option<String>,
+    /// The identity of each ask and heading in the briefing, the tours and
+    /// the docs, minted when the document was saved and kept while that part
+    /// says the same thing (see `marks`).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    marks: Vec<Mark>,
     /// Fields this binary doesn't know, written by a newer Recto. Saving
     /// writes them back, so an older binary still running (a long-lived
     /// viewer, a machine whose sync hasn't landed) can't drop a newer one's
@@ -112,6 +117,17 @@ struct Document {
 pub struct NamedDoc {
     pub name: String,
     pub body: String,
+}
+
+/// One part's identity: the document it's in ("brief", "tour", or a doc's
+/// name), what names it there ("ask:" or "heading:" and its key), a digest of
+/// what it says, and the identity itself.
+#[derive(Debug, Clone, Deserialize, Serialize)]
+struct Mark {
+    doc: String,
+    key: String,
+    digest: String,
+    id: String,
 }
 
 #[derive(Debug, Deserialize, Serialize)]
@@ -144,6 +160,7 @@ impl Document {
             pull_requests: Vec::new(),
             quotes: Vec::new(),
             lens: None,
+            marks: Vec::new(),
             unknown: serde_json::Map::new(),
         }
     }
@@ -246,7 +263,57 @@ impl Store {
     }
 
     pub fn set_tour(&mut self, tour: Option<&str>) {
+        self.remark("tour", tour);
         self.document.tour = tour.map(str::to_string);
+    }
+
+    /// Mint identities for a document's parts as it's saved: a part that
+    /// still says what it did keeps its identity, anything new or reworded
+    /// gets a fresh one, and parts no longer there are forgotten, so writing
+    /// one again later is new too.
+    fn remark(&mut self, doc: &str, body: Option<&str>) {
+        let (old, mut kept): (Vec<Mark>, Vec<Mark>) = std::mem::take(&mut self.document.marks)
+            .into_iter()
+            .partition(|m| m.doc == doc);
+        if let Some(body) = body {
+            let parts = crate::marks::parts(body);
+            let tagged = parts
+                .asks
+                .iter()
+                .map(|p| ("ask:", p))
+                .chain(parts.headings.iter().map(|p| ("heading:", p)));
+            for (tag, part) in tagged {
+                let key = format!("{tag}{}", part.key);
+                let id = old
+                    .iter()
+                    .find(|m| m.key == key && m.digest == part.digest)
+                    .map_or_else(|| crate::marks::mint(part), |m| m.id.clone());
+                kept.push(Mark {
+                    doc: doc.to_string(),
+                    key,
+                    digest: part.digest.clone(),
+                    id,
+                });
+            }
+        }
+        self.document.marks = kept;
+    }
+
+    /// The identities of a saved document's parts, in document order.
+    pub fn doc_marks(&self, doc: &str, body: &str) -> crate::marks::Ids {
+        let parts = crate::marks::parts(body);
+        let find = |tag: &str, part: &crate::marks::Part| {
+            let key = format!("{tag}{}", part.key);
+            self.document
+                .marks
+                .iter()
+                .find(|m| m.doc == doc && m.key == key && m.digest == part.digest)
+                .map(|m| m.id.clone())
+        };
+        crate::marks::Ids {
+            asks: parts.asks.iter().map(|p| find("ask:", p)).collect(),
+            headings: parts.headings.iter().map(|p| find("heading:", p)).collect(),
+        }
     }
 
     pub fn lens(&self) -> Option<&str> {
@@ -282,6 +349,7 @@ impl Store {
     }
 
     pub fn set_brief(&mut self, brief: Option<&str>) {
+        self.remark("brief", brief);
         self.document.brief = brief.map(str::to_string);
     }
 
@@ -307,6 +375,7 @@ impl Store {
         if name == "tour" {
             return self.set_tour(body);
         }
+        self.remark(name, body);
         let docs = &mut self.document.docs;
         match (docs.iter().position(|d| d.name == name), body) {
             (Some(i), Some(body)) => docs[i].body = body.to_string(),
@@ -648,6 +717,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         pull_requests: Vec::new(),
         quotes: Vec::new(),
         lens: None,
+        marks: Vec::new(),
         unknown: serde_json::Map::new(),
     }))
 }
@@ -812,6 +882,53 @@ mod tests {
         assert!(store.comments_visible());
         assert!(store.annotations().is_empty());
         assert_eq!(store.focus(), None);
+    }
+
+    /// An ask keeps its identity while it asks the same thing, so its answer
+    /// stays with it; reworded, or dropped and asked again, it's a new ask
+    /// that an old answer can't land on.
+    #[test]
+    fn asks_and_headings_keep_their_identity_while_they_say_the_same_thing() {
+        let (state_home, workspace) = roots("marks");
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        let brief =
+            "## Needs you\n\n```ask push\nPush to main?\n```\n\n## Where we stand\n\nBuilding.\n";
+        store.set_brief(Some(brief));
+        let first = store.doc_marks("brief", brief);
+        let push = first.ask(0).unwrap().to_string();
+        let stand = first.heading(1).unwrap().to_string();
+        store.save().unwrap();
+
+        // The same ask, with the section around it rewritten.
+        let mut store = Store::load_at(&state_home, &workspace, None).unwrap();
+        let brief =
+            "## Needs you\n\n```ask push\nPush to main?\n```\n\n## Where we stand\n\nBuilt.\n";
+        store.set_brief(Some(brief));
+        let second = store.doc_marks("brief", brief);
+        assert_eq!(second.ask(0), Some(push.as_str()));
+        assert_ne!(second.heading(1), Some(stand.as_str()));
+
+        // The same id asking something else.
+        let reworded = "```ask push\nPush to main now?\n```\n";
+        store.set_brief(Some(reworded));
+        assert_ne!(
+            store.doc_marks("brief", reworded).ask(0),
+            Some(push.as_str())
+        );
+
+        // Dropped, then asked again word for word.
+        store.set_brief(Some("Nothing needs you."));
+        let again = "```ask push\nPush to main?\n```\n";
+        store.set_brief(Some(again));
+        assert_ne!(store.doc_marks("brief", again).ask(0), Some(push.as_str()));
+
+        // Each document keeps its own, and removing one forgets its marks.
+        store.set_doc("plan", Some(again));
+        let plan = store.doc_marks("plan", again).ask(0).map(str::to_string);
+        assert!(plan.is_some());
+        assert_ne!(plan.as_deref(), store.doc_marks("brief", again).ask(0));
+        store.set_doc("plan", None);
+        assert_eq!(store.doc_marks("plan", again).ask(0), None);
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod input;
 mod job;
 mod link;
 mod markdown;
+mod marks;
 mod serve;
 mod stack;
 mod state;

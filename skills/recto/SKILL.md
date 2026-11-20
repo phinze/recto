@@ -95,10 +95,13 @@ it here and keep it current:
     EOF
 
 Each fenced `ask ID` block is a question Paul answers in place. Its `- `
-lines are offered as choices, and he can add words either way. His answer
-comes back like any other comment, anchored to the ask's ID. Give every new
-question a new ID: the window remembers answers by ID, so a fresh question
-under an ID he already answered shows up as handled.
+lines become choices, and he can add his own words either way. His answer
+comes back like any other comment, labeled with the ask's ID. Answers stick
+to the exact wording of the ask: if you rewrite the briefing and keep an ask
+word for word, it stays answered. Reword an ask, or drop it and bring it back
+later, and it shows up as a fresh question even if you reuse the ID. Comments
+on a section heading work the same way, staying tied to that version of the
+section's text.
 
 When what needs him is an action rather than a decision (click Install on
 the Mac, try the dev window, review the next stacked PR), write a `do ID`

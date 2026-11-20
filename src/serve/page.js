@@ -643,17 +643,30 @@
       const tabName = docSection ? content.querySelector(`nav.tabs button[data-tab="${docSection.id}"]`)?.textContent.trim() : '';
       const what = brief ? 'Briefing' : doc ? tabName : repo ? repo + ' tour' : 'Tour';
       const title = heading ? heading.textContent.trim().replace(/\s*(held|sent|on it|handled|not delivered)$/, '') : '';
-      const anchor = { kind: brief ? 'brief' : doc ? 'doc' : 'tour', repo, section: title, label: title ? what + ' › ' + title : what };
+      // A heading recto marked is known by that mark, so a comment stays with
+      // what the section said rather than landing on a rewrite of it.
+      const section = (heading && heading.dataset.mark) || title;
+      const anchor = { kind: brief ? 'brief' : doc ? 'doc' : 'tour', repo, section, label: title ? what + ' › ' + title : what };
       if (doc) anchor.path = doc;
       return anchor;
     }
     return { kind: 'text', repo, label: repo || 'the page' };
   }
 
+  // An answer is anchored to the ask's mark: recto mints a new one whenever
+  // an ask is reworded or asked again, so an answer from an earlier briefing
+  // can't land on a later ask that reuses its id. An ask saved before marks
+  // existed falls back to its id. The label keeps the id the agent wrote.
+  function askSection(card) {
+    return card.dataset.mark || card.dataset.ask;
+  }
+  function answers(c, card) {
+    return c.anchor.kind === 'ask' && c.anchor.section === askSection(card);
+  }
   function askAnchor(card) {
     const q = card.querySelector('.ask-q').textContent.trim().split('\n')[0];
     const what = card.classList.contains('do') ? 'Do ' : 'Ask ';
-    return { kind: 'ask', section: card.dataset.ask, label: what + card.dataset.ask + ': ' + (q.length > 80 ? q.slice(0, 79) + '…' : q) };
+    return { kind: 'ask', section: askSection(card), label: what + card.dataset.ask + ': ' + (q.length > 80 ? q.slice(0, 79) + '…' : q) };
   }
 
   // rig names another rig the comment is for (an answer to an ask gathered
@@ -920,7 +933,7 @@
         }
       } else if ((a.kind === 'tour' || a.kind === 'brief' || a.kind === 'doc') && a.section) {
         const scope = a.kind === 'doc' ? `section.doc[data-doc="${CSS.escape(a.path || '')}"] ` : '';
-        const h = [...content.querySelectorAll(`${scope}article.${a.kind} h1, ${scope}article.${a.kind} h2`)].find((x) => x.textContent.trim() === a.section);
+        const h = [...content.querySelectorAll(`${scope}article.${a.kind} h1, ${scope}article.${a.kind} h2`)].find((x) => (x.dataset.mark || x.textContent.trim()) === a.section);
         if (h) {
           const b = document.createElement('span');
           b.className = 'c-badge';
@@ -932,8 +945,8 @@
       }
     }
     const answerOf = (card) => card.dataset.rig
-      ? (peerComments[card.dataset.rig] || []).filter((c) => c.anchor.kind === 'ask' && c.anchor.section === card.dataset.ask).pop()
-      : answered.get(card.dataset.ask);
+      ? (peerComments[card.dataset.rig] || []).filter((c) => answers(c, card)).pop()
+      : answered.get(askSection(card));
     for (const card of content.querySelectorAll('.ask')) {
       const c = answerOf(card);
       const slot = card.querySelector('.ask-answer');
@@ -1003,7 +1016,7 @@
   function sendPeer(peer, pressed) {
     const rig = peer.dataset.rig;
     const ids = [...peer.querySelectorAll('.ask')]
-      .map((card) => (peerComments[rig] || []).filter((c) => c.anchor.kind === 'ask' && c.anchor.section === card.dataset.ask).pop())
+      .map((card) => (peerComments[rig] || []).filter((c) => answers(c, card)).pop())
       .filter((c) => c && (c.state === 'held' || c.state === 'failed') && (pressed || !sending.has(c.id)))
       .map((c) => c.id);
     if (!ids.length || !framed) return;

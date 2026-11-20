@@ -35,6 +35,7 @@ use crate::backend::{
     Backend, Base, Commit, Scope, detect_backend_from, repository_root, short_oid,
 };
 use crate::highlight::{Highlighter, expand_tabs, ext_for_path};
+use crate::marks::{Ids, Need, need_fence, need_id};
 use crate::watch::{WatchTree, is_interesting, may_add_directories};
 use crate::{link, markdown, parse_pathspec, state};
 
@@ -701,7 +702,8 @@ fn group_docs(
     match store.brief().filter(|t| !t.trim().is_empty()) {
         Some(brief) => {
             let mut html = String::new();
-            render_group_doc(&ctx, "brief", "", brief, budget, &mut html);
+            let marks = store.doc_marks("brief", brief);
+            render_group_doc(&ctx, "brief", "", brief, &marks, budget, &mut html);
             brief_with(gathered, &html, out);
         }
         None if !gathered.is_empty() => brief_with(gathered, "", out),
@@ -713,7 +715,8 @@ fn group_docs(
         }
         let mut html = String::new();
         let class = if doc.name == "tour" { "tour" } else { "doc" };
-        render_group_doc(&ctx, class, &doc.name, &doc.body, budget, &mut html);
+        let marks = store.doc_marks(&doc.name, &doc.body);
+        render_group_doc(&ctx, class, &doc.name, &doc.body, &marks, budget, &mut html);
         docs.push((doc.name, html));
     }
 }
@@ -755,7 +758,9 @@ fn gather_asks(peers: &[Peer]) -> String {
             );
             continue;
         };
-        let asks = store.brief().map(brief_asks).unwrap_or_default();
+        let brief = store.brief().unwrap_or_default();
+        let asks = brief_asks(brief);
+        let marks = store.doc_marks("brief", brief);
         if asks.is_empty() {
             continue;
         }
@@ -765,8 +770,8 @@ fn gather_asks(peers: &[Peer]) -> String {
             esc(&peer.slug),
             esc(&peer.label)
         );
-        for (kind, id, text) in asks {
-            out.push_str(&ask_html(kind, &id, &text, Some(&peer.slug)));
+        for (n, (kind, id, text)) in asks.into_iter().enumerate() {
+            out.push_str(&ask_html(kind, &id, &text, marks.ask(n), Some(&peer.slug)));
         }
         out.push_str("</div>");
     }
@@ -776,47 +781,13 @@ fn gather_asks(peers: &[Peer]) -> String {
     format!("<section class=gathered><h2>Across rigs</h2>{out}</section>")
 }
 
-/// What needs the person, as a briefing writes it: an `ask` is a question
-/// they answer, a `do` is an action of theirs they mark done. Both keep the
-/// briefing open until they're settled, and both are answered the same way.
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum Need {
-    Ask,
-    Do,
-}
-
-/// Read a fence's info string as an `ask` or `do` block: its kind and the id
-/// it names, if any.
-fn need_fence(info: &str) -> Option<(Need, Option<String>)> {
-    let info = info.trim();
-    let (kind, rest) = if let Some(rest) = info.strip_prefix("ask") {
-        (Need::Ask, rest)
-    } else if let Some(rest) = info.strip_prefix("do") {
-        (Need::Do, rest)
-    } else {
-        return None;
-    };
-    if !(rest.is_empty() || rest.starts_with(char::is_whitespace)) {
-        return None;
-    }
-    Some((kind, rest.split_whitespace().next().map(str::to_string)))
-}
-
-/// The id a block names, or its place among the briefing's blocks.
-fn need_id(kind: Need, id: Option<String>, n: usize) -> String {
-    id.unwrap_or_else(|| match kind {
-        Need::Ask => format!("ask{n}"),
-        Need::Do => format!("do{n}"),
-    })
-}
-
 /// The asks and to-dos in a briefing, as `(kind, id, text)`, numbered the way
 /// `render_doc` numbers a block that names no id.
 fn brief_asks(source: &str) -> Vec<(Need, String, String)> {
     let mut out = Vec::new();
     let mut asking: Option<(Need, String, String)> = None;
     let mut n = 0;
-    for event in Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION) {
+    for event in crate::marks::parser(source) {
         if let Some((_, _, text)) = asking.as_mut() {
             match event {
                 Event::End(TagEnd::CodeBlock) => out.extend(asking.take()),
@@ -848,6 +819,7 @@ fn render_group_doc(
     class: &str,
     name: &str,
     tour: &str,
+    marks: &Ids,
     budget: &mut usize,
     out: &mut String,
 ) {
@@ -899,6 +871,7 @@ fn render_group_doc(
         &ids,
         &label,
         tour,
+        marks,
         budget,
         out,
         &mut |spec, budget, html| {
@@ -1347,10 +1320,15 @@ fn render_workspace(
 
     let tour = tour.filter(|t| !t.trim().is_empty());
     if let Some(tour) = tour.as_deref() {
+        let marks = store
+            .as_ref()
+            .map(|s| s.doc_marks("tour", tour))
+            .unwrap_or_default();
         render_tour(
             &format!("t{index}"),
             "Tour",
             tour,
+            &marks,
             &mut budget,
             out,
             &mut |spec, budget, html| match quoted.get(spec.trim()) {
@@ -2499,28 +2477,31 @@ fn render_tour(
     ids: &str,
     label: &str,
     source: &str,
+    marks: &Ids,
     budget: &mut usize,
     out: &mut String,
     quote: &mut QuoteFn,
 ) {
-    render_doc("tour", ids, label, source, budget, out, quote);
+    render_doc("tour", ids, label, source, marks, budget, out, quote);
 }
 
 /// An agent-written Markdown document: a tour, or the briefing. Headings make
 /// an outline, fenced `recto PATH:SPAN` blocks quote the diff, and fenced
 /// `ask ID` blocks are questions the person answers in place.
+#[allow(clippy::too_many_arguments)]
 fn render_doc(
     class: &str,
     ids: &str,
     label: &str,
     source: &str,
+    marks: &Ids,
     budget: &mut usize,
     out: &mut String,
     quote: &mut QuoteFn,
 ) {
     let mut asking: Option<(Need, String, String)> = None;
     let mut asks = 0;
-    let parser = Parser::new_ext(source, Options::all() - Options::ENABLE_SMART_PUNCTUATION);
+    let parser = crate::marks::parser(source);
     let mut events: Vec<Event> = Vec::new();
     let mut outline: Vec<(String, String)> = Vec::new();
     let mut heading: Option<(String, String)> = None;
@@ -2534,7 +2515,8 @@ fn render_doc(
             match event {
                 Event::End(TagEnd::CodeBlock) => {
                     if let Some((kind, id, text)) = asking.take() {
-                        events.push(Event::Html(ask_html(kind, &id, &text, None).into()));
+                        let mark = marks.ask(asks - 1);
+                        events.push(Event::Html(ask_html(kind, &id, &text, mark, None).into()));
                     }
                 }
                 Event::Text(t) => text.push_str(&t),
@@ -2594,13 +2576,14 @@ fn render_doc(
             Event::Start(Tag::Heading {
                 level: level @ (HeadingLevel::H1 | HeadingLevel::H2),
                 classes,
-                attrs,
+                mut attrs,
                 ..
             }) => {
-                let id = format!(
-                    "{ids}-{}",
-                    outline.len() + usize::from(heading.is_some()) + 1
-                );
+                let n = outline.len() + usize::from(heading.is_some());
+                let id = format!("{ids}-{}", n + 1);
+                if let Some(mark) = marks.heading(n) {
+                    attrs.push(("data-mark".into(), Some(mark.to_string().into())));
+                }
                 heading = Some((id.clone(), String::new()));
                 events.push(Event::Start(Tag::Heading {
                     level,
@@ -2721,7 +2704,7 @@ fn render_doc(
 /// question; an action's only choice is "done". The page sends the answer as
 /// a comment anchored to the block's id, so answering is the same gesture as
 /// commenting, and either kind keeps the briefing open until it's settled.
-fn ask_html(kind: Need, id: &str, text: &str, rig: Option<&str>) -> String {
+fn ask_html(kind: Need, id: &str, text: &str, mark: Option<&str>, rig: Option<&str>) -> String {
     let mut question = Vec::new();
     let mut choices = Vec::new();
     for line in text.lines() {
@@ -2739,6 +2722,9 @@ fn ask_html(kind: Need, id: &str, text: &str, rig: Option<&str>) -> String {
         if kind == Need::Do { " do" } else { "" },
         esc(id)
     );
+    if let Some(mark) = mark {
+        let _ = write!(out, " data-mark=\"{}\"", esc(mark));
+    }
     if let Some(rig) = rig {
         let _ = write!(out, " data-rig=\"{}\"", esc(rig));
     }
@@ -3264,6 +3250,7 @@ mod tests {
             "bg",
             "Briefing",
             "## Needs you\n\nThe demo is at http://foxtrotbase:7745 now.",
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |_, _, _| {},
@@ -3317,6 +3304,7 @@ mod tests {
             "t0",
             "Tour",
             "# One\n\n<script>x</script>\n\n## Two\n\n```recto src/a.rs:2\n```\n",
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |spec, budget, html| quote_html(0, spec, spec, &files, budget, html),
@@ -3349,6 +3337,7 @@ mod tests {
             "tour",
             "tour",
             "# Across\n\n```recto beta/src/a.rs:2\n```\n\n```recto gamma/x.rs:1\n```\n",
+            &Ids::default(),
             &mut 0,
             &mut out,
         );
@@ -3373,6 +3362,28 @@ mod tests {
     }
 
     #[test]
+    fn marked_asks_and_headings_carry_their_identity() {
+        let mut out = String::new();
+        let marks = Ids {
+            asks: vec![Some("mask".into())],
+            headings: vec![None, Some("mhead".into())],
+        };
+        render_doc(
+            "brief",
+            "bg",
+            "Briefing",
+            "## Needs you\n\n```ask q1\nShip?\n```\n\n## Where we stand\n\nBuilding.\n",
+            &marks,
+            &mut 0,
+            &mut out,
+            &mut |_, _, _| {},
+        );
+        assert!(out.contains("data-ask=\"q1\" data-mark=\"mask\""), "{out}");
+        assert!(out.contains("<h2 id=\"bg-1\">"), "{out}");
+        assert!(out.contains("data-mark=\"mhead\""), "{out}");
+    }
+
+    #[test]
     fn ask_blocks_become_cards_with_choices() {
         let mut out = String::new();
         render_doc(
@@ -3380,6 +3391,7 @@ mod tests {
             "bg",
             "Briefing",
             "## Needs you\n\n```ask q1\nFold the list <by default>?\n- folded\n- open\n```\n\n```ask\nAnything else?\n```\n",
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |_, _, _| {},
@@ -3404,6 +3416,7 @@ mod tests {
             "bg",
             "Briefing",
             "## Needs you\n\n```do mac-install\nClick Install on the Mac.\n- it may ask for Touch ID\n```\n\n```do\nTry the dev pill.\n```\n\n```dog\nnot a do\n```\n",
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |_, _, _| {},
@@ -3444,7 +3457,12 @@ mod tests {
         let ids: Vec<&str> = asks.iter().map(|(_, id, _)| id.as_str()).collect();
         assert_eq!(ids, ["q1", "ask2"]);
         assert_eq!(asks[0].2, "Ship?\n- yes\n");
-        let card = ask_html(Need::Ask, "q1", &asks[0].2, Some("other-rig"));
+        let card = ask_html(Need::Ask, "q1", &asks[0].2, None, Some("other-rig"));
+        let marked = ask_html(Need::Ask, "q1", &asks[0].2, Some("m123"), None);
+        assert!(
+            marked.contains("data-ask=\"q1\" data-mark=\"m123\""),
+            "{marked}"
+        );
         assert!(
             card.contains("data-ask=\"q1\" data-rig=\"other-rig\""),
             "{card}"
@@ -3493,6 +3511,7 @@ mod tests {
             "t0",
             "Tour",
             "[x](javascript:alert(1)) [ok](https://example.com) [rel](#t0-1) ![pic](https://tracker/p.png)",
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |_, _, _| {},
@@ -3511,6 +3530,7 @@ mod tests {
             "t0",
             "Tour",
             "```mermaid\nflowchart LR\n  A[<b>x</b>] --> B\n```\n\n```mermaidish\nplain\n```\n",
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |_, _, _| {},
@@ -3532,6 +3552,7 @@ mod tests {
             &format!(
                 "![shot](recto-asset:{hash}.png) ![forged](recto-asset:../x.png) ![outer ![inner](https://t/i.png)](recto-asset:{hash}.svg)"
             ),
+            &Ids::default(),
             &mut 0,
             &mut out,
             &mut |_, _, _| {},
