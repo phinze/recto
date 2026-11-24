@@ -252,6 +252,17 @@ fn handle(mut stream: UnixStream) {
             let _ = stream.write_all(head.as_bytes());
             let _ = stream.write_all(PELE.as_bytes());
         }
+        path if path.starts_with("/font/") => match font(&path["/font/".len()..]) {
+            Some(bytes) => {
+                let head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: font/woff2\r\nContent-Length: {}\r\nCache-Control: private, max-age=31536000, immutable\r\nConnection: close\r\n\r\n",
+                    bytes.len()
+                );
+                let _ = stream.write_all(head.as_bytes());
+                let _ = stream.write_all(bytes);
+            }
+            None => respond(&mut stream, "404 Not Found", "text/plain", b"not found\n"),
+        },
         path if path.starts_with("/asset/") => asset(&mut stream, &path["/asset/".len()..]),
         _ => respond(&mut stream, "404 Not Found", "text/plain", b"not found\n"),
     }
@@ -2957,6 +2968,21 @@ const JS: &str = include_str!("serve/page.js");
 const PELE: &str = include_str!("serve/vendor/pele.js");
 const PELE_PATH: &str = "/pele-1.13.0.js";
 
+/// The window's face, Allo by Josh Puckett (SIL OFL 1.1,
+/// `serve/vendor/fonts/OFL.txt`), bundled so prose sets the same on every
+/// machine and the page still fetches nothing from off this server. The full
+/// variable font, since the page varies its roundness. Versioned names, so
+/// the browser may keep them forever.
+fn font(name: &str) -> Option<&'static [u8]> {
+    match name {
+        "allo-variable-1.1.0.woff2" => {
+            Some(include_bytes!("serve/vendor/fonts/allo-variable.woff2"))
+        }
+        "allo-oblique-1.1.0.woff2" => Some(include_bytes!("serve/vendor/fonts/allo-oblique.woff2")),
+        _ => None,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -3353,6 +3379,20 @@ mod tests {
         assert!(out.contains("new();"), "{out}");
         assert!(out.contains("no repo here by that name"), "{out}");
         assert!(out.contains("id=\"tg-1\""), "{out}");
+    }
+
+    #[test]
+    fn the_reading_face_is_served_by_exact_name_only() {
+        for name in ["allo-variable-1.1.0.woff2", "allo-oblique-1.1.0.woff2"] {
+            let bytes = font(name).expect(name);
+            assert_eq!(&bytes[..4], b"wOF2", "{name} is WOFF2");
+        }
+        for name in ["", "allo-variable.woff2", "../serve.rs", "OFL.txt"] {
+            assert!(font(name).is_none(), "{name:?}");
+        }
+        // The page asks for the same names the route serves.
+        assert!(CSS.contains("url(\"font/allo-variable-1.1.0.woff2\")"));
+        assert!(CSS.contains("url(\"font/allo-oblique-1.1.0.woff2\")"));
     }
 
     #[test]
