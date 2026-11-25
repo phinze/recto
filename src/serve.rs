@@ -580,7 +580,8 @@ fn fragment(req: &Request) -> String {
     if roots.is_empty() && docs.is_empty() && out.is_empty() {
         out.push_str("<p class=empty>Nothing here yet. This group has no repositories, and no briefing or docs have been written for it (<code>recto brief</code>, <code>recto doc NAME</code>).</p>");
     }
-    let tabbed = roots.len() + docs.len() > 1;
+    let pr_count: usize = rendered.iter().map(|(_, s)| s.prs.len()).sum();
+    let tabbed = roots.len() + docs.len() + pr_count > 1;
     if tabbed {
         // Docs and repos read as tabs, one shown at a time. The page picks
         // which; the server only suggests a default: the group's tour, else
@@ -633,6 +634,13 @@ fn fragment(req: &Request) -> String {
                 );
             }
             out.push_str("</button>");
+            for (id, label) in &sum.prs {
+                let _ = write!(
+                    out,
+                    "<button type=button class=pr-tab data-tab=\"{id}\">{}</button>",
+                    esc(label)
+                );
+            }
         }
         out.push_str("</nav>");
     }
@@ -959,6 +967,10 @@ struct Summary {
     removed: u32,
     tour: bool,
     error: bool,
+    /// The attached PRs' own pages, as `(id, tab label)`, and their HTML,
+    /// which follows the repo's section on the page.
+    prs: Vec<(String, String)>,
+    pr_html: String,
 }
 
 /// Rendered sections, keyed by everything a section depends on: the repo's
@@ -1063,6 +1075,7 @@ fn render_section(
         }
     };
     out.push_str("</section>");
+    out.push_str(&summary.pr_html);
     (out, summary)
 }
 
@@ -1407,6 +1420,39 @@ fn render_workspace(
     } else if !files.is_empty() {
         render_files(index, &files, drafts, front_pr, &mut budget, out);
     }
+    // Each attached PR gets a page of its own, opening onto the layer that
+    // carries it, or the whole stack when nothing narrower does.
+    let layers = crate::stack::layers(&commits);
+    let mut pr_tabs = Vec::new();
+    let mut pr_html = String::new();
+    for pr in &prs {
+        let view = layers
+            .iter()
+            .filter(|_| layers.len() > 1)
+            .find(|l| layer_pr(&prs, l).is_some_and(|p| p.number == pr.number))
+            .map(|l| l.view())
+            .unwrap_or_default();
+        let review = store.as_ref().and_then(|s| {
+            s.review(&link::PullRequestRef {
+                repository: pr.repository.clone(),
+                number: pr.number,
+                head_oid: pr.head_oid.clone(),
+            })
+        });
+        let id = format!("pr-{index}-{}", pr.number);
+        pr_page(
+            &PrPage {
+                id: &id,
+                index,
+                repo: &repo_name(&root),
+                view: &view,
+                pr,
+                review: review.as_ref(),
+            },
+            &mut pr_html,
+        );
+        pr_tabs.push((id, format!("#{} {}", pr.number, pr.title)));
+    }
     Ok(Summary {
         root: Some(root),
         files: files.len(),
@@ -1415,7 +1461,195 @@ fn render_workspace(
         removed,
         tour: tour.is_some(),
         error: false,
+        prs: pr_tabs,
+        pr_html,
     })
+}
+
+/// What a PR's page is drawn from: its snapshot, the review being drafted on
+/// it, and the view of its repo that shows its code.
+struct PrPage<'a> {
+    id: &'a str,
+    index: usize,
+    repo: &'a str,
+    view: &'a str,
+    pr: &'a link::PullRequest,
+    review: Option<&'a state::RestoredReview>,
+}
+
+/// A pull request as a page of its own: who opened it and where it merges,
+/// its description, the review being drafted on it, the conversation, and
+/// the threads still open on its code. Its files are the repo's to show, at
+/// the layer that carries it.
+fn pr_page(page: &PrPage, out: &mut String) {
+    let PrPage {
+        id,
+        index,
+        repo,
+        view,
+        pr,
+        review,
+    } = *page;
+    let who = |a: &link::Actor| esc(a.name.as_deref().unwrap_or(&a.login));
+    let day = |t: &str| esc(t.get(..10).unwrap_or(t));
+    let _ = write!(
+        out,
+        "<section class=pr id=\"{id}\" data-pr={} data-repo-index={index}><header class=pr-head><div class=pr-meta><b>{}</b> <a href=\"{}\" target=_blank rel=noopener>{}#{}</a> <span>by {}</span> <span class=pr-refs><code>{}</code> ← <code>{}</code></span></div><h1>{}</h1><button type=button class=pr-files data-view=\"{index}:{}\">Its code in {}</button></header>",
+        pr.number,
+        esc(repo),
+        esc(&pr.url),
+        esc(&pr.repository),
+        pr.number,
+        who(&pr.author),
+        esc(&pr.base_ref),
+        esc(&pr.head_ref),
+        esc(&pr.title),
+        esc(view),
+        esc(repo),
+    );
+    let _ = write!(
+        out,
+        "<h2 id=\"{id}-desc\">Description</h2><article class=\"doc pr-body\">{}</article>",
+        if pr.body.trim().is_empty() {
+            "<p class=dim>No description.</p>".to_string()
+        } else {
+            github_markdown(&pr.body)
+        }
+    );
+    if let Some(r) =
+        review.filter(|r| r.verdict.is_some() || r.body.is_some() || !r.comments.is_empty())
+    {
+        let _ = write!(
+            out,
+            "<h2 id=\"{id}-review\">Your review draft</h2><div class=pr-review data-pr={}><div class=review-verdict><span>verdict</span> <b>{}</b></div>",
+            pr.number,
+            r.verdict.map_or("not chosen yet", |v| v.label())
+        );
+        match r.body.as_ref().filter(|b| !b.body.trim().is_empty()) {
+            Some(b) => {
+                let _ = write!(
+                    out,
+                    "<div class=review-body>{}</div>",
+                    small_markdown(&b.body)
+                );
+            }
+            None => out.push_str("<p class=dim>No summary yet.</p>"),
+        }
+        for d in &r.comments {
+            draft_card(d, slate_number(&r.comments, d), Some(pr.number), out);
+        }
+        out.push_str("</div>");
+    }
+    // The conversation, comments and reviews in the order they came, with
+    // bots quieted so the people stand out.
+    let mut said: Vec<(&str, String)> = pr
+        .conversation
+        .iter()
+        .map(|c| {
+            (
+                c.created_at.as_str(),
+                format!(
+                    "<div class=\"tl{}\"><div class=tl-head><span class=tl-who>{}</span> <span class=dim>{}</span></div>{}</div>",
+                    if c.author.bot { " tl-bot" } else { "" },
+                    who(&c.author),
+                    day(&c.created_at),
+                    github_markdown(&c.body)
+                ),
+            )
+        })
+        .collect();
+    // A reviewer's newer review supersedes their earlier ones, and a bot's
+    // say is rarely the point: both fold to their heading.
+    let latest: HashMap<&str, usize> = pr
+        .reviews
+        .iter()
+        .enumerate()
+        .map(|(i, r)| (r.author.login.as_str(), i))
+        .collect();
+    for (i, r) in pr.reviews.iter().enumerate() {
+        let verb = match r.state {
+            link::ReviewState::Approved => "approved",
+            link::ReviewState::ChangesRequested => "requested changes",
+            link::ReviewState::Dismissed => "review dismissed",
+            link::ReviewState::Pending => "review pending",
+            _ => "reviewed",
+        };
+        if r.body.trim().is_empty() && verb == "reviewed" {
+            continue;
+        }
+        let when = r.submitted_at.as_deref().unwrap_or("");
+        let head = format!(
+            "<span class=tl-who>{}</span> <span class=\"tl-verb {}\">{verb}</span> <span class=dim>{}</span>",
+            who(&r.author),
+            format!("{:?}", r.state).to_lowercase(),
+            day(when),
+        );
+        let superseded = latest.get(r.author.login.as_str()) != Some(&i);
+        let html = if superseded || r.author.bot {
+            format!(
+                "<details class=\"tl tl-fold\"><summary class=tl-head>{head}{}</summary>{}</details>",
+                if superseded {
+                    " <span class=dim>· superseded</span>"
+                } else {
+                    ""
+                },
+                github_markdown(&r.body)
+            )
+        } else {
+            format!(
+                "<div class=tl><div class=tl-head>{head}</div>{}</div>",
+                github_markdown(&r.body)
+            )
+        };
+        said.push((when, html));
+    }
+    said.sort_by(|a, b| a.0.cmp(b.0));
+    let _ = write!(out, "<h2 id=\"{id}-conv\">Conversation</h2>");
+    if said.is_empty() {
+        out.push_str("<p class=dim>Nobody has said anything yet.</p>");
+    } else {
+        out.push_str("<div class=timeline>");
+        for (_, html) in said {
+            out.push_str(&html);
+        }
+        out.push_str("</div>");
+    }
+    let (open, settled): (Vec<&link::ReviewThread>, Vec<&link::ReviewThread>) =
+        pr.threads.iter().partition(|t| t.is_open());
+    if !open.is_empty() || !settled.is_empty() {
+        let _ = write!(out, "<h2 id=\"{id}-threads\">Threads on the code</h2>");
+        for t in &open {
+            let Some(first) = t.comments.first() else {
+                continue;
+            };
+            let line = t
+                .line
+                .or(t.original_line)
+                .map(|l| format!(":{l}"))
+                .unwrap_or_default();
+            let _ = write!(
+                out,
+                "<div class=pr-thread><div class=tl-head><code>{}{line}</code> <span class=tl-who>{}</span>{}</div>{}</div>",
+                esc(&t.path),
+                who(&first.author),
+                match t.comments.len() - 1 {
+                    0 => String::new(),
+                    1 => " <span class=dim>· 1 reply</span>".into(),
+                    n => format!(" <span class=dim>· {n} replies</span>"),
+                },
+                github_markdown(&first.body)
+            );
+        }
+        if !settled.is_empty() {
+            let _ = write!(
+                out,
+                "<p class=dim>{} resolved or outdated thread{}</p>",
+                settled.len(),
+                if settled.len() == 1 { "" } else { "s" }
+            );
+        }
+    }
+    out.push_str("</section>");
 }
 
 /// The base a page diffs from once a rig's starting commit is known, and how
@@ -2299,10 +2533,49 @@ fn stored_image(dest: &str) -> Option<String> {
 /// the same rules as a tour: raw HTML shows as text, links only go somewhere
 /// safe, and images never load.
 fn small_markdown(body: &str) -> String {
+    markdown_with(body, |t| t.to_string())
+}
+
+/// Text written on GitHub, where bots and templates lean on raw HTML
+/// (`<details>`, `<summary>`, `<!-- markers -->`). Its tags and comments
+/// drop out and their words stay, still as text: nothing it says renders.
+fn github_markdown(body: &str) -> String {
+    markdown_with(body, strip_tags)
+}
+
+fn strip_tags(html: &str) -> String {
+    let mut out = String::new();
+    let mut rest = html;
+    while let Some(at) = rest.find('<') {
+        out.push_str(&rest[..at]);
+        let tail = &rest[at..];
+        let end = if tail.starts_with("<!--") {
+            tail.find("-->").map(|e| e + 3)
+        } else if tail[1..].starts_with(|c: char| c.is_ascii_alphabetic() || c == '/') {
+            tail.find('>').map(|e| e + 1)
+        } else {
+            None
+        };
+        match end {
+            Some(e) => {
+                out.push(' ');
+                rest = &tail[e..];
+            }
+            None => {
+                out.push('<');
+                rest = &tail[1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
+fn markdown_with(body: &str, raw: impl Fn(&str) -> String) -> String {
     let events =
         Parser::new_ext(body, Options::all() - Options::ENABLE_SMART_PUNCTUATION).map(|event| {
             match event {
-                Event::Html(t) | Event::InlineHtml(t) => Event::Text(t),
+                Event::Html(t) | Event::InlineHtml(t) => Event::Text(raw(&t).into()),
                 Event::Start(Tag::Link {
                     link_type,
                     dest_url,
@@ -3488,6 +3761,72 @@ mod tests {
         assert!(out.contains("data-choice=\"open\""), "{out}");
         // An ask without an id gets one by position.
         assert!(out.contains("data-ask=\"ask2\""), "{out}");
+    }
+
+    /// A PR's page: its description as the author wrote it on GitHub, with
+    /// raw HTML reduced to its words, a reviewer's earlier reviews folded
+    /// under their newest, and a way into its code at the layer carrying it.
+    #[test]
+    fn a_pull_request_reads_as_a_page_of_its_own() {
+        let review = |who: &str, at: &str, body: &str| link::ReviewSummary {
+            author: link::Actor {
+                login: who.into(),
+                name: None,
+                bot: false,
+            },
+            body: body.into(),
+            state: link::ReviewState::Commented,
+            submitted_at: Some(at.into()),
+            commit_oid: None,
+        };
+        let pr = link::PullRequest {
+            body: "## Why\n\n<!-- template -->Because <b>reasons</b>.\n\n<script>x</script>".into(),
+            reviews: vec![
+                review("bot-ish", "2026-10-01T00:00:00Z", "first pass"),
+                review("bot-ish", "2026-10-02T00:00:00Z", "second pass"),
+            ],
+            ..crate::testing::empty_pull_request("base")
+        };
+        let mut out = String::new();
+        pr_page(
+            &PrPage {
+                id: "pr-0-42",
+                index: 0,
+                repo: "repo",
+                view: "layer:abc",
+                pr: &pr,
+                review: None,
+            },
+            &mut out,
+        );
+        assert!(out.starts_with("<section class=pr id=\"pr-0-42\""), "{out}");
+        assert!(out.contains("data-view=\"0:layer:abc\""), "{out}");
+        assert!(out.contains("Because  reasons ."), "{out}");
+        assert!(
+            !out.contains("template") && !out.contains("<script>") && !out.contains("&lt;b&gt;"),
+            "{out}"
+        );
+        assert!(
+            out.contains("tl-fold\"><summary class=tl-head><span class=tl-who>bot-ish</span>"),
+            "the earlier review folds: {out}"
+        );
+        assert_eq!(out.matches("superseded").count(), 1, "{out}");
+        assert!(
+            out.contains("<div class=tl><div class=tl-head><span class=tl-who>bot-ish"),
+            "{out}"
+        );
+        assert!(
+            !out.contains("pr-0-42-review"),
+            "no draft, no section: {out}"
+        );
+    }
+
+    #[test]
+    fn github_text_keeps_its_words_and_drops_its_tags() {
+        assert_eq!(strip_tags("<details><summary>ok</summary>"), "  ok ");
+        assert_eq!(strip_tags("a <!-- hidden --> b"), "a   b");
+        assert_eq!(strip_tags("1 < 2 and <3"), "1 < 2 and <3");
+        assert_eq!(strip_tags("<!-- never closed"), "<!-- never closed");
     }
 
     /// An ask carries the agent's own pick on a `pick:` line, shown apart

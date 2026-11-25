@@ -497,12 +497,17 @@ when they tell you to, never on your own judgment.
 
 ### In the web window
 
-The web window shows the draft too: the verdict and summary at the top of
-the repo, and each inline comment under the last line it's about. With no
-terminal Recto running, the review commands write the saved draft directly
-and answer the same way, and `recto pr URL` attaches the PR for the window.
-`recto review-focus ID` points the window at that draft's lines; the summary
-needs no focusing, since it heads the repo.
+The web window gives each attached PR a page of its own, under "Pull
+requests" in its rail: the description, the whole review draft (verdict,
+summary and every inline comment), the conversation with superseded and bot
+reviews folded, and the threads still open on the code, with a button into
+the repo at the layer that carries the PR. The repo shows the draft as well:
+the verdict and summary at its top, and each inline comment under the last
+line it's about. With no terminal Recto running, the review commands write
+the saved draft directly and answer the same way, and `recto pr URL`
+attaches the PR for the window. `recto review-focus ID` points the window at
+that draft's lines; the summary needs no focusing, since it heads the PR's
+page.
 Paul steers a draft by selecting text in it and commenting. That comment
 arrives like any other, anchored as `REPO draft ✎N (id ID) on PATH:LINES` or
 `REPO review summary`. Revise with `recto review-comment --id ID` or

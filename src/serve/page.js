@@ -247,7 +247,7 @@
     if (railReady) {
       // A doc picked by key joins the flow of pages at its place.
       if (remember && railOn.matches && sec && hasPages()) {
-        const page = !sec.matches('section.repo');
+        const page = !sec.matches('section.repo, section.pr');
         setPages(page);
         if (page) window.scrollTo({ top: sec.getBoundingClientRect().top + window.scrollY - 16 });
       }
@@ -465,6 +465,11 @@
       views.set(ri, rest.join(':'));
       saveViews();
       pick.classList.add('pending');
+      // From a PR's page, its code: the repo, at the layer carrying it.
+      if (pick.closest('section.pr') && document.getElementById('repo-' + ri)) {
+        activate('repo-' + ri, true);
+        window.scrollTo(0, 0);
+      }
       repoRefresh(ri, pick.classList.contains('step'));
       return;
     }
@@ -1130,10 +1135,10 @@
       let stored = null;
       try { stored = sessionStorage.getItem(placeKey); } catch {}
       const act = content.querySelector('.tabbed > section.active');
-      pagesMode = openAsks().length > 0 || stored === '1' || (stored === null && !(act && act.matches('section.repo')));
+      pagesMode = openAsks().length > 0 || stored === '1' || (stored === null && !(act && act.matches('section.repo, section.pr')));
     }
     if (!hasPages()) pagesMode = false;
-    else if (!content.querySelector('section.repo')) pagesMode = true;
+    else if (!content.querySelector('section.repo, section.pr')) pagesMode = true;
     const brief = content.querySelector('details.group-brief');
     if (brief) brief.open = true;
     document.body.classList.toggle('pages-mode', pagesMode);
@@ -1157,7 +1162,8 @@
         const sec = document.getElementById(b.dataset.tab);
         const name = (b.childNodes[b.querySelector('.tour-dot') ? 1 : 0]?.textContent || b.textContent).trim();
         const stat = b.querySelector('.stat');
-        return { sec, name, kind: sec && sec.matches('section.repo') ? 'code' : 'page', stat: stat ? stat.innerHTML : '', active: sec && sec.classList.contains('active') };
+        const kind = !sec ? 'page' : sec.matches('section.repo') ? 'code' : sec.matches('section.pr') ? 'pr' : 'page';
+        return { sec, name, kind, stat: stat ? stat.innerHTML : '', active: sec && sec.classList.contains('active') };
       }).filter((s) => s.sec);
     }
     const out = [];
@@ -1165,6 +1171,7 @@
     if (tour) out.push({ sec: tour, name: 'Tour', kind: 'page', stat: '', active: true });
     for (const sec of content.querySelectorAll('main > section.doc')) out.push({ sec, name: sec.querySelector('.tour-label')?.textContent || sec.dataset.doc || '', kind: 'page', stat: '', active: true });
     for (const sec of content.querySelectorAll('section.repo')) out.push({ sec, name: sec.dataset.repo || '', kind: 'code', stat: '', active: true });
+    for (const sec of content.querySelectorAll('main > section.pr')) out.push({ sec, name: sec.querySelector('h1')?.textContent || '', kind: 'pr', stat: '', active: true });
     return out;
   }
   // A page's headings, each marked while an ask under it is open.
@@ -1194,6 +1201,16 @@
       html += '<div class=rail-group>Pages</div>';
       if (brief) pageRow(':brief', 'Overview', brief);
       for (const s of pages) pageRow(s.sec.id || ':group-tour', s.name, s.sec);
+    }
+    // A pull request is a place of its own, between the reading and the code
+    // it's about: its description, review draft and conversation.
+    const prs = secs.filter((s) => s.kind === 'pr');
+    if (prs.length) html += '<div class=rail-group>Pull requests</div>';
+    for (const s of prs) {
+      const on = s.active && !pagesMode;
+      const repo = s.sec.querySelector('.pr-meta b')?.textContent || '';
+      html += `<button type=button class="rail-top${on ? ' active' : ''}" data-rail="${escHTML(s.sec.id)}"><span class=rail-name>${escHTML(s.name)} <span class=rail-sub>${escHTML(repo)}</span></span></button>`;
+      if (on) html += '<div class=rail-kids>' + [...s.sec.querySelectorAll(':scope > h2[id]')].map((h) => `<button type=button class=toc-h data-goto="${escHTML(h.id)}"><span class=rail-name>${escHTML(h.textContent.replace(/\s*(held|sent|on it|handled|not delivered)$/, '').trim())}</span></button>`).join('') + '</div>';
     }
     if (code.length) html += '<div class=rail-group>Code</div>';
     for (const s of code) {

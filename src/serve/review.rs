@@ -31,7 +31,7 @@ pub(crate) fn respond_offline(request: &link::Request) -> Option<link::Response>
 pub(crate) fn focus_offline(id: Option<u64>) -> i32 {
     let Some(id) = id else {
         eprintln!(
-            "recto: no viewer running; the web window shows the summary at the top of the repo"
+            "recto: no viewer running; the web window shows the summary on the PR's own page"
         );
         return 0;
     };

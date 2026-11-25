@@ -470,7 +470,8 @@ figure.quote tr:not(.del) .sig { visibility: hidden; }
   .tabbed section.repo:has(> .lensbar) details.file > summary, section.repo:has(> .lensbar) details.file > summary { top: 42px; }
   /* The pages read as one flow, and each repo is a place of its own. */
   body.pages-mode .tabbed > section.doc { display: block; }
-  body.pages-mode :is(.tabbed > section.repo, main > section.repo) { display: none; }
+  body.pages-mode :is(.tabbed > section.repo, main > section.repo, .tabbed > section.pr, main > section.pr) { display: none; }
+  body:not(.pages-mode) main > section.pr:not(.active) { display: none; }
   body:not(.pages-mode) :is(details.group-brief, .group-tour, main > section.doc) { display: none; }
   body.pages-mode :is(section.doc, .group-tour) { margin-top: 64px; padding-top: 40px; border-top: 1px solid var(--surface0); }
   body.pages-mode :is(section.doc, .group-tour):first-child { margin-top: 0; padding-top: 0; border-top: 0; }
@@ -523,3 +524,44 @@ figure.quote tr:not(.del) .sig { visibility: hidden; }
 .rail-kids .toc-v .toc-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .rail-kids .toc-change { padding-left: 20px; }
 .rail-kids .toc-whole .rev-id { display: none; }
+
+/* ---- A pull request's page -------------------------------------------------
+   Who opened it and where it merges, then its description, the review being
+   drafted, the conversation and the threads on its code. */
+.rail-sub { font-weight: 400; color: var(--overlay0); font-size: 12.5px; }
+section.pr { max-width: var(--measure); }
+header.pr-head { margin: 4px 0 8px; }
+.pr-meta { display: flex; flex-wrap: wrap; gap: 4px 12px; align-items: baseline; font-size: var(--t-sm); color: var(--subtext); }
+.pr-meta b { color: var(--text); }
+.pr-meta a { color: var(--blue); }
+.pr-refs code { font-size: 12.5px; }
+header.pr-head h1 { font: 700 var(--t-h1)/1.2 var(--sans); letter-spacing: -0.015em; margin: 10px 0 14px; }
+.pr-files { font: 600 var(--t-ui) var(--sans); color: var(--text); background: var(--surface0); border: 1px solid var(--surface1); border-radius: 999px; padding: 6px 16px; cursor: pointer; --rond: var(--rond-you); }
+.pr-files:hover { border-color: var(--overlay0); }
+section.pr > h2 { font: 650 var(--t-h2)/1.25 var(--sans); margin: 40px 0 14px; scroll-margin-top: 16px; }
+.pr-review { background: var(--mantle); border: 1px solid var(--surface1); border-radius: 12px; padding: 14px 20px; }
+.pr-review .review-verdict { display: flex; gap: 10px; align-items: baseline; margin-bottom: 8px; }
+.pr-review .review-verdict span { color: var(--overlay0); font-size: var(--t-sm); }
+.timeline { border-left: 2px solid var(--surface0); padding-left: 18px; }
+.tl, .pr-thread { margin: 0 0 20px; }
+.tl-head { font-size: var(--t-ui); margin-bottom: 4px; display: flex; gap: 8px; align-items: baseline; flex-wrap: wrap; }
+.tl-who { font-weight: 650; }
+.tl-verb.approved { color: var(--green); }
+.tl-verb.changesrequested { color: var(--red); }
+.tl > :not(.tl-head), .pr-thread > :not(.tl-head) { color: var(--subtext); font-size: 15.5px; }
+.tl > p, .pr-thread > p { margin: 0 0 8px; }
+.tl-bot { opacity: 0.6; }
+.tl-fold > summary { cursor: pointer; list-style: none; color: var(--subtext); }
+.tl-fold > summary::-webkit-details-marker { display: none; }
+.tl-fold > summary::before { content: "▸"; color: var(--overlay0); font-size: 11px; }
+.tl-fold[open] > summary::before { content: "▾"; }
+.tl-fold:not([open]) { margin-bottom: 8px; }
+/* The description is the author's document: set apart, its headings a step
+   below the page's own. */
+section.pr article.pr-body { border: 1px solid var(--surface0); border-radius: 12px; padding: 4px 24px 8px; }
+section.pr article.pr-body :is(h1, h2) { font: 650 var(--t-h3)/1.3 var(--sans); margin: 22px 0 8px; }
+section.pr article.pr-body h3 { font: 650 var(--t-body)/1.3 var(--sans); margin: 18px 0 6px; }
+/* A PR's rail row keeps its repo in view under a long title. */
+.rail-top[data-rail^="pr-"] .rail-name { white-space: normal; line-height: 1.3; }
+.rail-top[data-rail^="pr-"] .rail-sub { display: block; margin-top: 2px; }
+.pr-thread { padding: 12px 16px; border: 1px solid var(--surface0); border-radius: 10px; }
