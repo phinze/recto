@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
@@ -196,6 +196,13 @@ pub trait Backend: Send + Sync {
     /// The commits in `from..to`, newest first, each with its diffstat.
     fn commits(&self, _from: &str, _to: &str) -> Result<Vec<Commit>> {
         Ok(Vec::new())
+    }
+    /// The changes in `from..to` that were made in this workspace, as
+    /// [`Commit::change`] names them. Authorship can't say this: the same
+    /// person works in many workspaces of one repository, and a merged pull
+    /// request brings their commits in from somewhere else.
+    fn made_here(&self, _from: &str, _to: &str) -> HashSet<String> {
+        HashSet::new()
     }
     /// The unified diff of a run of commits, from just below `bottom` to
     /// `top`: one layer of a stack, the way a PR made of it reads.
@@ -822,6 +829,59 @@ impl Backend for JjBackend {
         ])?;
         Ok(parse_commits(&out, &me))
     }
+
+    /// A change was made here when it was born as this workspace's working
+    /// copy: `jj new`, `jj commit` and `jj split` all start a change as `@`.
+    /// The evolog names the operation each change began in, and asking what
+    /// `@` was at those operations names the ones that began here. Work that
+    /// arrived by a fetch, like a pull request merged on GitHub, began as
+    /// nobody's `@`. So did a change made with `jj new --no-edit`, which
+    /// then reads as someone else's, the safe way to be wrong.
+    fn made_here(&self, from: &str, to: &str) -> HashSet<String> {
+        let Ok(evolog) = self.run(&[
+            "evolog",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            &format!("({from})..({to})"),
+            "-T",
+            "if(operation, commit.change_id() ++ \" \" ++ operation.id() ++ \"\\n\")",
+        ]) else {
+            return HashSet::new();
+        };
+        // Each change's entries run newest first, so its last is its birth.
+        let mut born: HashMap<&str, &str> = HashMap::new();
+        for (change, op) in evolog.lines().filter_map(|l| l.split_once(' ')) {
+            born.insert(change, op);
+        }
+        let ops: HashSet<&str> = born.values().copied().collect();
+        if ops.is_empty() {
+            return HashSet::new();
+        }
+        // `present` because this workspace may not have existed yet.
+        let revset = ops
+            .iter()
+            .map(|op| format!("at_operation({op}, present(@))"))
+            .collect::<Vec<_>>()
+            .join(" | ");
+        let Ok(was_here) = self.run(&[
+            "log",
+            "--ignore-working-copy",
+            "--no-graph",
+            "-r",
+            &revset,
+            "-T",
+            "change_id ++ \"\\n\"",
+        ]) else {
+            return HashSet::new();
+        };
+        was_here
+            .lines()
+            .map(str::trim)
+            .filter(|c| born.contains_key(c))
+            .map(str::to_string)
+            .collect()
+    }
 }
 
 pub struct GitBackend {
@@ -1191,6 +1251,22 @@ impl Backend for GitBackend {
             rows.push('\n');
         }
         Ok(parse_commits(&rows, &me))
+    }
+
+    /// Git keeps no record of which checkout made a commit, so this is the
+    /// commits you authored, less merges: a merged pull request's merge
+    /// carries your name and brings in work from another branch.
+    fn made_here(&self, from: &str, to: &str) -> HashSet<String> {
+        let Ok(singles) = self.run(&["rev-list", "--no-merges", &format!("{from}..{to}")]) else {
+            return HashSet::new();
+        };
+        let singles: HashSet<&str> = singles.lines().collect();
+        self.commits(from, to)
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|c| c.mine && singles.contains(c.id.as_str()))
+            .map(|c| c.change)
+            .collect()
     }
 }
 
@@ -1887,7 +1963,40 @@ mod tests {
         let branch = backend.default_bases().remove(0);
         let anchor = crate::serve::anchor(&backend, &branch, Some(&start), true);
         assert_eq!(anchor.base, branch);
-        assert!(anchor.note.unwrap().contains("other people"));
+        assert!(anchor.note.unwrap().contains("from elsewhere"));
+    }
+
+    /// The cloud-api-metadata-prototype case: the same person lands work on
+    /// trunk from another workspace of the repository, a direct push and a
+    /// merged branch, while this one still has its own work on top.
+    #[test]
+    fn page_keeps_the_branch_point_when_another_workspace_landed_your_work() {
+        let (repo, _remote, start) = jj_trunk_repo("jj-anchor-other-rig");
+        let other = TempRepo::new("jj-anchor-other-rig-ws");
+        std::fs::remove_dir(&other.0).unwrap();
+        repo.run(
+            "jj",
+            &["workspace", "add", "-r", "main", other.0.to_str().unwrap()],
+        );
+        jj_commit(&other, "pushed.txt", "pushed\n", "pushed from another rig");
+        jj_commit(&other, "branch.txt", "branch\n", "a pull request's commit");
+        // A merge of that branch with trunk, the shape GitHub lands a PR as.
+        other.run("jj", &["new", "main", "@-", "-m", "merge pull request"]);
+        other.run("jj", &["new"]);
+        jj_land(&other);
+        repo.run("jj", &["rebase", "-s", "@", "-d", "main"]);
+        jj_commit(&repo, "mine.txt", "mine\n", "this rig's work");
+
+        let backend = JjBackend::new(repo.0.clone());
+        let branch = backend.default_bases().remove(0);
+        let b = backend.base_commit(&branch).unwrap();
+        assert!(
+            backend.commits(&start, &b).unwrap().iter().all(|c| c.mine),
+            "the other workspace's commits carry your name"
+        );
+        assert!(backend.made_here(&start, &b).is_empty());
+        let anchor = crate::serve::anchor(&backend, &branch, Some(&start), false);
+        assert_eq!(anchor.base, branch);
     }
 
     #[test]
@@ -1940,5 +2049,31 @@ mod tests {
                 ("landed".into(), true, true, 2)
             ]
         );
+    }
+
+    #[test]
+    fn git_counts_your_commits_but_not_merges_as_made_here() {
+        let repo = TempRepo::new("git-made-here");
+        repo.run("git", &["init", "-b", "main"]);
+        repo.run("git", &["config", "user.name", "Recto Test"]);
+        repo.run("git", &["config", "user.email", "recto@example.invalid"]);
+        repo.run("git", &["config", "commit.gpgsign", "false"]);
+        repo.run("git", &["commit", "--allow-empty", "-m", "start"]);
+        let backend = GitBackend::new(repo.0.clone());
+        let start = backend.commit_id("HEAD").unwrap();
+        repo.run("git", &["checkout", "-b", "pr"]);
+        std::fs::write(repo.0.join("pr.txt"), "pr\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "pr"]);
+        repo.run("git", &["checkout", "main"]);
+        std::fs::write(repo.0.join("mine.txt"), "mine\n").unwrap();
+        repo.run("git", &["add", "."]);
+        repo.run("git", &["commit", "-m", "mine"]);
+        repo.run("git", &["merge", "--no-ff", "-m", "merge pr", "pr"]);
+
+        let here = backend.made_here(&start, "HEAD");
+        let merge = backend.commit_id("HEAD").unwrap();
+        assert_eq!(here.len(), 2, "both commits, not the merge: {here:?}");
+        assert!(!here.contains(&merge));
     }
 }

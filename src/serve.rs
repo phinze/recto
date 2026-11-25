@@ -1663,9 +1663,10 @@ pub(crate) struct Anchor {
 /// A rig that pushes straight to trunk has an empty branch point the moment
 /// its work lands, and a branch that's merged reads the same. Anchoring at
 /// the commit the rig started from keeps that work on the page. It only
-/// applies when everything between the start and the branch point is your
-/// own landed work: a stack's lower layer isn't on trunk, and once someone
-/// else's commits are in between, the range would show their work as yours.
+/// applies when everything between the start and the branch point is work
+/// this workspace landed: a stack's lower layer isn't on trunk, and once
+/// anything else is in between (someone else's commits, or yours from another
+/// rig or a merged pull request), the range would show it as this rig's.
 pub(crate) fn anchor(
     backend: &dyn Backend,
     branch_base: &Base,
@@ -1710,14 +1711,18 @@ pub(crate) fn anchor(
     if !landed {
         return plain(None);
     }
+    // Yours by authorship and made in this workspace: another rig's work
+    // and a merged pull request carry your name too. A merge counts even
+    // when jj calls it empty, since what it brings in isn't this rig's.
+    let here = backend.made_here(&s, &b);
     match backend.commits(&s, &b) {
-        Ok(between) if between.iter().all(|c| c.mine || c.empty) => Anchor {
+        Ok(between) if between.iter().all(|c| c.mine && here.contains(&c.change)) => Anchor {
             base: Base::Revision(s.clone()),
             label: Some(start_label(&s)),
             note: None,
         },
         Ok(_) => plain(Some(
-            "Trunk has moved past where this rig started, with other people's commits in between, so this diff starts at the branch point.".into(),
+            "Trunk has moved past where this rig started, with work from elsewhere in between, so this diff starts at the branch point.".into(),
         )),
         Err(_) => plain(None),
     }
