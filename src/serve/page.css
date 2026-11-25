@@ -423,3 +423,80 @@ article.brief > :is(figure, pre, table) { max-width: none; }
    A deletion inside the span keeps its tint, or it would read as surviving. */
 figure.quote tr.add { background: none; }
 figure.quote tr:not(.del) .sig { visibility: hidden; }
+/* ---- The rail ------------------------------------------------------------
+   The contents stay in view down the right in place of the tabs. Reading
+   keeps a reading column; code gets the width. A narrow window folds the
+   rail to a strip of ticks that opens over the page; a phone keeps the tabs
+   and the contents sheet. */
+#rail { display: none; }
+@media (min-width: 900px), (not (pointer: coarse)) {
+  :root { --rail: 272px; }
+  #rail { display: block; position: fixed; top: 0; right: 0; bottom: 0; width: var(--rail); overflow-y: auto; z-index: 20;
+    padding: 12px 12px 40px 8px; border-left: 1px solid var(--surface0); background: var(--base);
+    font: var(--t-ui)/1.4 var(--sans); }
+  #live { right: calc(var(--rail) + 12px); }
+  #back { right: calc(var(--rail) + 20px); }
+  main { margin: 0 var(--rail) 0 0; max-width: none; padding: 24px 40px 80px; }
+  main > * { max-width: 760px; margin-left: auto; margin-right: auto; }
+  body.code-mode:not(.pages-mode) main > * { max-width: 1400px; }
+  nav.tabs { display: none; }
+  #toc-btn { display: none !important; }
+  /* No tab strip above them now. */
+  .tabbed details.file > summary, details.file > summary { top: 0; }
+  .tabbed .lensbar, .lensbar { top: 0; }
+  .tabbed section.repo:has(> .lensbar) details.file > summary, section.repo:has(> .lensbar) details.file > summary { top: 42px; }
+  /* The pages read as one flow, and each repo is a place of its own. */
+  body.pages-mode .tabbed > section.doc { display: block; }
+  body.pages-mode :is(.tabbed > section.repo, main > section.repo) { display: none; }
+  body:not(.pages-mode) :is(details.group-brief, .group-tour, main > section.doc) { display: none; }
+  body.pages-mode :is(section.doc, .group-tour) { margin-top: 64px; padding-top: 40px; border-top: 1px solid var(--surface0); }
+  body.pages-mode :is(section.doc, .group-tour):first-child { margin-top: 0; padding-top: 0; border-top: 0; }
+  body.pages-mode :is(section.doc, .group-tour) .tour-label { display: block; font: 700 var(--t-h1)/1.2 var(--sans); letter-spacing: -0.015em; color: var(--text); margin: 0 0 8px; }
+  /* A doc that opens on its own title doesn't need the label too. */
+  body.pages-mode :is(section.doc, .group-tour) article:has(> h1) > .tour-label { display: none; }
+  details.group-brief > summary.brief-strip { display: none; }
+  details.group-brief { margin: 8px auto 32px; }
+  /* The rail carries the outline and names the doc. */
+  article:is(.tour, .doc) { margin-top: 0; }
+  ol.outline, .tour-label { display: none; }
+  body.pages-mode main:not(:has(details.group-brief)) nav.tabs + section.doc { margin-top: 0; padding-top: 0; border-top: 0; }
+  #rail .ticks { display: none; }
+}
+@media (max-width: 899px) and (not (pointer: coarse)) {
+  :root { --rail: 40px; }
+  #rail { padding: 14px 0; overflow: hidden; }
+  #rail > * { display: none; }
+  #rail > .ticks { display: flex; flex-direction: column; align-items: center; gap: 9px; cursor: pointer; }
+  #rail .ticks i { width: 14px; height: 2px; border-radius: 1px; background: var(--surface1); flex: none; }
+  #rail .ticks i.top { width: 22px; background: var(--overlay0); margin-top: 8px; }
+  #rail .ticks i.here { background: var(--text); }
+  #rail .ticks i.t-ask { background: var(--peach); }
+  #rail:hover, #rail.open { width: 300px; padding: 12px 12px 40px 8px; overflow-y: auto; box-shadow: -10px 0 30px rgba(0,0,0,0.4); }
+  #rail:is(:hover, .open) > * { display: block; }
+  #rail:is(:hover, .open) > .rail-top { display: flex; }
+  #rail:is(:hover, .open) > .ticks { display: none; }
+  main { padding: 20px 24px 80px; }
+}
+.rail-top { all: unset; box-sizing: border-box; display: flex; align-items: baseline; gap: 8px; width: 100%; cursor: pointer;
+  padding: 6px 10px; border-radius: 8px; color: var(--subtext); font-weight: 600; }
+.rail-top:hover { background: var(--surface0); color: var(--text); }
+.rail-top.active { color: var(--text); background: var(--mantle); }
+.rail-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-stat { font: 12px var(--mono); font-weight: 400; white-space: nowrap; }
+.rail-count { margin-left: auto; font-size: 12px; font-weight: 700; color: var(--crust); background: var(--peach); border-radius: 999px; padding: 0 8px; --rond: var(--rond-you); }
+.rail-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--peach); flex: none; align-self: center; }
+.rail-group { font: 600 12px var(--sans); color: var(--overlay0); padding: 16px 10px 4px; }
+.rail-group:first-child { padding-top: 4px; }
+.rail-kids { margin: 2px 0 8px 10px; padding-left: 8px; border-left: 1px solid var(--surface0); }
+.rail-kids button { all: unset; box-sizing: border-box; display: flex; gap: 8px; align-items: baseline; width: 100%; cursor: pointer;
+  padding: 4px 8px; border-radius: 6px; color: var(--subtext); font-size: 13.5px; line-height: 1.35; }
+.rail-kids button:hover { background: var(--surface0); color: var(--text); }
+.rail-kids button.here { color: var(--text); background: var(--surface0); box-shadow: inset 2px 0 0 var(--text); }
+.rail-kids .toc-f { font: 12.5px/1.35 var(--mono); }
+.rail-kids .toc-f .toc-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+.rail-kids .toc-stack { margin-bottom: 8px; padding-bottom: 6px; border-bottom: 1px solid var(--surface0); }
+.rail-kids .toc-v { font-size: 13px; }
+.rail-kids .toc-v.active { color: var(--text); background: var(--mantle); }
+.rail-kids .toc-v .toc-path { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rail-kids .toc-change { padding-left: 20px; }
+.rail-kids .toc-whole .rev-id { display: none; }

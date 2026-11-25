@@ -242,6 +242,17 @@
     }
     for (const b of content.querySelectorAll('nav.tabs button')) b.classList.toggle('active', b.dataset.tab === id);
     for (const s of content.querySelectorAll('.tabbed > section')) s.classList.toggle('active', s.id === id);
+    const sec = document.getElementById(id);
+    document.body.classList.toggle('code-mode', !!(sec && sec.matches('section.repo')));
+    if (railReady) {
+      // A doc picked by key joins the flow of pages at its place.
+      if (remember && railOn.matches && sec && hasPages()) {
+        const page = !sec.matches('section.repo');
+        setPages(page);
+        if (page) window.scrollTo({ top: sec.getBoundingClientRect().top + window.scrollY - 16 });
+      }
+      buildRail();
+    }
   }
 
   function applyTab() {
@@ -350,6 +361,7 @@
     }
     drawDiagrams();
     applyTab();
+    if (railReady) { applyPlace(); buildRail(); }
     syncExpandButtons();
     syncMarkers(false);
     decorate();
@@ -393,6 +405,7 @@
     }
     drawDiagrams();
     applyTab();
+    if (railReady) { applyPlace(); buildRail(); }
     syncExpandButtons();
     const moved = syncMarkers(false);
     syncLenses(false);
@@ -993,7 +1006,8 @@
     const peers = [...new Set([...content.querySelectorAll('.peer[data-rig]')].map((p) => p.dataset.rig))];
     if (framed) window.parent.postMessage({ asks: open, peers }, location.origin);
     const brief = content.querySelector('details.group-brief');
-    if (brief) {
+    if (railReady) buildRail();
+    if (brief && !(railReady && railOn.matches)) {
       // Folding once everything's answered waits for a fresh page: folding
       // now would yank whatever the reader is looking at up by the
       // briefing's height, right after they answered.
@@ -1089,6 +1103,203 @@
     }
     tocList.innerHTML = html || '<p class=dim>Nothing on this page to jump to.</p>';
   }
+  // The rail: the contents, kept in view in place of the tabs. The pages
+  // (the Overview, which is the briefing, then each doc) read as one flow,
+  // and each repo's code is a place of its own. Every page's headings stay
+  // listed under it, and the one in view is marked as the reader scrolls;
+  // a repo unfolds into its stack and files while it's open. In a narrow
+  // window the rail folds to a strip of ticks, one per row, that opens over
+  // the page. A phone keeps the tabs and the contents sheet.
+  var railReady = false;
+  const railOn = matchMedia('(min-width: 900px), (not (pointer: coarse))');
+  const rail = document.createElement('aside');
+  rail.id = 'rail';
+  rail.setAttribute('aria-label', 'outline');
+  document.body.append(rail);
+  // Pages or code. The window lands on the pages while anything there is
+  // open, and otherwise where the reader last was.
+  let pagesMode = null;
+  const placeKey = tabKey + ':pages';
+  const openAsks = (scope = content) => [...scope.querySelectorAll('.ask:not(.answered)')];
+  const hasPages = () => !!content.querySelector('details.group-brief, section.doc, .group-tour');
+  function applyPlace() {
+    if (!railOn.matches) { document.body.classList.remove('pages-mode'); return; }
+    if (pagesMode === null) {
+      let stored = null;
+      try { stored = sessionStorage.getItem(placeKey); } catch {}
+      const act = content.querySelector('.tabbed > section.active');
+      pagesMode = openAsks().length > 0 || stored === '1' || (stored === null && !(act && act.matches('section.repo')));
+    }
+    if (!hasPages()) pagesMode = false;
+    else if (!content.querySelector('section.repo')) pagesMode = true;
+    const brief = content.querySelector('details.group-brief');
+    if (brief) brief.open = true;
+    document.body.classList.toggle('pages-mode', pagesMode);
+  }
+  function setPages(on) {
+    if (pagesMode === on) return;
+    pagesMode = on;
+    try { sessionStorage.setItem(placeKey, on ? '1' : '0'); } catch {}
+    applyPlace();
+    buildRail();
+  }
+  function pageEl(id) {
+    if (id === ':brief') return content.querySelector('details.group-brief');
+    if (id === ':group-tour') return content.querySelector('.group-tour');
+    return document.getElementById(id);
+  }
+  function railSections() {
+    const tabs = [...content.querySelectorAll('nav.tabs button[data-tab]')];
+    if (tabs.length) {
+      return tabs.map((b) => {
+        const sec = document.getElementById(b.dataset.tab);
+        const name = (b.childNodes[b.querySelector('.tour-dot') ? 1 : 0]?.textContent || b.textContent).trim();
+        const stat = b.querySelector('.stat');
+        return { sec, name, kind: sec && sec.matches('section.repo') ? 'code' : 'page', stat: stat ? stat.innerHTML : '', active: sec && sec.classList.contains('active') };
+      }).filter((s) => s.sec);
+    }
+    const out = [];
+    const tour = content.querySelector('.group-tour');
+    if (tour) out.push({ sec: tour, name: 'Tour', kind: 'page', stat: '', active: true });
+    for (const sec of content.querySelectorAll('main > section.doc')) out.push({ sec, name: sec.querySelector('.tour-label')?.textContent || sec.dataset.doc || '', kind: 'page', stat: '', active: true });
+    for (const sec of content.querySelectorAll('section.repo')) out.push({ sec, name: sec.dataset.repo || '', kind: 'code', stat: '', active: true });
+    return out;
+  }
+  // A page's headings, each marked while an ask under it is open.
+  function pageHeadings(scope) {
+    const hs = [...scope.querySelectorAll('article h1[id], article h2[id]')]
+      .filter((h) => scope.matches('details.group-brief') || !h.closest('details.group-brief'));
+    const asks = openAsks(scope);
+    return hs.map((h, i) => {
+      const next = hs[i + 1];
+      const open = asks.some((a) => (h.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_FOLLOWING)
+        && (!next || (next.compareDocumentPosition(a) & Node.DOCUMENT_POSITION_PRECEDING)));
+      return `<button type=button class=toc-h data-goto="${escHTML(h.id)}"><span class=rail-name>${escHTML(h.textContent.replace(/\s*(held|sent|on it|handled|not delivered)$/, '').trim())}</span>${open ? '<span class=rail-dot></span>' : ''}</button>`;
+    }).join('');
+  }
+  function buildRail() {
+    const keep = rail.scrollTop;
+    let html = '';
+    const brief = content.querySelector('details.group-brief');
+    const secs = railSections();
+    const pages = secs.filter((s) => s.kind === 'page'), code = secs.filter((s) => s.kind === 'code');
+    const pageRow = (id, name, scope) => {
+      const n = openAsks(scope).length;
+      html += `<button type=button class=rail-top data-rail="${escHTML(id)}" data-page><span class=rail-name>${escHTML(name)}</span>${n ? `<span class=rail-count>${n}</span>` : ''}</button>`;
+      if (pagesMode) html += `<div class=rail-kids>${pageHeadings(scope)}</div>`;
+    };
+    if (brief || pages.length) {
+      html += '<div class=rail-group>Pages</div>';
+      if (brief) pageRow(':brief', 'Overview', brief);
+      for (const s of pages) pageRow(s.sec.id || ':group-tour', s.name, s.sec);
+    }
+    if (code.length) html += '<div class=rail-group>Code</div>';
+    for (const s of code) {
+      const on = s.active && !pagesMode;
+      html += `<button type=button class="rail-top${on ? ' active' : ''}" data-rail="${escHTML(s.sec.id)}"><span class=rail-name>${escHTML(s.name)}</span>${s.stat ? `<span class=rail-stat>${s.stat}</span>` : ''}</button>`;
+      if (on) html += `<div class=rail-kids>${tocStack(s.sec)}${tocHeadings(s.sec)}${tocFiles(s.sec)}</div>`;
+    }
+    rail.innerHTML = html;
+    // The folded strip: a tick per row, and the headings and files under
+    // them while they fit.
+    const kids = [...rail.querySelectorAll('.rail-kids [data-goto]')];
+    const ticks = [...rail.querySelectorAll('.rail-top, .rail-kids [data-goto]')]
+      .filter((b) => b.matches('.rail-top') || kids.length <= 40)
+      .map((b) => b.matches('.rail-top')
+        ? `<i class="top${b.classList.contains('active') ? ' here' : ''}${b.querySelector('.rail-count') ? ' t-ask' : ''}" data-rail="${escHTML(b.dataset.rail)}"></i>`
+        : `<i class="${b.querySelector('.rail-dot') ? 't-ask' : ''}" data-goto="${escHTML(b.dataset.goto)}"></i>`).join('');
+    rail.insertAdjacentHTML('beforeend', `<div class=ticks>${ticks}</div>`);
+    rail.scrollTop = keep;
+    spy();
+  }
+  // Where the reader is: the last heading or file, and in the pages the
+  // last page, whose top has passed under the sticky bars.
+  function spy() {
+    const atEnd = window.innerHeight + window.scrollY >= document.body.scrollHeight - 4;
+    const rows = [...rail.querySelectorAll('.rail-kids [data-goto]')];
+    let current = null;
+    for (const r of rows) {
+      const el = document.getElementById(r.dataset.goto);
+      if (!el || !el.offsetParent) continue;
+      if (el.getBoundingClientRect().top < 140) current = r;
+    }
+    if (atEnd && rows.length) current = rows[rows.length - 1];
+    for (const r of rows) r.classList.toggle('here', r === current);
+    for (const t of rail.querySelectorAll('.ticks i[data-goto]')) t.classList.toggle('here', !!current && t.dataset.goto === current.dataset.goto);
+    if (!pagesMode) return;
+    const tops = [...rail.querySelectorAll('.rail-top[data-page]')];
+    let page = tops[0] || null;
+    for (const t of tops) {
+      const el = pageEl(t.dataset.rail);
+      if (el && el.offsetParent && el.getBoundingClientRect().top < 140) page = t;
+    }
+    if (atEnd && current) page = current.closest('.rail-kids')?.previousElementSibling || page;
+    for (const t of tops) t.classList.toggle('active', t === page);
+    for (const t of rail.querySelectorAll('.ticks i.top[data-rail]')) t.classList.toggle('here', !!page && t.dataset.rail === page.dataset.rail);
+  }
+  let spyQueued = false;
+  window.addEventListener('scroll', () => {
+    if (spyQueued) return;
+    spyQueued = true;
+    requestAnimationFrame(() => { spyQueued = false; spy(); });
+  }, { passive: true });
+  rail.addEventListener('click', (e) => {
+    if (e.target.closest('.ticks')) { rail.classList.add('open'); return; }
+    const pick = e.target.closest('[data-pick]');
+    if (pick) {
+      const row = content.querySelector(`button[data-view="${CSS.escape(pick.dataset.pick)}"]`);
+      if (row) row.click();
+      return;
+    }
+    const top = e.target.closest('[data-rail]');
+    if (top) {
+      rail.classList.remove('open');
+      const id = top.dataset.rail;
+      if ('page' in top.dataset) {
+        setPages(true);
+        const el = pageEl(id);
+        if (el) window.scrollTo({ top: id === ':brief' ? 0 : el.getBoundingClientRect().top + window.scrollY - 16 });
+      } else {
+        setPages(false);
+        activate(id, true);
+        window.scrollTo({ top: 0 });
+      }
+      return;
+    }
+    const go = e.target.closest('[data-goto]');
+    if (!go) return;
+    rail.classList.remove('open');
+    const el = document.getElementById(go.dataset.goto);
+    if (el && el.matches('details.file') && !el.open) { el.open = true; toggled.set(el.id, true); }
+    reveal(go.dataset.goto);
+  });
+  document.addEventListener('click', (e) => { if (!rail.contains(e.target)) rail.classList.remove('open'); });
+  // The frame's needs badge and `n`: the next open ask after the last one
+  // shown, wherever it sits, and back to the first after the last.
+  let lastAsk = null;
+  function nextAsk() {
+    const all = openAsks();
+    if (!all.length) return false;
+    const at = all.indexOf(lastAsk);
+    const pick = at >= 0 ? all[(at + 1) % all.length]
+      : all.find((a) => a.offsetParent && a.getBoundingClientRect().top > 80) || all[0];
+    lastAsk = pick;
+    const brief = pick.closest('details.group-brief');
+    if (brief) brief.open = true;
+    const repo = pick.closest('section.repo');
+    if (railOn.matches) setPages(!repo);
+    if (repo && repo.matches('.tabbed > section') && !repo.classList.contains('active')) activate(repo.id, true);
+    requestAnimationFrame(() => {
+      pick.scrollIntoView({ block: 'center', behavior: 'smooth' });
+      pick.animate([{ boxShadow: '0 0 0 3px rgba(226,171,126,0.7)' }, { boxShadow: '0 0 0 3px transparent' }], { duration: 1400 });
+    });
+    return true;
+  }
+  railOn.addEventListener('change', () => { applyPlace(); buildRail(); });
+  applyPlace();
+  buildRail();
+  railReady = true;
+
   // Long lines wrap by default; scrolling them sideways keeps code's shape,
   // which some diffs need more than they need everything on screen. The
   // choice is the reader's, kept across pages.
@@ -1173,6 +1384,7 @@
     }
     if (e.metaKey || e.ctrlKey || e.altKey) return;
     if (pickTab(e.key)) { e.preventDefault(); return; }
+    if (!framed && e.key === 'n' && nextAsk()) { e.preventDefault(); return; }
     if (framed && (e.key.length === 1 || e.key === 'Escape')) window.parent.postMessage({ key: e.key }, location.origin);
   });
 
@@ -1196,13 +1408,13 @@
     if (e.data && e.data.insets && typeof e.data.insets.bottom === 'number') {
       document.documentElement.style.setProperty('--safe-b', e.data.insets.bottom + 'px');
     }
-    // The frame's "needs you" badge: open the briefing and bring it up.
-    if (e.data && e.data.brief) {
+    // The frame's "needs you" badge: bring up the next open ask.
+    if (e.data && e.data.brief && !nextAsk()) {
       const brief = content.querySelector('details.group-brief');
       if (brief) {
-        if (!brief.open) brief.open = true;
-        const ask = [...brief.querySelectorAll('.ask:not(.answered)')][0];
-        (ask || brief).scrollIntoView({ block: ask ? 'center' : 'start', behavior: 'smooth' });
+        brief.open = true;
+        if (railOn.matches) setPages(true);
+        brief.scrollIntoView({ block: 'start', behavior: 'smooth' });
       }
     }
     // The frame repeats these every few seconds; only a change redraws.

@@ -36,13 +36,16 @@ reads:
     recto tour --group "$RIG_BASEDIR" < t.md   # one story across the repos
     recto focus src/app.rs:42-58               # point at code
     recto brief < brief.md                     # the briefing (below)
-    recto doc plan < plan.md                   # any other doc, as a tab
+    recto doc plan < plan.md                   # any other doc, as a page
     recto clear
 
-The window shows the group's docs as tabs beside the repos: the group tour
-first (it's the doc named `tour`), then each `recto doc NAME` in the order
-first written, a plan or a PR body, say. Quotes in a doc jump into the repo
-tabs, as in a tour. Rewrite a doc to update it; an empty body removes it.
+The window lists everything in a rail down the right. Pages come first:
+the briefing as the Overview, then the group tour (the doc named `tour`),
+then each `recto doc NAME` in the order first written, a plan or a PR body,
+say. The pages read as one scroll, Overview on top, so a doc sits right
+under the briefing and gets read after it. Each repo's code is a place of
+its own below them in the rail. Quotes in a doc jump into the repo's code,
+as in a tour. Rewrite a doc to update it; an empty body removes it.
 Keep docs few and named for what they are; the briefing, not a doc, is where
 anything that needs Paul goes.
 
@@ -350,8 +353,8 @@ per repo:
 
 DIR is the directory holding the repos (a rig's basedir), and each quote's
 path starts with its repo's directory under DIR. The web view (`recto serve`,
-behind `rig serve`) shows a group tour above the repo tabs, and a quote opens
-that repo's tab at the span. It doesn't go through a viewer, so call `recto`
+behind `rig serve`) shows a group tour among the pages, and a quote opens
+that repo's code at the span. It doesn't go through a viewer, so call `recto`
 directly here rather than `rig recto`, and no TUI needs to be running. The TUI
 shows only per-repo tours.
 
