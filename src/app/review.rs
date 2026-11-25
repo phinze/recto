@@ -315,6 +315,7 @@ impl App {
         store.set_notes(&self.agent_notes, self.next_agent_note_id);
         store.set_tour(self.tour.as_deref());
         store.set_lens(self.lens.as_deref());
+        store.set_base(self.saved_base.as_deref());
         let named = self
             .tour
             .as_deref()
@@ -371,6 +372,7 @@ impl App {
         match request {
             link::Request::Ping => link::Response::ok_status(self.status()),
             link::Request::SetBase { revision } => self.set_base_from_companion(revision),
+            link::Request::ResetBase => self.reset_base(),
             link::Request::AttachPr { pull_request } => {
                 self.attach_pull_request(*pull_request, true)
             }
@@ -472,6 +474,38 @@ impl App {
                     .clone()
                     .unwrap_or_else(|| format!("could not load base {label}")),
             );
+        }
+        if self.loading.is_none() {
+            self.saved_base = Some(label);
+            self.persist_soon();
+        } else {
+            self.base_to_save = Some(label);
+        }
+        link::Response::ok_status(self.status())
+    }
+
+    /// Forget the base `recto base` saved and go back to the one this viewer
+    /// would open on: an attached PR's branch point, or the default.
+    fn reset_base(&mut self) -> link::Response {
+        self.saved_base = None;
+        self.base_to_save = None;
+        self.persist_soon();
+        let pr_base = self.pull_request.as_ref().map(|front| {
+            let attached = self
+                .persistence
+                .as_ref()
+                .map(|s| s.pull_requests())
+                .unwrap_or_default();
+            Base::branch_point(link::stack_bottom(&attached, front).base_oid.clone())
+        });
+        let Some(base) = pr_base
+            .filter(|b| self.backend.resolves(b))
+            .or_else(|| self.backend.default_base())
+        else {
+            return link::Response::err("no default base to return to");
+        };
+        if self.backend.base_label(self.base()) != self.backend.base_label(&base) {
+            self.select_base(base);
         }
         link::Response::ok_status(self.status())
     }
@@ -596,6 +630,11 @@ impl App {
         self.pr_scroll = 0;
         self.active_thread = None;
         self.page = Page::PullRequest;
+        // Attaching a PR asks for its range, which supersedes a saved base.
+        if select_base && unfetched.is_none() {
+            self.saved_base = None;
+            self.base_to_save = None;
+        }
         if select_base && base_changed && unfetched.is_none() {
             // A tour resolved against the old range must not survive onto a
             // different PR diff. Authored notes remain anchored and visible

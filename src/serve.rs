@@ -1104,12 +1104,29 @@ fn render_workspace(
         }
     };
     let pull_request = store.as_ref().and_then(|s| s.pull_request().cloned());
+    // A base `recto base` saved is the range as asked for, ahead of a PR's
+    // base and the rig's start alike.
+    let saved = store.as_ref().and_then(|s| {
+        let base = saved_base(backend.as_ref(), s);
+        if base.is_none()
+            && let Some(revision) = s.base()
+        {
+            notices.push(format!(
+                "the saved base {revision} doesn't resolve here, so this diff starts where it would without one (`recto base --reset` forgets it)"
+            ));
+        }
+        base
+    });
+    let start = if saved.is_some() { None } else { start };
     // A stack of PRs is ranged from its bottom PR's base, so every layer is
     // on the page; the front PR's own base would cut off the ones below it.
-    let branch_base = view_base(
-        backend.as_ref(),
-        store.as_ref().and_then(|s| s.stack_base_pr()),
-    )?;
+    let branch_base = match saved {
+        Some(base) => base,
+        None => view_base(
+            backend.as_ref(),
+            store.as_ref().and_then(|s| s.stack_base_pr()),
+        )?,
+    };
     // Each of these is a few jj calls, and they don't wait on each other, so
     // they run side by side: the branch's diff, its commits, and whether the
     // rig's start moves the range. The range usually stays put, which makes
@@ -1983,6 +2000,70 @@ fn rev_stat(added: u32, removed: u32) -> String {
     )
 }
 
+/// The base `recto base` saved, when it still resolves here.
+fn saved_base(backend: &dyn Backend, store: &state::Store) -> Option<Base> {
+    store
+        .base()
+        .map(|r| Base::Revision(r.to_string()))
+        .filter(|b| backend.resolves(b))
+}
+
+/// The base the web window diffs from, for the commands that act on what it
+/// shows: a saved base, or else the branch base anchored at the rig's start.
+pub(crate) fn page_base(backend: &dyn Backend, store: &state::Store) -> Result<Base> {
+    if let Some(base) = saved_base(backend, store) {
+        return Ok(base);
+    }
+    let branch = view_base(backend, store.stack_base_pr())?;
+    Ok(anchor(
+        backend,
+        &branch,
+        rig_start(backend.root()).as_deref(),
+        false,
+    )
+    .base)
+}
+
+/// `recto base` with no viewer listening: save the base (or, with `None`,
+/// forget it) where `recto serve` and the next viewer read it. Returns the
+/// process exit code.
+pub(crate) fn save_base_offline(revision: Option<&String>) -> i32 {
+    let result = (|| -> Result<std::result::Result<(), String>> {
+        let backend = crate::backend::detect_backend()?;
+        let mut store = state::Store::load(backend.root(), None)?;
+        if let Some(revision) = revision
+            && !backend.resolves(&Base::Revision(revision.clone()))
+        {
+            return Ok(Err(format!(
+                "base {revision} doesn't resolve to a commit here"
+            )));
+        }
+        store.set_base(revision.map(String::as_str));
+        store.save()?;
+        Ok(Ok(()))
+    })();
+    match result {
+        Ok(Ok(())) => {
+            eprintln!(
+                "recto: no viewer running; {} for the web window and the next viewer",
+                match revision {
+                    Some(r) => format!("saved base {r}"),
+                    None => "forgot the saved base".into(),
+                }
+            );
+            0
+        }
+        Ok(Err(refusal)) => {
+            eprintln!("recto: {refusal}");
+            1
+        }
+        Err(e) => {
+            eprintln!("recto: {e:#}");
+            2
+        }
+    }
+}
+
 /// The base a page diffs from, by the TUI's own rule: an attached PR's branch
 /// point when this workspace can resolve it, otherwise the default base.
 fn view_base(backend: &dyn Backend, pull_request: Option<&link::PullRequest>) -> Result<Base> {
@@ -2033,20 +2114,9 @@ pub(crate) fn save_focus_offline(path: &str, start: Option<u32>, end: Option<u32
                 )));
             }
         }
-        // The same range the web view shows, anchored at the rig's start
-        // when rig says where that is.
-        let branch = view_base(backend.as_ref(), store.stack_base_pr())?;
-        let mut files = parse_diff(&backend.unified_diff(&Scope::Range(branch.clone()), false)?);
-        let start_commit = rig_start(backend.root());
-        let anchored = anchor(
-            backend.as_ref(),
-            &branch,
-            start_commit.as_deref(),
-            files.is_empty(),
-        );
-        if anchored.base != branch {
-            files = parse_diff(&backend.unified_diff(&Scope::Range(anchored.base), false)?);
-        }
+        // The same range the web view shows.
+        let base = page_base(backend.as_ref(), &store)?;
+        let files = parse_diff(&backend.unified_diff(&Scope::Range(base), false)?);
         let Some(file) = files.iter().find(|f| f.path == path) else {
             return Ok(Err(format!("not in current diff: {path}")));
         };
@@ -2111,15 +2181,9 @@ pub(crate) fn save_lens_offline(spec: &str) -> i32 {
         let mut store = state::Store::load(backend.root(), None)?;
         let spec = spec.trim();
         if !spec.is_empty() {
-            let base = view_base(backend.as_ref(), store.stack_base_pr())?;
-            let anchored = anchor(
-                backend.as_ref(),
-                &base,
-                rig_start(backend.root()).as_deref(),
-                false,
-            );
+            let base = page_base(backend.as_ref(), &store)?;
             let commits = backend
-                .base_commit(&anchored.base)
+                .base_commit(&base)
                 .and_then(|from| backend.commits(&from, backend.head_rev()).ok())
                 .unwrap_or_default();
             if matches!(

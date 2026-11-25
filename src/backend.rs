@@ -2000,6 +2000,28 @@ mod tests {
     }
 
     #[test]
+    fn a_saved_base_wins_over_the_page_s_own_while_it_resolves() {
+        let (repo, _remote, _start) = jj_trunk_repo("jj-saved-base");
+        jj_commit(&repo, "a.txt", "a\n", "pushed");
+        jj_land(&repo);
+        let backend = JjBackend::new(repo.0.clone());
+        let state_home = repo.0.join(".state");
+        let mut store = crate::state::Store::load_at(&state_home, &repo.0, None).unwrap();
+
+        store.set_base(Some("trunk()-"));
+        assert_eq!(
+            crate::serve::page_base(&backend, &store).unwrap(),
+            Base::Revision("trunk()-".into())
+        );
+        store.set_base(Some("no_such_bookmark"));
+        assert_ne!(
+            crate::serve::page_base(&backend, &store).unwrap(),
+            Base::Revision("no_such_bookmark".into()),
+            "a base that no longer resolves gives way"
+        );
+    }
+
+    #[test]
     fn page_keeps_the_branch_point_for_unlanded_work() {
         let (repo, _remote, start) = jj_trunk_repo("jj-anchor-branch");
         jj_commit(&repo, "lower.txt", "lower\n", "lower");

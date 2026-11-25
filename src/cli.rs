@@ -41,9 +41,16 @@ pub(crate) enum ClientCommand {
         #[command(subcommand)]
         command: StateCommand,
     },
-    /// Retarget the running diff to a jj revset or git ref. Waits for the new
-    /// range to finish loading before returning.
-    Base { revision: String },
+    /// Retarget the diff to a jj revset or git ref, for the running viewer,
+    /// the web window and the next viewer alike: the base is saved with the
+    /// workspace. With a viewer running, waits for the new range to load.
+    Base {
+        #[arg(required_unless_present = "reset")]
+        revision: Option<String>,
+        /// Forget the saved base and return to the one recto picks itself.
+        #[arg(long, conflicts_with = "revision")]
+        reset: bool,
+    },
     /// Focus a file or span in the running recto. PATHSPEC is `path`,
     /// `path:LINE`, or `path:START-END` (new-side line numbers).
     Focus { pathspec: String },
@@ -518,7 +525,9 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
     // `base` knows the revision it asked for; `pr` derives its base from the
     // PR, so its target has to come back from the viewer.
     let retarget = match &command {
-        ClientCommand::Base { revision } => Some(Some(revision.as_str())),
+        // A reset's target is whatever the viewer falls back to, so it's read
+        // off the load it reports, as for `pr`.
+        ClientCommand::Base { revision, .. } => Some(revision.as_deref()),
         ClientCommand::Pr { .. } => Some(None),
         _ => None,
     };
@@ -534,6 +543,10 @@ pub(crate) fn run_client(command: ClientCommand) -> i32 {
             }
             link::Request::Clear => return crate::serve::save_clear_offline(),
             link::Request::Lens { spec } => return crate::serve::save_lens_offline(spec),
+            link::Request::SetBase { revision } => {
+                return crate::serve::save_base_offline(Some(revision));
+            }
+            link::Request::ResetBase => return crate::serve::save_base_offline(None),
             link::Request::ReviewFocus { id } => return crate::serve::review_focus_offline(*id),
             _ => {}
         }
@@ -719,9 +732,13 @@ fn build_request(command: &ClientCommand) -> Result<link::Request> {
         | ClientCommand::Doc { .. } => {
             Err(anyhow!("this command does not use the workspace socket"))
         }
-        ClientCommand::Base { revision } => Ok(link::Request::SetBase {
+        ClientCommand::Base {
+            revision: Some(revision),
+            ..
+        } => Ok(link::Request::SetBase {
             revision: revision.clone(),
         }),
+        ClientCommand::Base { revision: None, .. } => Ok(link::Request::ResetBase),
         ClientCommand::Ping => Ok(link::Request::Ping),
         ClientCommand::Pr { locator } => Ok(link::Request::AttachPr {
             pull_request: Box::new(github::fetch_pull_request(locator)?),
@@ -1008,7 +1025,8 @@ mod tests {
     #[test]
     fn base_command_carries_the_revision() {
         let request = build_request(&ClientCommand::Base {
-            revision: "@--".into(),
+            revision: Some("@--".into()),
+            reset: false,
         })
         .unwrap();
 
@@ -1016,6 +1034,12 @@ mod tests {
             request,
             link::Request::SetBase { revision } if revision == "@--"
         ));
+        let reset = build_request(&ClientCommand::Base {
+            revision: None,
+            reset: true,
+        })
+        .unwrap();
+        assert!(matches!(reset, link::Request::ResetBase));
     }
 
     #[test]

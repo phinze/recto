@@ -100,6 +100,11 @@ struct Document {
     /// when it changes, the way it follows focus.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     lens: Option<String>,
+    /// The base `recto base` last set, as the revset it was given. A viewer
+    /// opens on it and `recto serve` diffs from it, ahead of the base they'd
+    /// pick on their own, until `recto base --reset` or a PR attach.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    base: Option<String>,
     /// The identity of each ask and heading in the briefing, the tours and
     /// the docs, minted when the document was saved and kept while that part
     /// says the same thing (see `marks`).
@@ -160,6 +165,7 @@ impl Document {
             pull_requests: Vec::new(),
             quotes: Vec::new(),
             lens: None,
+            base: None,
             marks: Vec::new(),
             unknown: serde_json::Map::new(),
         }
@@ -322,6 +328,14 @@ impl Store {
 
     pub fn set_lens(&mut self, lens: Option<&str>) {
         self.document.lens = lens.filter(|l| !l.is_empty()).map(str::to_string);
+    }
+
+    pub fn base(&self) -> Option<&str> {
+        self.document.base.as_deref()
+    }
+
+    pub fn set_base(&mut self, base: Option<&str>) {
+        self.document.base = base.filter(|b| !b.is_empty()).map(str::to_string);
     }
 
     pub fn quotes(&self) -> &[QuoteStamp] {
@@ -717,6 +731,7 @@ fn load_legacy(rig_root: &Path, repo: &str, workspace_root: &Path) -> Result<Opt
         pull_requests: Vec::new(),
         quotes: Vec::new(),
         lens: None,
+        base: None,
         marks: Vec::new(),
         unknown: serde_json::Map::new(),
     }))

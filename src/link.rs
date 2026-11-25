@@ -27,6 +27,10 @@ pub enum Request {
     /// Retarget the running diff to an arbitrary jj revset or git ref.
     #[serde(rename = "base")]
     SetBase { revision: String },
+    /// Drop the base `SetBase` saved and return to the one the viewer picks
+    /// on its own.
+    #[serde(rename = "base-reset")]
+    ResetBase,
     /// Scroll to and highlight a span. `start`/`end` are new-side (post-image)
     /// line numbers; both absent means "whole file".
     Focus {
@@ -796,7 +800,7 @@ fn handle_while_in_editor(
             });
             resp
         }
-        Request::SetBase { .. } => {
+        Request::SetBase { .. } | Request::ResetBase => {
             queue(tx, request.clone());
             Response::ok_note("recto is in an editor; the base will change when you return")
         }

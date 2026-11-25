@@ -460,6 +460,12 @@ pub(crate) struct App {
     pub(crate) quote_stamps: Vec<crate::anchor::QuoteStamp>,
     /// Where the agent last moved the view, saved for the window to follow.
     pub(crate) lens: Option<String>,
+    /// The base `recto base` set, saved so the window and the next viewer
+    /// diff from it too. `None` leaves the base to the usual rules.
+    pub(crate) saved_base: Option<String>,
+    /// A base `recto base` asked for whose range is still loading. It's
+    /// saved once the range lands, so a base that fails to load isn't kept.
+    pub(crate) base_to_save: Option<String>,
     /// A section a companion asked for before the tour page had geometry to
     /// resolve it against. Spent by the next draw.
     pub(crate) tour_pending_section: Option<usize>,
@@ -656,6 +662,9 @@ impl App {
         let lens = persistence
             .as_ref()
             .and_then(|store| store.lens().map(str::to_string));
+        let saved_base = persistence
+            .as_ref()
+            .and_then(|store| store.base().map(str::to_string));
         let (annotations, restored_focus, show_comments) = persistence
             .as_ref()
             .map(|store| {
@@ -695,6 +704,8 @@ impl App {
             tour_anchors,
             quote_stamps,
             lens,
+            saved_base,
+            base_to_save: None,
             tour_pending_section: None,
             quote_return: None,
             review_scroll: 0,
@@ -1148,6 +1159,7 @@ impl App {
                 Err(error) => {
                     self.loading = None;
                     self.load_error = Some(error.to_string());
+                    self.base_to_save = None;
                     self.restore_loaded_selection();
                 }
             }
@@ -1226,6 +1238,12 @@ impl App {
         self.diff_cursor = None;
         self.last_review_click = None;
         if let Scope::Range(base) = &scope {
+            if let Some(asked) = self.base_to_save.take()
+                && asked == self.backend.base_label(base)
+            {
+                self.saved_base = Some(asked);
+                self.persist_soon();
+            }
             self.loaded_base = base.clone();
             if let Some(i) = self.bases.iter().position(|b| b == base) {
                 self.base_idx = i;
@@ -3323,6 +3341,58 @@ mod tests {
         assert_eq!(app.base(), &Base::Revision("base".into()));
         assert!(status.loading_base.is_none());
         assert_eq!(status.load_error.as_deref(), Some("synthetic load failure"));
+    }
+
+    #[test]
+    fn companion_base_is_saved_once_its_range_lands_and_reset_forgets_it() {
+        let root =
+            std::env::temp_dir().join(format!("recto-app-state-{}-saved-base", std::process::id()));
+        let _ = std::fs::remove_dir_all(&root);
+        std::fs::create_dir_all(&root).unwrap();
+        let state_home = root.join("state");
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(
+            backend,
+            Highlighter::new(),
+            None,
+            Some(state::Store::load_at(&state_home, &root, None).unwrap()),
+        )
+        .unwrap();
+        let saved = || {
+            state::Store::load_at(&state_home, &root, None)
+                .unwrap()
+                .base()
+                .map(str::to_string)
+        };
+
+        app.handle_request(link::Request::SetBase {
+            revision: "other".into(),
+        });
+        assert_eq!(app.saved_base, None, "not while the range is loading");
+        settle_load(&mut app);
+        assert_eq!(app.saved_base.as_deref(), Some("other"));
+        app.persist_now().unwrap();
+        assert_eq!(saved().as_deref(), Some("other"));
+
+        let response = app.handle_request(link::Request::ResetBase);
+        assert!(response.ok);
+        settle_load(&mut app);
+        assert_eq!(app.base(), &Base::Revision("base".into()));
+        app.persist_now().unwrap();
+        assert_eq!(saved(), None);
+    }
+
+    #[test]
+    fn failed_companion_base_is_not_saved() {
+        let backend = Arc::new(TestBackend::new());
+        let mut app = App::load(backend.clone(), Highlighter::new(), None, None).unwrap();
+        backend.fail.store(true, Ordering::SeqCst);
+        app.handle_request(link::Request::SetBase {
+            revision: "missing".into(),
+        });
+        settle_load(&mut app);
+        assert_eq!(app.saved_base, None);
+        assert_eq!(app.base_to_save, None);
     }
 
     #[test]

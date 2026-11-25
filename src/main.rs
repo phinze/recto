@@ -227,8 +227,25 @@ fn main() -> Result<()> {
             .unwrap_or_default();
         link::stack_bottom(&attached, front).clone()
     });
+    // A base `recto base` saved comes next: it was asked for, and the web
+    // window is already showing it.
+    let saved_base = persistence
+        .as_ref()
+        .and_then(|s| s.base())
+        .map(|r| Base::Revision(r.to_string()))
+        .filter(|base| {
+            let ok = backend.resolves(base);
+            if !ok {
+                startup_notices.push(format!(
+                    "saved base {} doesn't resolve here; showing the usual range instead (`recto base --reset` forgets it)",
+                    backend.base_label(base)
+                ));
+            }
+            ok
+        });
     let initial_base = match cli.base {
         Some(revision) => Some(Base::Revision(revision)),
+        None if saved_base.is_some() => saved_base,
         None => stack_base.as_ref().and_then(|pr| {
             let base = Base::branch_point(pr.base_oid.clone());
             if backend.resolves(&base) {

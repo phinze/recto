@@ -49,10 +49,13 @@ as in a tour. Rewrite a doc to update it; an empty body removes it.
 Keep docs few and named for what they are; the briefing, not a doc, is where
 anything that needs Paul goes.
 
-The terminal Recto is the escape hatch, for when Paul asks for it or for
-what the window can't do yet: retargeting the base and co-authoring review
-drafts. `rig recto <repo>` puts that repo's viewer beside the agent,
-starting it if needed; any remaining arguments are forwarded to recto from
+Terminal Recto is the escape hatch for when Paul asks for it, or for the one
+thing the web window can't do yet: co-authoring review drafts. You don't
+need it to retarget the base anymore. `recto base REVSET` saves the base and
+the web window follows, and `recto base --reset` lets Recto pick the base
+again.
+`rig recto <repo>` puts that repo's viewer beside the agent, starting it
+if needed; any remaining arguments are forwarded to recto from
 the correct workspace (`rig recto cloud base 'trunk()'`). Every `rig recto`
 command opens the viewer, so don't use it to probe. Do not run tmux pane
 commands yourself, and do not use `recto -R` as a substitute: Rig owns the
@@ -214,7 +217,8 @@ Outside a Rig, use the ordinary `recto …` commands below.
     recto focus PATH:START-END   # highlight lines START..END
     recto focus PATH:LINE        # highlight a single line
     recto focus PATH             # scroll to the file, no line span
-    recto base REVSET            # retarget the diff and wait for it to load
+    recto base REVSET            # retarget the diff (saved, so the window follows)
+    recto base --reset           # forget the saved base; back to Recto's own pick
     recto annotate SPEC [SPEC…]  # label multiple spans as numbered steps
     recto tour < FILE            # lay down a literate tour (Markdown on stdin)
     recto tour BODY              # the same, as an argument; empty removes it
@@ -250,6 +254,12 @@ post-change file, the ones you'd see in your editor after the edit.
 
 `base` accepts the same backend-native value as startup's `--base`: a jj
 revset such as `@-` or `fork_point(trunk() | @)`, or a git ref such as `HEAD`.
+With a live viewer running, `recto base REVSET` saves the base to the
+workspace once the range loads; with no viewer running, it checks that the
+revset resolves and saves it right away. Both the web window and future
+terminal Recto sessions use that saved base ahead of an attached PR's base
+or a rig's start commit. It sticks around until you run `recto base --reset`
+or attach a PR with `recto pr`, which switches to that PR's range instead.
 Against the live Recto surface the command returns only after the new range is
 on screen, so a following `focus` or `annotate` cannot race the old diff. While
 Recto is parked in an editor, the command queues the retarget and says that it
