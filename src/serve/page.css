@@ -222,16 +222,33 @@ article.brief h2:first-of-type { margin-top: 12px; }
 .group-brief article { margin: 0; padding: 0 0 8px; }
 
 .ask { background: var(--base); border: 1px solid var(--surface1); border-radius: 12px; padding: 16px 20px; margin: 14px 0; max-width: var(--measure); }
-.ask.answered { border-color: var(--surface0); opacity: 0.85; }
+/* Answered, an ask stays where it was asked as the record of the decision:
+   the question quiet, the answer plain. */
+.ask.answered { border-color: var(--surface0); background: none; }
+.ask.answered .ask-q, .ask.answered .ask-q :is(p, li) { color: var(--subtext); }
+.ask.answered :is(.ask-pick, .ask-kind) { display: none; }
+.ask.answered .ask-answer::before { content: "Decided"; display: block; font: 600 var(--t-sm) var(--sans); color: var(--green); margin: 14px 0 2px; }
+.ask.do.answered .ask-answer::before { content: "Done"; }
+.ask.answered .ask-given { color: var(--text); font-weight: 600; font-size: var(--t-body); }
 /* An action that's the person's to take, not a question: it keeps the
    briefing open the same way, and its one button marks it done. */
 .ask.do { border-left: 3px solid var(--peach); }
 .ask-kind { font: 600 var(--t-sm) var(--sans); color: var(--peach); margin-bottom: 6px; }
 .ask.do .ask-choices button.picked { background: var(--peach); border-color: var(--peach); }
-.ask-q p { margin: 0 0 10px; }
+.ask-q :is(p, ul, ol) { margin: 0 0 10px; }
+.ask-q :is(ul, ol) { padding-left: 22px; }
+.ask-q > :last-child { margin-bottom: 0; }
+/* The agent's own pick, set apart from the question so it can be taken or
+   left at a glance; its choice wears the same accent. */
+.ask-pick { display: grid; grid-template-columns: auto 1fr; gap: 14px; align-items: baseline; margin: 12px 0 4px; padding: 10px 14px;
+  background: var(--mantle); border-radius: 10px; font-size: 15.5px; line-height: 1.5; }
+.ask-pick-label { font: 600 var(--t-sm) var(--sans); color: var(--peach); white-space: nowrap; }
+.ask-pick-why > * { margin: 0; }
+.ask-pick-why > * + * { margin-top: 6px; }
 .ask-choices { display: flex; flex-wrap: wrap; gap: 8px; margin: 12px 0 4px; }
 .ask-choices button { font: 500 var(--t-ui)/1.35 var(--sans); color: var(--text); background: var(--surface0); border: 1px solid var(--surface1); border-radius: 999px; padding: 7px 16px; cursor: pointer; text-align: left; }
 .ask-choices button:hover { border-color: var(--overlay0); }
+.ask-choices button.agent-pick { border-color: var(--peach); }
 .ask-choices button.picked { background: var(--text); color: var(--crust); border-color: var(--text); }
 .ask.answered .ask-choices { display: none; }
 .ask-answer textarea, #composer textarea { width: 100%; font: 15px/1.5 var(--sans); color: var(--text); background: var(--base); border: 1px solid var(--surface1); border-radius: 6px; padding: 6px 8px; resize: vertical; }
@@ -271,6 +288,12 @@ article:is(.tour, .doc, .brief) > p:has(> a.shot) { max-width: none; }
 .gathered { margin: 4px 0 14px; padding-bottom: 6px; border-bottom: 1px solid var(--surface0); }
 .gathered h2 { font: 650 var(--t-h3) var(--sans); color: var(--text); margin: 8px 0 12px; }
 .gathered .peer h3 { font: 650 var(--t-body) var(--sans); margin: 16px 0 4px; }
+.gathered .peer-doc { font: 500 var(--t-sm) var(--sans); color: var(--overlay0); margin: 12px 0 -4px; }
+/* A decided ask stays on its own rig's page as the record; here, once that
+   rig has handled the answer, it's no longer anyone's to look at. */
+.gathered .ask[data-cstate="done"],
+.gathered :is(.peer-page, .peer):not(:has(.ask:not([data-cstate="done"]))),
+.gathered:not(:has(.ask:not([data-cstate="done"]))) { display: none; }
 a[href^="rig:"] { color: var(--blue); text-decoration: none; border-bottom: 1px dotted var(--blue); cursor: pointer; }
 a[href^="rig:"]::after { content: " ↗"; font-size: 0.85em; }
 

@@ -751,7 +751,7 @@ fn brief_with(gathered: &str, brief: &str, out: &mut String) {
     }
 }
 
-/// Every ask in the peers' briefings, under a link to the rig that asked.
+/// Every ask in the peers' pages, under a link to the rig that asked.
 /// Whether each is answered is the page's call, from the comments it's
 /// given; an answer goes to the rig in the card's `data-rig`.
 fn gather_asks(peers: &[Peer]) -> String {
@@ -769,22 +769,39 @@ fn gather_asks(peers: &[Peer]) -> String {
             );
             continue;
         };
+        // The briefing's asks first, then each doc's under the doc's name:
+        // an ask can sit with the context it's about.
+        let mut cards = String::new();
         let brief = store.brief().unwrap_or_default();
-        let asks = brief_asks(brief);
         let marks = store.doc_marks("brief", brief);
-        if asks.is_empty() {
+        for (n, (kind, id, text)) in brief_asks(brief).into_iter().enumerate() {
+            cards.push_str(&ask_html(kind, &id, &text, marks.ask(n), Some(&peer.slug)));
+        }
+        for doc in store.docs() {
+            let asks = brief_asks(&doc.body);
+            if asks.is_empty() {
+                continue;
+            }
+            let marks = store.doc_marks(&doc.name, &doc.body);
+            let _ = write!(
+                cards,
+                "<div class=peer-page><p class=peer-doc>in {}</p>",
+                esc(&doc_title(&doc.name))
+            );
+            for (n, (kind, id, text)) in asks.into_iter().enumerate() {
+                cards.push_str(&ask_html(kind, &id, &text, marks.ask(n), Some(&peer.slug)));
+            }
+            cards.push_str("</div>");
+        }
+        if cards.is_empty() {
             continue;
         }
         let _ = write!(
             out,
-            "<div class=peer data-rig=\"{0}\"><h3><a href=\"rig:{0}\">{1}</a></h3>",
+            "<div class=peer data-rig=\"{0}\"><h3><a href=\"rig:{0}\">{1}</a></h3>{cards}</div>",
             esc(&peer.slug),
             esc(&peer.label)
         );
-        for (n, (kind, id, text)) in asks.into_iter().enumerate() {
-            out.push_str(&ask_html(kind, &id, &text, marks.ask(n), Some(&peer.slug)));
-        }
-        out.push_str("</div>");
     }
     if out.is_empty() {
         return out;
@@ -2711,19 +2728,40 @@ fn render_doc(
 /// `caption` is how the tour wrote the spec, which a group tour prefixes with
 /// the repo's directory.
 /// A question the person answers in place, or an action of theirs they mark
-/// done. For a question, lines starting `- ` are choices and the rest is the
-/// question; an action's only choice is "done". The page sends the answer as
-/// a comment anchored to the block's id, so answering is the same gesture as
+/// done. For a question, lines starting `- ` are choices, a line starting
+/// `pick:` is the agent's own pick and why, and the rest is the question; an
+/// action's only choice is "done". The page sends the answer as a comment
+/// anchored to the block's id, so answering is the same gesture as
 /// commenting, and either kind keeps the briefing open until it's settled.
+/// Once answered it stays where it was asked, as the record of the decision.
 fn ask_html(kind: Need, id: &str, text: &str, mark: Option<&str>, rig: Option<&str>) -> String {
     let mut question = Vec::new();
     let mut choices = Vec::new();
+    let mut pick: Option<&str> = None;
     for line in text.lines() {
-        match line.trim_start().strip_prefix("- ") {
+        let bare = line.trim_start();
+        match bare.strip_prefix("- ") {
             Some(choice) if kind == Need::Ask => choices.push(choice.trim()),
-            _ => question.push(line),
+            _ => match bare.strip_prefix("pick:") {
+                Some(why) if kind == Need::Ask && pick.is_none() => pick = Some(why.trim()),
+                _ => question.push(line),
+            },
         }
     }
+    // The choice the pick names, when it opens with one: the longest that
+    // fits, so "ship it" beats "ship".
+    let picked = pick.and_then(|p| {
+        let p = p.to_lowercase();
+        choices
+            .iter()
+            .filter(|c| {
+                let c = c.to_lowercase();
+                p.strip_prefix(&c)
+                    .is_some_and(|rest| rest.chars().next().is_none_or(|ch| !ch.is_alphanumeric()))
+            })
+            .max_by_key(|c| c.len())
+            .copied()
+    });
     if kind == Need::Do {
         choices = vec!["done"];
     }
@@ -2743,22 +2781,30 @@ fn ask_html(kind: Need, id: &str, text: &str, mark: Option<&str>, rig: Option<&s
     if kind == Need::Do {
         out.push_str("<div class=ask-kind>for you to do</div>");
     }
-    out.push_str("<div class=ask-q>");
-    for para in question
-        .split("\n\n")
-        .map(str::trim)
-        .filter(|p| !p.is_empty())
-    {
-        let _ = write!(out, "<p>{}</p>", esc(para).replace('\n', "<br>"));
+    let _ = write!(
+        out,
+        "<div class=ask-q>{}</div>",
+        small_markdown(question.trim())
+    );
+    if let Some(pick) = pick.filter(|p| !p.is_empty()) {
+        let _ = write!(
+            out,
+            "<div class=ask-pick><span class=ask-pick-label>Agent's pick</span><div class=ask-pick-why>{}</div></div>",
+            small_markdown(pick)
+        );
     }
-    out.push_str("</div>");
     if !choices.is_empty() {
         out.push_str("<div class=ask-choices>");
         for c in choices {
             let _ = write!(
                 out,
-                "<button type=button data-choice=\"{0}\">{0}</button>",
-                esc(c)
+                "<button type=button data-choice=\"{0}\"{1}>{0}</button>",
+                esc(c),
+                if Some(c) == picked {
+                    " class=agent-pick"
+                } else {
+                    ""
+                }
             );
         }
         out.push_str("</div>");
@@ -3442,6 +3488,48 @@ mod tests {
         assert!(out.contains("data-choice=\"open\""), "{out}");
         // An ask without an id gets one by position.
         assert!(out.contains("data-ask=\"ask2\""), "{out}");
+    }
+
+    /// An ask carries the agent's own pick on a `pick:` line, shown apart
+    /// from the question and marking the choice it names, and its prose is
+    /// Markdown like the page around it.
+    #[test]
+    fn an_ask_shows_the_agents_pick_apart_from_the_question() {
+        let card = ask_html(
+            Need::Ask,
+            "ship",
+            "Ship `main` now?\npick: ship it, since CI is green\n- ship\n- ship it\n- wait\n",
+            None,
+            None,
+        );
+        assert!(card.contains("<code>main</code>"), "{card}");
+        assert!(!card.contains("pick:"), "{card}");
+        assert!(
+            card.contains("<span class=ask-pick-label>Agent's pick</span><div class=ask-pick-why><p>ship it, since CI is green</p>"),
+            "{card}"
+        );
+        assert!(
+            card.contains("data-choice=\"ship it\" class=agent-pick>"),
+            "the longest choice the pick opens with: {card}"
+        );
+        assert!(!card.contains("data-choice=\"ship\" class"), "{card}");
+        // A pick naming no choice still shows; a do has no pick to make.
+        let free = ask_html(
+            Need::Ask,
+            "q",
+            "Which?\npick: neither\n- a\n- b\n",
+            None,
+            None,
+        );
+        assert!(
+            free.contains("ask-pick") && !free.contains("agent-pick"),
+            "{free}"
+        );
+        let todo = ask_html(Need::Do, "d", "Click it.\npick: later\n", None, None);
+        assert!(
+            !todo.contains("ask-pick") && todo.contains("pick: later"),
+            "{todo}"
+        );
     }
 
     /// An action that's the person's to take is a `do` block: a card of its

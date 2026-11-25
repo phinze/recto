@@ -74,8 +74,8 @@ with `rig recto --pane <repo>`.
 
 ### The briefing
 
-The briefing is one page that organizes Paul's attention, pinned above
-everything else in the window. Agents can juggle five threads; a person
+The briefing is one page that organizes Paul's attention: the Overview,
+first in the window's pages. Agents can juggle five threads; a person
 reading them gets scattered. So instead of answering in many places, gather
 it here and keep it current:
 
@@ -84,6 +84,7 @@ it here and keep it current:
 
     ```ask fold
     Should the revision list start folded, or open once work has landed?
+    pick: folded, since most rigs open with nothing landed yet
     - folded
     - open when landed
     ```
@@ -98,8 +99,13 @@ it here and keep it current:
     EOF
 
 Each fenced `ask ID` block is a question Paul answers in place. Its `- `
-lines become choices, and he can add his own words either way. His answer
-comes back like any other comment, labeled with the ask's ID. Answers stick
+lines become choices, and he can add his own words either way. Put your own
+pick on a `pick:` line, the choice first and then why: it shows apart from
+the question and marks that choice, so he can take it or leave it at a
+glance. The question and pick are Markdown. Write each ask to stand on its
+own, since cos's page shows it away from everything around it: the question,
+the choices and your pick should make sense without the text above. His
+answer comes back like any other comment, labeled with the ask's ID. Answers stick
 to the exact wording of the ask: if you rewrite the briefing and keep an ask
 word for word, it stays answered. Reword an ask, or drop it and bring it back
 later, and it shows up as a fresh question even if you reuse the ID. Comments
@@ -119,8 +125,8 @@ briefing open the way an unanswered ask does, and is gathered into the chief
 of staff's page the same way. His "done" comes back as a comment anchored to
 the block's ID, like an answer, so follow up then (check the Mac reports
 installed). Don't bury an action he has to take in prose under "Needs you":
-the briefing folds once every block in it is settled, and prose doesn't
-count. Keep the
+the window counts open blocks in its needs badge and `n` steps through them,
+and prose isn't counted. Keep the
 section order: what needs him first, then what his comments turned into,
 then a short "where we stand". Rewrite the whole briefing rather than
 append to it, whenever you finish something he asked for or reach a
@@ -128,11 +134,22 @@ decision that's his, and drop asks once they're answered. In a rig it
 belongs to `$RIG_BASEDIR`; outside one, pass `--group DIR`. Quotes work as
 in a group tour. An empty body removes it.
 
-The chief of staff's window gathers every rig's asks at the top of its
-briefing, under a link to the rig that asked, and Paul can answer them
-there; the answer reaches you the same way. So an ask left in a briefing
-after it's settled (answered in the terminal, say) keeps asking him from
-cos's page too: rewrite the briefing to drop it. Link another rig with
+An ask or a do can also sit in a doc, beside the context it's about: a
+plan's open question under the section that raises it, say. It works the
+same as one in the briefing: counted in the badge, reached with `n`, and
+gathered into cos's page under the doc's name. Use the briefing for what
+needs him now, and put an ask in a doc when the doc is where he'd want to
+decide it. Once answered, an ask in a doc stays put as the record of the
+decision, shown as decided with his answer: keep it word for word when you
+rewrite the doc. The briefing is current state rather than a record, so its
+answered asks still go when you rewrite it.
+
+The chief of staff's window gathers every rig's asks, from its briefing
+and its docs, at the top of its own briefing, under a link to the rig that
+asked. Paul can answer them there; the answer reaches you the same way, and
+once you `rig ack` it done the ask leaves cos's page. So an ask settled
+outside the window (answered in the terminal, say) keeps asking him from
+cos's page: rewrite the briefing or doc to drop it. Link another rig with
 `[label](rig:SLUG)`, its basedir name; clicking it puts that rig on screen
 in Rex, and the window follows.
 

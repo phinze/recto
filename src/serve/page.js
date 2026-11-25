@@ -964,10 +964,12 @@
       const c = answerOf(card);
       const slot = card.querySelector('.ask-answer');
       card.classList.toggle('answered', !!c);
+      if (c) card.dataset.cstate = c.state; else delete card.dataset.cstate;
       if (c && drafts[askKey(card)]) { delete drafts[askKey(card)]; saveDrafts(); }
       if (c) {
         slot.innerHTML = '<div class=ask-given></div><span class=c-badge></span>';
-        slot.querySelector('.ask-given').textContent = c.body;
+        // The answer as he gave it, without the label the agent reads it by.
+        slot.querySelector('.ask-given').textContent = c.body.replace(/^Choice: /, '');
         const b = slot.querySelector('.c-badge');
         b.dataset.cstate = c.state;
         b.textContent = stateWords[c.state] || c.state;
